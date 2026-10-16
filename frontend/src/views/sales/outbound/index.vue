@@ -33,6 +33,15 @@ function goProjectDetail(row: Outbound) {
   if (row.projectId) router.push(`/sales/projects/${row.projectId}/detail`)
 }
 
+/**
+ * 关联合同（ADR-007）：contractId 非空（合同交付自动出库）→ 合同号；
+ * 合同无独立详情页，故整词纯文本 mono 展示**不跳转**（避免死链），hover tooltip 显示合同客户名；
+ * 存量 / 手工补录 contractId 为 null（或合同已随项目删除）→ '-'。
+ */
+function contractOf(row: Outbound) {
+  return row.contractId ? db.contracts.find((c) => c.id === row.contractId) : undefined
+}
+
 const list = computed(() =>
   db.outbounds.filter((o) => {
     const kw = searchText.value.trim()
@@ -281,6 +290,18 @@ async function handleRevert(o: Outbound) {
             <el-tag v-else size="small" type="info" effect="plain">补录</el-tag>
           </template>
         </el-table-column>
+        <el-table-column label="关联合同" width="110" align="left">
+          <template #default="{ row }">
+            <el-tooltip
+              v-if="contractOf(row)"
+              :content="`合同客户：${contractOf(row)!.customer || '-'}`"
+              placement="top"
+            >
+              <span class="contract-code">{{ contractOf(row)!.code }}</span>
+            </el-tooltip>
+            <span v-else class="muted">-</span>
+          </template>
+        </el-table-column>
         <el-table-column prop="customer" label="客户" width="140" show-overflow-tooltip />
         <el-table-column prop="assetName" label="资产" min-width="180" show-overflow-tooltip />
         <el-table-column label="数量/额度" width="110" align="right">
@@ -327,7 +348,7 @@ async function handleRevert(o: Outbound) {
     </el-card>
 
     <!-- 补录对话框（对齐创建页表单视觉：顶标签 + 分区块） -->
-    <el-dialog v-model="createDialog.visible" title="补录销售出库" width="720px" :close-on-click-modal="false">
+    <el-dialog v-model="createDialog.visible" title="补录销售出库" class="dlg-form" :close-on-click-modal="false">
       <div class="info-bar" style="margin-bottom: 14px;">
         <el-icon aria-hidden="true"><InfoFilled /></el-icon>
         <span>
@@ -416,14 +437,7 @@ async function handleRevert(o: Outbound) {
               <el-input-number v-model="createDialog.form.qty" :min="0" :precision="0" :step="1" controls-position="right" style="width: 100%;" />
             </el-form-item>
             <el-form-item label="销售金额（元）">
-              <el-input-number
-                :model-value="(createDialog.form.amount || 0) * 10000"
-                :min="0"
-                :precision="0"
-                controls-position="right"
-                style="width: 100%;"
-                @update:model-value="(v) => { createDialog.form.amount = (v || 0) / 10000 }"
-              />
+              <el-input-number v-model="createDialog.form.amount" :min="0" :precision="2" :controls="false" style="width: 100%;" />
             </el-form-item>
           </div>
           <el-form-item label="备注">
@@ -458,6 +472,15 @@ async function handleRevert(o: Outbound) {
 .link:hover {
   color: var(--primary-hover);
   text-decoration: underline;
+}
+
+/* 合同号：纯文本 mono（与项目详情页 .contract-code 同规格；无独立详情页，不跳转） */
+.contract-code {
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  cursor: default;
 }
 
 /* 补录弹窗内部分区块（与创建页 block-head 同语言，更紧凑） */

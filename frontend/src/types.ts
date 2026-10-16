@@ -34,6 +34,7 @@ export const TYPE_TAG_CLASS: Record<string, string> = {
   平台软件: 'tag-gray',
   卫星Token: 'tag-orange',
   卫星数据: 'tag-purple',
+  遥感数据: 'tag-blue',
   软件: 'tag-blue',
   硬件集群: 'tag-green',
   算力服务器: 'tag-orange',
@@ -77,8 +78,9 @@ export interface Asset {
   lockedQty: number // 锁定数量（被进行中的销售项目占用）
   shippedQty: number // 售卖数量（已出库）
   repeatSale: boolean // 可重复售卖
-  salePrice: number // 单价（万元/单位）
-  soldAmount: number // 累计售卖金额（万元）
+  pricingMode?: 'unit' | 'amount' // 计价模式（ADR-008）：unit=单价×数量（默认）；amount=包量金额权威（卫星 Token），salePrice 仅参考
+  salePrice: number // 单价（元/单位）；amount 模式下为参考单价（元/万Token），不参与计价
+  soldAmount: number // 累计售卖金额（元）
   soldCount: number // 授权/销售次数（可重复售卖）
   status: AssetStatus // 库存可售 / 全部出售
   inboundDate: string // 入库时间
@@ -86,9 +88,43 @@ export interface Asset {
   perpetual: boolean // 长期买断（无到期时间）
   spec: string // 规格/说明
   saleDetail?: IWorkbookData // 售卖内容明细（Excel 快照，入库时录入；结构自由、可含行列合并）
-  contractFile?: string // 产品清单（uploads 目录文件名，抽屉内可在线预览）
+  contractFile?: string // 产品清单（uploads 目录散列文件名，抽屉内可在线预览；展示原始名走 fileDisplayName）
+  featureDoc?: string // 功能清单附件（uploads 目录散列文件名；"" = 未上传，与 contractFile 同模式）
   remark: string
   updatedAt: string
+}
+
+/** 遥感数据可售明细（ADR-011，Supersedes ADR-010）：父资产（type='遥感数据'）下的可售卖子项，维度 省（可含市）× 精度 × 月份 */
+export interface RsItem {
+  id: number
+  assetId: number // 父资产 id
+  province: string // 省/自治区/直辖市，必填
+  city: string // 市，可空（默认 ""）
+  resolution: number // 精度（米），如 1.5
+  saleMonth: string // YYYY-MM
+  price: number // 单价（整数元/份）
+  repeatSale: boolean // 可重复售卖（默认 true，只计次不扣量）
+  createdAt: string
+  updatedAt: string
+}
+
+/** 明细展示名：省 + 市 + 精度m + 月份（如「河北省石家庄市 1.5m 2026-09」） */
+export function rsItemName(r: RsItem): string {
+  return `${r.province}${r.city || ''} ${r.resolution}m ${r.saleMonth}`
+}
+
+/** 是否包量定价模式（ADR-008）：amount 模式下合同金额为权威输入，salePrice 仅参考 */
+export function isAmountMode(a: Pick<Asset, 'pricingMode'>): boolean {
+  return a.pricingMode === 'amount'
+}
+
+/** 文件元数据（bootstrap files 全量）：storedName=散列名（URL/资产字段用），name=原始文件名（展示用） */
+export interface FileMeta {
+  storedName: string
+  name: string
+  size: number
+  uploadedBy: string
+  createdAt: string
 }
 
 /** 购物车项（预留 userId 维度，为后续账号权限管控做准备；当前默认 admin） */
@@ -96,7 +132,10 @@ export interface CartItem {
   id: number
   userId: string
   assetId: number
+  itemId?: number // 遥感数据明细 id（ADR-011，挂 rs_items；含 itemId 行数量恒 1）
+  customer?: string // 行级客户（ADR-007）：结算时按 customer 分组拆合同；"" = 未填写
   qty: number
+  amount?: number // 合同金额（元，整数；ADR-008，仅包量定价资产行有值）
   createdAt: string
   updatedAt: string
 }
@@ -107,8 +146,12 @@ export function availableQty(a: Asset): number | null {
   return Math.max(0, a.quantity - a.lockedQty - a.shippedQty)
 }
 
-/** 可售金额 = 可售数量 × 单价 */
+/** 可售金额 = 可售数量 × 单价。
+ * 包量定价（amount 模式，卫星Token）返回 0：其 salePrice 为「元/万Token」参考值（不参与计价，
+ * ADR-008），quantity 为 Token 个数，两者相乘不是真实金额（曾导致看板/板块「可售金额」虚高）。
+ * 该类资产以合同金额（整数元）为权威口径，已体现在项目/合同的 contractAmount 统计中。 */
 export function availableValue(a: Asset): number {
+  if (isAmountMode(a)) return 0
   const q = availableQty(a)
   return q === null ? 0 : q * a.salePrice
 }
@@ -179,6 +222,8 @@ export const ITEM_STATUS: Record<ItemStatus, { label: string; tag: 'success' | '
 export interface ProjectItem {
   id: number
   assetId: number | null
+  contractId?: number | null // 所属合同（ADR-007）；存量明细为 null
+  itemId?: number // 遥感数据明细 id（ADR-011，挂 rs_items；空 = 非明细行）
   qty: number
   unit: string
   price: number
@@ -195,19 +240,55 @@ export interface Project {
   id: number
   code: string // 项目编号 SP-XXXX
   name: string
-  customer: string
+  customer: string // 多合同时为空字符串（前端显示「N 位客户」）
   industry: string
   rep: string // 生态人员（原销售人员）
+  businessOwner?: string // 商务负责人（存量项目为空，展示 '-'）
   subject: string
-  status: ProjectStatus
-  expectedAmount: number // 预计销售金额
+  status: ProjectStatus // 派生字段：由名下合同状态推导（ADR-007），前端不可手动变更
+  expectedAmount: number // 预计销售金额（=Σ合同金额，派生）
   quoteAmount: number // 报价金额
-  contractAmount: number // 合同金额
+  contractAmount: number // 合同金额（=Σ合同金额，派生兼容口径）
   paidAmount: number // 已回款金额
   expectedSignDate: string
   lastFollowDate: string
   remark: string
   items: ProjectItem[]
+  contractCount?: number // 合同数量（ADR-007，派生；存量项目可能缺失）
+  createdAt: string
+  updatedAt: string
+}
+
+// ============================================================
+// 合同（ADR-007：项目下按客户拆分的合同，库存联动最小单位）
+// ============================================================
+export interface ContractItem {
+  id: number
+  assetId: number | null
+  contractId: number | null // 所属合同；存量明细为 null
+  itemId?: number // 遥感数据明细 id（ADR-011，挂 rs_items；空 = 非明细行）
+  qty: number
+  unit: string
+  price: number
+  amount: number
+  status: ItemStatus
+  locked?: boolean // 下单时刻是否真实加锁
+  deliveryReq: string
+  lockedDate: string
+  confirmedDate: string
+  shippedDate: string
+}
+
+export interface Contract {
+  id: number
+  code: string // 合同编号 HT-XXXX
+  projectId: number
+  customer: string // 合同客户（合同内强制同一资产主体）
+  subject: string // 资产主体（由明细带出）
+  contractAmount: number // 合同金额（元）
+  status: ProjectStatus // active / delivered / terminated（与项目三态同构）
+  remark: string
+  items: ContractItem[]
   createdAt: string
   updatedAt: string
 }
@@ -239,6 +320,7 @@ export interface Outbound {
   id: number
   code: string // 出库单号 CK-XXXX
   projectId: number | null
+  contractId?: number | null // 关联合同（ADR-007）：合同交付自动出库时非空；存量/手工补录为 null
   projectName: string
   customer: string
   assetId: number
@@ -277,6 +359,7 @@ export interface AssetFlow {
   date: string
   ref: string // 关联单号/项目
   note: string
+  operator?: string // 操作账号（存量流水为空显示 -；"system" = 初始化入库，显示「系统」）
 }
 
 export interface OpLog {
@@ -289,6 +372,7 @@ export interface OpLog {
   detail: string
   operator: string
   time: string
+  changes?: string // 字段级变更明细（仅资产「编辑」日志有；"" = 无变更不展示）
 }
 
 // ============================================================
@@ -388,7 +472,38 @@ export function formatWan(v: number | null | undefined): string {
   return v.toLocaleString('zh-CN', { maximumFractionDigits: 2 })
 }
 
-/** 标准金额展示：字段单位为万元，换算为元并以「¥ + 千分位 + 两位小数」展示 */
+/**
+ * Token 数量展示（ADR-008）：库内仍存原始 Token 数，仅展示层换算——
+ * 300000000 → "3 亿"，137000000 → "13700 万"，< 1e4 → 原数 + "个"
+ */
+export function formatTokens(n: number | null | undefined): string {
+  if (n === null || n === undefined || Number.isNaN(n)) return '-'
+  if (n >= 1e8) {
+    const v = n / 1e8
+    return `${Number.isInteger(v) ? v : v.toFixed(2).replace(/\.?0+$/, '')} 亿`
+  }
+  if (n >= 1e4) {
+    const v = n / 1e4
+    return `${Number.isInteger(v) ? v : v.toFixed(2).replace(/\.?0+$/, '')} 万`
+  }
+  return `${n} 个`
+}
+
+/** 数量展示口径（ADR-008）：包量定价（Token）资产用 formatTokens，其余用 formatWan */
+export function formatAssetQty(a: Pick<Asset, 'pricingMode'>, n: number | null | undefined): string {
+  return isAmountMode(a) ? formatTokens(n) : formatWan(n)
+}
+
+/**
+ * 派生参考单价（ADR-008，仅包量定价模式展示用）：合同金额 ÷ 数量 ÷ 1e4（元/万Token），
+ * 保留 4 位小数并带「约」；不参与任何金额计算。
+ */
+export function derivedUnitPrice(amount: number, qty: number): string {
+  if (!amount || !qty) return '-'
+  return `约 ${(amount / qty / 1e4).toFixed(4)} 元/万Token`
+}
+
+/** 标准金额展示：字段单位即元（ADR-006），直显「¥ + 千分位 + 两位小数」，0/空显示 '-' */
 export function formatMoney(v: number | null | undefined): string {
   if (v === null || v === undefined) return '-'
   return new Intl.NumberFormat('zh-CN', {
@@ -396,10 +511,10 @@ export function formatMoney(v: number | null | undefined): string {
     currency: 'CNY',
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
-  }).format(v * 10000)
+  }).format(v)
 }
 
-/** 元单位金额的标准展示（千分位 + 两位小数，不含 ¥ 前缀），用于合同金额等以元为单位的输入展示 */
+/** 元单位金额的输入框展示（千分位 + 两位小数，不含 ¥ 前缀，空/非法回退 0.00），与 formatMoney 同为元口径 */
 export function formatYuan(v: number | null | undefined): string {
   const n = Number(v)
   if (v === null || v === undefined || Number.isNaN(n)) return '0.00'

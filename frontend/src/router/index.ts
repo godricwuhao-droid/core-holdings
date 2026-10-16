@@ -119,12 +119,24 @@ const router = createRouter({
   routes,
 })
 
+/** viewer（生态人员）可访问路由：/assets/**（排除创建/编辑等写页面）+ /cart；默认落地 /assets/embodied */
+const VIEWER_HOME = '/assets/embodied'
+function viewerAllowedPath(path: string): boolean {
+  if (path === '/cart') return true
+  if (!path.startsWith('/assets/')) return false
+  if (path === '/assets/create') return false
+  if (/^\/assets\/\d+\/edit$/.test(path)) return false
+  return true
+}
+
 // ============================================================
 // 全局守卫：登录态 + 角色
 //  - 无 token：非 /login 一律重定向 /login（带 redirect 参数）
 //  - 有 token 访问 /login：回 /
 //  - token 在但 currentUser 缺失（新标签页刷新）：fetchMe 校验，
 //    401 由响应拦截器清态跳登录
+//  - viewer（生态人员）：仅 /assets/**（排除创建/编辑页）与 /cart，
+//    其余路由（看板/销售/出库/基础设置/资产创建编辑）→ 静默重定向 /assets/embodied
 //  - /settings/*（users/deliverables/reps）仅 admin，非 admin 直接访问 → 提示并回 /
 // ============================================================
 router.beforeEach(async (to) => {
@@ -141,6 +153,10 @@ router.beforeEach(async (to) => {
       // 401 已被响应拦截器处理（清态 + 整页跳登录）；其余错误阻断导航
       return false
     }
+  }
+  // viewer（生态人员）：菜单/路由收窄——仅资产浏览 + 购物车，其余静默回资产首页
+  if (currentUser.value?.role === 'viewer' && !viewerAllowedPath(to.path)) {
+    return VIEWER_HOME
   }
   if (to.path === '/settings/users' && currentUser.value?.role !== 'admin') {
     ElMessage.warning('仅管理员可访问「账号与审计」')

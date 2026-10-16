@@ -272,10 +272,10 @@ void db
     <el-dialog
       v-model="dialog.visible"
       :title="(dialog.editing ? '编辑' : '新增') + '交付物 · ' + dialog.type"
-      width="560px"
+      class="dlg-form"
       :close-on-click-modal="false"
     >
-      <el-form label-width="100px">
+      <el-form label-width="96px">
         <el-form-item v-if="!dialog.editing" label="资产类型">
           <el-input :model-value="dialog.type" disabled />
           <div class="muted dl-tip">针对当前选中的类型新增；其他类型请先在上方切换页签 / 胶囊</div>

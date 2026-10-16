@@ -5,6 +5,153 @@
 
 ---
 
+## 2026-10-16 变更（ADR-011 遥感数据「父资产 + 可售明细」两层模型，⚠️ Supersedes ADR-010）
+
+### 新表 rs_items（遥感数据可售明细）
+
+父资产（`assets` 行，`type='遥感数据'`，容器，本身不可直接加购/下单）下的真正售卖单位。维度 = 省（可含市）× 精度（米）× 月份（YYYY-MM），每份一个单价（整数元/份），默认可重复售卖（只计次不扣量）。
+
+| 列 | 类型 | 可空 | 说明 |
+|----|------|------|------|
+| `id` | INTEGER PK | 否 | DB 自增（禁止手写） |
+| `assetId` | INTEGER INDEX | 否 | 父资产 id（`type='遥感数据'`；引用完整性由服务层保证，无 DB 外键） |
+| `province` | VARCHAR(64) 默认 `''` | 否 | 省/自治区/直辖市，必填（服务层校验非空） |
+| `city` | VARCHAR(64) 默认 `''` | 否 | 市，可空（省级明细不填） |
+| `resolution` | FLOAT | 否 | 精度，单位**米**（如 1.5），> 0（Pydantic 422） |
+| `saleMonth` | VARCHAR(7) 默认 `''` | 否 | 售卖月份 `YYYY-MM`（`^\d{4}-\d{2}$`，Pydantic 422） |
+| `price` | FLOAT | 否 | 单价，**整数元/份**（元口径 ADR-006；服务层校验 >0 且整数，否则 400） |
+| `repeatSale` | BOOLEAN | 否（默认 1） | 可重复售卖（true=只计次不扣量；false=下单锁父资产 lockedQty，交付扣 shippedQty） |
+| `createdAt`/`updatedAt` | VARCHAR(32) | 否（默认 `''`） | `YYYY-MM-DD HH:MM` |
+
+唯一性：`(assetId, province, city, resolution, saleMonth)` 组合唯一，**服务层判重**（create/update 排除自身，Python 层，resolution 容差 1e-9，无 DB 唯一约束/索引）；重复 400「该父资产下已存在相同 省/市 + 精度 + 月份 的明细」。
+
+建表方式：`Base.metadata.create_all`（新表，无 ALTER 迁移需求）。
+
+### cart_items / project_items 新增列 `itemId`（均幂等迁移）
+
+| 表.列 | 类型 | 可空 | 说明 |
+|-------|------|------|------|
+| `cart_items.itemId` | INTEGER INDEX | 是 | 挂 `rs_items` 明细；非空行 qty 恒 1（≠1 → 400）、结算金额=明细 price 权威；判重键升级为 **(userId, assetId, itemId, customer)**（无 itemId 行 = `itemId IS NULL`，口径不变）；存量/非遥感行恒 NULL |
+| `project_items.itemId` | INTEGER INDEX | 是 | 挂 `rs_items` 明细；非空行 qty 恒 1、`amount` 权威 = 明细 price × 1（忽略前端传值）、锁定/交付/回滚按**明细** repeatSale（true 不锁只计次，false 锁父资产 lockedQty）；存量/非遥感行恒 NULL |
+
+迁移语句（幂等，`main.py::_ensure_migration`）：
+
+```sql
+ALTER TABLE cart_items    ADD COLUMN itemId INTEGER;
+CREATE INDEX ix_cart_items_itemId    ON cart_items (itemId);
+ALTER TABLE project_items ADD COLUMN itemId INTEGER;
+CREATE INDEX ix_project_items_itemId ON project_items (itemId);
+```
+
+### 数据清理（幂等一次性迁移）
+
+删除 ADR-010 演示遥感数据资产（`type='遥感数据'` 且带三维字段值的存量行，即「河北省石家庄市 1.5m 2026-09-15」id=29）及其 `rs_items`/`asset_deliverables`/`flows` 关联行。删前 **assert 无 project_items/cart_items 引用**（有引用则启动失败暴露问题，等价 delete_asset 的 400 逻辑）。匹配条件限定「三维字段非空」——ADR-011 新建的父资产容器 4 列恒空，**不会被误删**；执行一次后命中 0 行，幂等。
+
+### assets 4 列废弃标注（ADR-010 遗留，列保留不删）
+
+`assets.province` / `assets.city` / `assets.resolution` / `assets.imageDate` **已废弃（ADR-011）**：schema（AssetIn/AssetOut）移除、服务层不再读写、`update_asset` 不再接受；仅作为技术债保留列与存量值。遥感数据售卖粒度全部由 `rs_items` 承载。
+
+---
+
+## 2026-10-16 变更（ADR-008 包量定价 + ADR-009 购物车隔离 + ADR-010 遥感数据）
+
+> ⚠️ 本节 ADR-010 部分（assets 三维 4 列 + 三维判重 + 入库默认值）**已被 ADR-011 取代**：4 列废弃保留、判重/默认值逻辑移除，见上方 ADR-011 章节。ADR-008/ADR-009 部分仍有效。
+
+### assets 新增列（6 列，均幂等迁移）
+
+| 表.列 | 类型 | 可空 | 说明 |
+|-------|------|------|------|
+| `assets.pricingMode` | VARCHAR(16) NOT NULL 默认 `'unit'` | 否 | 计价模式（ADR-008）：`unit`（单价×数量，默认）/ `amount`（包量合同金额整数元权威）。卫星 Token 资产入库置 `amount`（后端按类型权威决定，不接受前端入参）；`amount` 模式下 `salePrice` 仅参考值，不参与金额计算 |
+| `assets.province` | VARCHAR(64) 默认 `''` | 否 | 遥感数据省（ADR-010）；仅 `type='遥感数据'` 使用，其余类型恒空 |
+| `assets.city` | VARCHAR(64) 默认 `''` | 否 | 遥感数据市（可空，省级资产不填） |
+| `assets.resolution` | FLOAT | 是 | 遥感数据精度，单位**米**（如 1.5） |
+| `assets.imageDate` | VARCHAR(10) 默认 `''` | 否 | 遥感数据影像日期 `YYYY-MM-DD` |
+
+唯一性：遥感数据 `(province, city, resolution, imageDate)` 组合唯一，**服务层判重**（`create_asset` / `update_asset` 排除自身，Python 层，SQLite 单写模型，无 DB 唯一约束/索引）。
+
+### cart_items 新增列
+
+| 表.列 | 类型 | 可空 | 说明 |
+|-------|------|------|------|
+| `cart_items.amount` | FLOAT | 是 | 包量计价合同金额（ADR-008，元，整数）：仅 `pricingMode='amount'` 资产行使用，结算时必填（缺失 400）；unit 模式恒 NULL（忽略入参） |
+
+### 存量数据回填（幂等）
+
+- ADR-008：`UPDATE assets SET pricingMode='amount' WHERE type='卫星Token' AND pricingMode='unit'`（`salePrice` 原值保留，语义转参考值）；
+- ADR-009：`UPDATE cart_items SET userId='<admin 账号 users.id>' WHERE userId='admin'`（购物车改按登录用户隔离后，存量行归属 admin）。
+
+迁移语句（幂等，`main.py::_ensure_migration`）：
+
+```sql
+ALTER TABLE assets ADD COLUMN pricingMode VARCHAR(16) NOT NULL DEFAULT 'unit';
+ALTER TABLE cart_items ADD COLUMN amount FLOAT;
+ALTER TABLE assets ADD COLUMN province   VARCHAR(64) DEFAULT '';
+ALTER TABLE assets ADD COLUMN city       VARCHAR(64) DEFAULT '';
+ALTER TABLE assets ADD COLUMN resolution FLOAT;
+ALTER TABLE assets ADD COLUMN imageDate  VARCHAR(10) DEFAULT '';
+```
+
+### 行为变更（无新列）
+
+- **购物车按登录用户隔离（ADR-009）**：router 层购物车 7 端点传 `str(user.id)`（`get_current_user`）；`bootstrap.cart` 仅返回当前请求用户的行；`DEFAULT_USER` 常量保留但 router 不再使用。判重 (userId, assetId, customer) 与库存校验规则不变。
+- **销售明细计价分支（ADR-008）**：`amount` 模式明细以 `amount`（整数元，>0，否则 400）为权威输入，`price = round(amount/qty, 6)` 派生展示值，跳过 `price×qty` 权威重算；`unit` 模式行为完全不变。覆盖 `POST /projects`、`POST /sales/order`、`POST /cart/checkout`。
+- **遥感数据入库默认值（ADR-010）**：`quantity` 0→1、`unit` 空→`份（区域·精度·日期）`；`repeatSale` 由前端传（默认 True，允许关闭）。
+
+---
+
+## 2026-10-15 变更（ADR-007 合同层级：新表 contracts + 5 个新列 + 清理脚本）
+
+### 新表 contracts（合同）
+
+项目下按客户拆分的合同，库存联动的最小单位。合同内强制同一资产主体；合同一经生成不可增删改明细。
+
+| 列 | 类型 | 可空 | 说明 |
+|----|------|------|------|
+| id | INTEGER PK | 否 | DB 自增（禁止手写） |
+| code | VARCHAR(32) UNIQUE INDEX | 否 | `HT-{4位序号}`（flush 生成 id 后拼写） |
+| projectId | INTEGER INDEX | 否 | 归属项目（ForeignKey 声明，SQLite 默认不启用外键约束，引用完整性由服务层保证） |
+| customer | VARCHAR(128) | 否（默认 `''`） | 合同客户（必填语义由入参校验保证） |
+| subject | VARCHAR(128) | 否（默认 `''`） | 签约主体：建合同时从合同内资产主体推导（合同内强制同主体） |
+| contractAmount | FLOAT | 否（默认 0） | 合同金额，单位=**元**（ADR-006，Decimal 计算落 float） |
+| status | VARCHAR(32) INDEX | 否（默认 `active`） | `active` / `delivered` / `terminated` |
+| remark | TEXT | 否（默认 `''`） | 备注 |
+| createdAt/updatedAt | VARCHAR(32) | 否（默认 `''`） | `YYYY-MM-DD` |
+
+建表方式：`Base.metadata.create_all`（新表，无 ALTER 迁移需求）。ORM 关系：`Project.contracts`（cascade delete-orphan）、`Contract.items`（cascade delete-orphan，按 `project_items.contractId` 关联）。
+
+### 新增列（均幂等迁移，`main.py::_ensure_migration`）
+
+| 表.列 | 类型 | 可空 | 说明 |
+|-------|------|------|------|
+| `project_items.contractId` | INTEGER INDEX | 是 | 所属合同（ADR-007）：新数据必填；**存量项为 NULL**（清理脚本执行后消失） |
+| `outbounds.contractId` | INTEGER INDEX | 是 | 所属合同：合同交付自动出库精确关联；项目级手动出库为 NULL（`projectId` 保留） |
+| `flows.contractId` | INTEGER INDEX | 是 | 合同级交付/终止产生的流水（sale_out/cancel_release/manual_adjust）关联合同；非合同场景 NULL |
+| `logs.contractId` | INTEGER | 是 | 合同级状态变更日志（`action='合同状态变更'`）关联合同；其余日志 NULL |
+| `cart_items.customer` | VARCHAR(128) 默认 `''` | 否 | 购物车行级客户；唯一键语义 (userId, assetId, customer)（服务层判重，无 DB 唯一约束） |
+
+迁移语句（幂等）：
+
+```sql
+ALTER TABLE project_items ADD COLUMN contractId INTEGER;
+CREATE INDEX ix_project_items_contractId ON project_items (contractId);
+ALTER TABLE outbounds  ADD COLUMN contractId INTEGER;
+CREATE INDEX ix_outbounds_contractId ON outbounds (contractId);
+ALTER TABLE flows      ADD COLUMN contractId INTEGER;
+CREATE INDEX ix_flows_contractId ON flows (contractId);
+ALTER TABLE logs       ADD COLUMN contractId INTEGER;
+ALTER TABLE cart_items ADD COLUMN customer VARCHAR(128) DEFAULT '';
+```
+
+### 项目派生字段（无新列，行为变更）
+
+`projects.status` / `expectedAmount` / `contractAmount` / `customer` / `subject` 由合同派生（`services._recompute_project`，任何合同状态变更后重算落库）：无合同→status=active（存量兼容）；有 active→active；全 delivered→delivered；全 terminated→terminated；混合 delivered+terminated→terminated（保守）。`expectedAmount`=Σ合同 contractAmount；多合同 customer/subject=空字符串（前端显示「N 位客户」）、单合同=该合同值。`quoteAmount`/`paidAmount` 保留项目级手动。
+
+### 数据清理脚本（迁移窗口专用）
+
+`backend/cleanup_sales_data.py`（⚠️ 仅架构师审核后在**停服窗口**手动执行，应用启动不调用）：备份库 → 单事务按序删 `project_items` → `outbounds`（全部）→ 销售类 `flows`（`project_lock`/`sale_out`/`cancel_release`/`manual_adjust`，**`purchase_in` 保留**）→ `cart_items` → `contracts` → `projects` → 资产 `lockedQty=0, shippedQty=0, soldCount=0, soldAmount=0` → 资产 status 重刷（auto_status 同规则）→ 输出清理前后计数。幂等保护（projects+contracts 均空则跳过）。用法：`python3 cleanup_sales_data.py [--db path] [--dry-run]`。
+
+---
+
 ## 2026-10-14 变更
 
 ### OpLog（表 `logs`）新增列 `assetId`
@@ -63,6 +210,60 @@ ALTER TABLE logs ADD COLUMN assetId INTEGER;
 
 ---
 
+## 2026-10-15 变更（资产详情四点：3 个新列）
+
+### assets 新增列 `featureDoc`
+
+| 列名 | 类型 | 可空 | 说明 |
+|------|------|------|------|
+| featureDoc | VARCHAR(255) | 否（默认 `''`） | 功能清单附件 filename（`/upload` 返回值）；替换 `saleDetail` 电子表格的 UI 载体。`saleDetail` 列与存量数据保留不删 |
+
+### flows 新增列 `operator`
+
+| 列名 | 类型 | 可空 | 说明 |
+|------|------|------|------|
+| operator | VARCHAR(64) | 否（默认 `''`） | 流水操作账号（登录 username）；存量流水为空（前端显示 `-`）；启动 seed 路径写 `"system"` |
+
+### logs 新增列 `changes`
+
+| 列名 | 类型 | 可空 | 说明 |
+|------|------|------|------|
+| changes | VARCHAR(512) | 否（默认 `''`） | 字段级变更描述，仅 `update_asset` 有实际变更时写入，如 `销售单价: 330,000 元 → 3,200,000 元；资产总数: 5 → 8 套`（元值千分位 + 「 元」）；长文本字段只记 `规格描述: 已变更` |
+
+迁移语句（均幂等，`main.py::_ensure_migration`）：
+
+```sql
+ALTER TABLE assets ADD COLUMN featureDoc VARCHAR(255) DEFAULT '';
+ALTER TABLE flows  ADD COLUMN operator   VARCHAR(64)  DEFAULT '';
+ALTER TABLE logs   ADD COLUMN changes    VARCHAR(512) DEFAULT '';
+```
+
+另：`projects.subject`（签约主体）列此前已存在，本轮仅补行为（后端权威推导，见 changelog 2026-10-15），`main.py` 加幂等补列判断（现有库 no-op）。
+
+---
+
+## 2026-10-15 变更（文件原名映射：新表 file_meta）
+
+### 新表 file_meta（上传文件原名映射）
+
+上传文件以散列名（`uuid4().hex.ext`）落盘 `uploads/`，资产/日志直接存散列名；本表记录散列名→原始文件名映射，供前端展示与下载时还原原始名。
+
+| 列 | 类型 | 可空 | 说明 |
+|----|------|------|------|
+| storedName | VARCHAR(255) PK | 否 | 散列落盘名（主键） |
+| name | VARCHAR(255) | 否（默认 `''`） | 原始文件名 |
+| size | INTEGER | 否（默认 0） | 文件字节数 |
+| uploadedBy | VARCHAR(64) | 否（默认 `''`） | 上传账号 username（存量回填为空） |
+| createdAt | VARCHAR(32) | 否（默认 `''`） | `YYYY-MM-DD HH:MM`（同 `logs.time` 风格） |
+
+建表方式：`Base.metadata.create_all`（新表，无 ALTER 迁移需求）。
+
+写入点：
+- `POST /api/upload` 落盘成功后 `services.add_file_meta(...)`（上传非资产操作，**不写 OpLog**）。
+- 启动 `main.py::_backfill_file_meta()` **幂等回填**（`file_meta` 为空才执行）：扫描 `uploads/`，散列名文件若存在**内容相同（MD5）**的非散列（可读）文件则以其为原始名，否则 `name=自身名`；**纯数据库操作，不移动/重命名/删除 uploads 任何文件**。
+
+---
+
 ## 主要表结构（摘要）
 
 ### assets（资产）
@@ -76,10 +277,12 @@ ALTER TABLE logs ADD COLUMN assetId INTEGER;
 | lockedQty | INTEGER | 锁定数量 |
 | shippedQty | INTEGER | 已出库数量 |
 | repeatSale | BOOLEAN | 可重复售卖（不扣库存） |
-| salePrice/soldAmount | FLOAT | 单价 / 累计销售金额（万元，4 位小数） |
+| salePrice/soldAmount | FLOAT | 单价 / 累计销售金额（**元**，ADR-006；`pricingMode='amount'` 时 salePrice 仅参考值） |
 | soldCount | INTEGER | 授权/销售次数 |
+| pricingMode | VARCHAR(16) | 计价模式 `unit` / `amount`（ADR-008，2026-10-16 新增） |
+| province/city/resolution/imageDate | VARCHAR/FLOAT | ⚠️ **已废弃（ADR-011）**：ADR-010 遥感三维字段，列保留不删（技术债），服务层不再读写；遥感售卖粒度见 `rs_items` 表 |
 | status | VARCHAR(32) | `in_stock` / `all_sold`（自动判定） |
-| inboundDate/expiryDate/perpetual/spec/saleDetail/contractFile/remark/updatedAt | - | 其它 |
+| inboundDate/expiryDate/perpetual/spec/saleDetail/featureDoc/contractFile/remark/updatedAt | - | 其它（featureDoc=功能清单附件 filename，2026-10-15 新增） |
 
 可售数量 = `quantity - lockedQty - shippedQty`。
 
@@ -90,8 +293,21 @@ ALTER TABLE logs ADD COLUMN assetId INTEGER;
 | id | INTEGER PK | DB 自增 |
 | code | VARCHAR(32) UNIQUE | `SP-{3位序号}` |
 | status | VARCHAR(32) | `active` / `delivered` / `terminated`（后端状态机权威决定） |
-| expectedAmount/quoteAmount/contractAmount/paidAmount | FLOAT | 各口径金额 |
+| expectedAmount/quoteAmount/contractAmount/paidAmount | FLOAT | 各口径金额（expectedAmount/contractAmount 为合同派生，2026-10-15 起） |
 | items | 关系 | `ProjectItem`，cascade delete-orphan |
+| contracts | 关系 | `Contract`，cascade delete-orphan（2026-10-15 新增） |
+
+### contracts（合同，2026-10-15 新增）
+
+| 列 | 类型 | 说明 |
+|----|------|------|
+| id | INTEGER PK | DB 自增 |
+| code | VARCHAR(32) UNIQUE | `HT-{4位序号}` |
+| projectId | INTEGER INDEX | 归属项目 |
+| customer/subject | VARCHAR | 合同客户 / 签约主体（合同内强制同主体） |
+| contractAmount | FLOAT | 合同金额（元，ADR-006） |
+| status | VARCHAR(32) | `active` / `delivered` / `terminated` |
+| remark/createdAt/updatedAt | - | - |
 
 ### project_items（项目明细）
 
@@ -99,11 +315,28 @@ ALTER TABLE logs ADD COLUMN assetId INTEGER;
 |----|------|------|
 | id | INTEGER PK | DB 自增 |
 | project_id | INTEGER FK→projects.id | 归属项目 |
+| contractId | INTEGER NULL INDEX | 所属合同（2026-10-15 新增；新数据必填，存量 NULL） |
 | assetId | INTEGER NULL | 关联资产（空=待关联资产 `pending_asset`） |
 | qty/price/amount | INTEGER/FLOAT | `amount = round(price*qty, 4)`（后端权威重算） |
 | status | VARCHAR(32) | `pending_asset`/`pending_amount`/`locked`/`confirmed`/`shipped`/`released`（`pending_amount` 现不再产生） |
-| locked | BOOLEAN | 下单时刻该资产是否真实加锁（= 非 repeatSale）。repeatSale 资产下单只记 `status='locked'` 但不加锁；交付/终止/编辑释放锁定均以此区分「真锁过要释放」与「从未锁过不可写 cancel_release 幽灵流水」。存量数据默认 `0`（未锁过，语义正确）；2026-10-15 幂等迁移补列 |
+| locked | BOOLEAN | 下单时刻该资产是否真实加锁（= 非 repeatSale；ADR-011 起明细行 = 非**明细** repeatSale）。repeatSale 资产下单只记 `status='locked'` 但不加锁；交付/终止/编辑释放锁定均以此区分「真锁过要释放」与「从未锁过不可写 cancel_release 幽灵流水」。存量数据默认 `0`（未锁过，语义正确）；2026-10-15 幂等迁移补列 |
+| itemId | INTEGER NULL INDEX | 遥感数据明细（ADR-011，2026-10-16 新增）：非空行 qty 恒 1、amount=明细 price 权威、锁定/交付按明细 repeatSale；存量/非遥感行 NULL |
 | lockedDate/confirmedDate/shippedDate/deliveryReq | - | - |
+
+### rs_items（遥感数据可售明细，ADR-011，2026-10-16 新增）
+
+| 列 | 类型 | 说明 |
+|----|------|------|
+| id | INTEGER PK | DB 自增 |
+| assetId | INTEGER INDEX | 父资产（`type='遥感数据'` 容器行） |
+| province/city | VARCHAR(64) | 省（必填）/ 市（可空 `''`） |
+| resolution | FLOAT | 精度（米），> 0 |
+| saleMonth | VARCHAR(7) | 售卖月份 `YYYY-MM` |
+| price | FLOAT | 单价，整数元/份（元口径） |
+| repeatSale | BOOLEAN | 默认 1（true=只计次不扣量；false=锁父资产库存） |
+| createdAt/updatedAt | VARCHAR(32) | `YYYY-MM-DD HH:MM` |
+
+唯一性 `(assetId, province, city, resolution, saleMonth)` 服务层判重（无 DB 约束）。引用完整性：`project_items.itemId` / `cart_items.itemId` 有引用时禁止删除（400「该明细存在销售关联，无法删除」）；父资产删除时级联清理（delete_asset 通过引用校验后才可达）。
 
 ### outbounds（出库）
 
@@ -112,12 +345,13 @@ ALTER TABLE logs ADD COLUMN assetId INTEGER;
 | id | INTEGER PK | DB 自增 |
 | code | VARCHAR(32) UNIQUE | `CK-{4位序号}` |
 | projectId/assetId | INTEGER | 关联项目/资产（普通列，非外键） |
+| contractId | INTEGER NULL INDEX | 关联合同（2026-10-15 新增；合同交付自动出库时非空） |
 | qty/amount | INTEGER/FLOAT | 金额 4 位小数 |
 | status | VARCHAR(16) | `done` / `reverted` |
 
 ### 其它表
 
-`flows`（资产流水）、`logs`（操作日志，见上）、`base_records`、`deliverable_templates`、`category_units`、`asset_deliverables`、`cart_items`。
+`flows`（资产流水）、`logs`（操作日志，见上）、`base_records`、`deliverable_templates`、`category_units`、`asset_deliverables`、`cart_items`、`file_meta`（上传文件原名映射，见上）。
 
 ---
 

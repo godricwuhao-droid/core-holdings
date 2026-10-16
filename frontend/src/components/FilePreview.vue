@@ -1,10 +1,10 @@
 <template>
   <div class="fp">
     <div class="fp-bar">
-      <span class="fp-name">{{ title || filename }}</span>
+      <span class="fp-name">{{ title || fileDisplayName(filename) }}</span>
       <span class="fp-ops">
-        <a :href="url" target="_blank" rel="noopener" class="fp-op">新窗口打开</a>
-        <a :href="url" download class="fp-op">下载</a>
+        <a :href="downloadUrl" target="_blank" rel="noopener" class="fp-op">新窗口打开</a>
+        <a :href="downloadUrl" download class="fp-op">下载</a>
       </span>
     </div>
     <div class="fp-body">
@@ -22,7 +22,7 @@
 
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
-import { fileUrl } from '@/api'
+import { fileDisplayName, fileUrl } from '@/api'
 
 const props = withDefaults(
   defineProps<{ filename: string; title?: string }>(),
@@ -36,7 +36,10 @@ const kind = computed<'image' | 'pdf' | 'docx' | 'other'>(() => {
   if (ext.value === 'docx') return 'docx'
   return 'other'
 })
-const url = computed(() => fileUrl(props.filename))
+// 内联预览（img/iframe/docx fetch）：inline=true → Content-Disposition: inline，避免触发下载
+const url = computed(() => fileUrl(props.filename, true))
+// 顶栏「新窗口打开 / 下载」：保持非 inline（attachment 下载语义）
+const downloadUrl = computed(() => fileUrl(props.filename))
 
 const html = ref('')
 const loading = ref(false)

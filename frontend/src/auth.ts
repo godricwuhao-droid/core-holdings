@@ -21,15 +21,15 @@ export interface CurrentUser {
 const TOKEN_KEY = 'token'
 const USER_KEY = 'currentUser'
 
-/** 角色中文标签（与后端固定三角色一致） */
+/** 角色中文展示名（内部标识仍为 admin/editor/viewer，仅展示名调整） */
 export const ROLE_LABELS: Record<Role, string> = {
-  admin: '管理',
-  editor: '可编辑',
-  viewer: '只读',
+  admin: '管理员',
+  editor: '商务人员',
+  viewer: '生态人员',
 }
 
-/** 只读账号统一禁用提示文案 */
-export const READONLY_TIP = '只读账号无操作权限'
+/** 生态人员（viewer）写入口统一禁用提示文案 */
+export const READONLY_TIP = '生态人员无此操作权限'
 
 function loadUser(): CurrentUser | null {
   try {
@@ -48,8 +48,18 @@ export const currentUser = computed<CurrentUser | null>(() => state.user)
 /** 是否管理员（账号与审计等 admin 专用能力） */
 export const isAdmin = computed(() => state.user?.role === 'admin')
 
-/** 是否可执行业务写操作（admin / editor 可写，viewer 只读） */
+/** 是否可执行业务写操作（admin / editor 可写；viewer 仅下单链路，资产编辑类禁用） */
 export const canWrite = computed(() => state.user !== null && state.user.role !== 'viewer')
+
+/** 是否生态人员（viewer）：菜单/路由收窄 + 下单链路放权 */
+export const isViewer = computed(() => state.user?.role === 'viewer')
+
+/**
+ * 是否已登录（ADR-009）：下单链路（购物车加购/改量/删行/清空/结算、直接下单）
+ * 后端已全部改为 require_order（认证即放行），前端对应入口以本判据解禁，
+ * 不再受 canWrite（admin/editor）限制；资产编辑类入口仍用 canWrite。
+ */
+export const isLoggedIn = computed(() => state.user !== null)
 
 export function getToken(): string | null {
   return localStorage.getItem(TOKEN_KEY)

@@ -51,7 +51,7 @@
           class="side-menu"
           style="border-right: none; padding-top: 8px;"
         >
-          <el-menu-item index="/dashboard">
+          <el-menu-item v-if="!isViewer" index="/dashboard">
             <el-icon><Odometer /></el-icon>
             <template #title><span>首页概览</span></template>
           </el-menu-item>
@@ -73,7 +73,18 @@
             </el-menu-item>
           </el-sub-menu>
 
-          <el-sub-menu index="sales">
+          <!-- viewer（生态人员）：销售管理整组不可见，购物车以独立菜单项保留（含角标） -->
+          <el-menu-item v-if="isViewer" index="/cart">
+            <el-icon><ShoppingCart /></el-icon>
+            <template #title>
+              <span style="display: inline-flex; align-items: center; gap: 6px;">
+                购物车
+                <el-badge v-if="cartCount > 0" :value="cartCount" :max="99" style="transform: translateY(1px);" />
+              </span>
+            </template>
+          </el-menu-item>
+
+          <el-sub-menu v-if="!isViewer" index="sales">
             <template #title>
               <el-icon><TrendCharts /></el-icon>
               <span>销售管理</span>
@@ -111,7 +122,7 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue'
 import { useRoute } from 'vue-router'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElMessageBox } from 'element-plus'
 import {
   Odometer,
   Box,
@@ -121,9 +132,10 @@ import {
   CircleCheckFilled,
   Fold,
   Expand,
+  ShoppingCart,
 } from '@element-plus/icons-vue'
 import { db } from '@/api'
-import { canWrite, clearSession, currentUser, isAdmin, ROLE_LABELS } from '@/auth'
+import { canWrite, clearSession, currentUser, isAdmin, isViewer, ROLE_LABELS } from '@/auth'
 
 const route = useRoute()
 const isCollapse = ref(false)

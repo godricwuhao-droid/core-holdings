@@ -14,9 +14,20 @@ export const CATEGORY_UNITS: CategoryUnit[] = [
   { board: 'embodied', type: '平台软件', unit: '套', note: '管理平台类' },
   { board: 'satellite', type: '卫星Token', unit: '颗（Token 额度）', note: '按 Token 额度与有效期售卖' },
   { board: 'satellite', type: '卫星数据', unit: '轨 / 期 / 条', note: '默认可重复售卖，不扣减库存' },
+  { board: 'satellite', type: '遥感数据', unit: '份（可售明细）', note: '父资产容器，按 省/精度/月份 维护明细售卖' },
   { board: 'software', type: '软件', unit: '套', note: '永久 / 年限 / 并发 / 账号许可' },
   { board: 'hardware', type: '硬件集群', unit: '集群 / 台', note: '整机柜或单台交付' },
   { board: 'compute', type: '算力服务器', unit: '台（服务期）', note: '按服务期售卖，建设中' },
+]
+
+/** 中国 31 省级行政区（ADR-011 遥感数据可售明细「省份」下拉内置常量） */
+export const PROVINCES: string[] = [
+  '北京市', '天津市', '河北省', '山西省', '内蒙古自治区',
+  '辽宁省', '吉林省', '黑龙江省',
+  '上海市', '江苏省', '浙江省', '安徽省', '福建省', '江西省', '山东省',
+  '河南省', '湖北省', '湖南省', '广东省', '广西壮族自治区', '海南省',
+  '重庆市', '四川省', '贵州省', '云南省', '西藏自治区',
+  '陕西省', '甘肃省', '青海省', '宁夏回族自治区', '新疆维吾尔自治区',
 ]
 
 export const FEATURE_CATALOGS: Record<string, FeatureModule[]> = {

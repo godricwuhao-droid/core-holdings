@@ -164,10 +164,10 @@ async function handleDelete(row: { id: number; name: string }) {
     <el-dialog
       v-model="dialog.visible"
       :title="(dialog.editing ? '编辑' : '新增') + kindLabel"
-      width="560px"
+      class="dlg-form"
       :close-on-click-modal="false"
     >
-      <el-form label-width="90px">
+      <el-form label-width="96px">
         <el-form-item label="名称" required>
           <el-input v-model="dialog.form.name" />
         </el-form-item>

@@ -3,17 +3,17 @@
  * 购物车 - 汇总待售资产
  *
  * 展示已加入购物车的资产，支持调整数量 / 移除 / 清空；数量受可售库存约束。
- * 「下单」= 用购物车资产生成「进行中」销售项目并锁定库存（不自动出库），随后清空购物车；
- * 交付（扣库存 + 出库记录）需在销售项目页将状态置「已完成」后触发。
+ * ADR-007：允许跨主体混装；每行填写「客户」，结算时按客户分组——
+ * 每客户生成一份合同（合同内强制同一主体），全部挂在同一个「进行中」销售项目下并锁定库存。
+ * 交付（扣库存 + 出库记录）在项目详情页对合同执行「交付」后触发。
  * 数据预留 userId 维度（当前默认 admin），为后续账号权限管控做准备。
  */
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Delete, InfoFilled, Sell, ShoppingCart } from '@element-plus/icons-vue'
-import { availableQty, formatMoney, type Asset, type CartItem } from '@/types'
-import { checkoutCart, clearCart, db, getAsset, refresh, removeCartItem, setCartQty, type OrderFields } from '@/api'
-import { canWrite, READONLY_TIP } from '@/auth'
+import { availableQty, entityShort, formatMoney, formatTokens, isAmountMode, rsItemName, type Asset, type CartItem, type RsItem } from '@/types'
+import { checkoutCart, clearCart, db, getAsset, patchCartItem, refresh, removeCartItem, rsItemById, setCartAmount, setCartQty, type OrderFields } from '@/api'
 import SalesOrderDialog from '@/components/SalesOrderDialog.vue'
 import type { OrderItem } from '@/components/SalesOrderDialog.vue'
 
@@ -24,21 +24,93 @@ interface CartRow {
   asset: Asset
   price: number
   subtotal: number
+  /** ADR-008：包量定价行（合同金额权威，单价仅参考） */
+  isAmount: boolean
+  /** ADR-011：遥感明细行（含 itemId，数量恒 1，单价 = 明细 price）
+   *  显式 `RsItem | undefined`（而非可选属性）：computed map 恒返回该键，
+   *  可选属性会使 filter 类型谓词 `r is CartRow` 不满足可赋值性（TS2677） */
+  rsItem: RsItem | undefined
 }
 
 const cartRows = computed<CartRow[]>(() =>
   db.cart
     .map((c) => {
       const asset = getAsset(c.assetId)
-      return { cart: c, asset, price: asset?.salePrice ?? 0, subtotal: (asset?.salePrice ?? 0) * c.qty }
+      const rsItem = c.itemId != null ? rsItemById(c.itemId) : undefined
+      const isAmount = !!asset && !rsItem && isAmountMode(asset)
+      // 遥感明细行合计 = 明细单价（qty 恒 1）；amount 模式行 = 行内合同金额；unit 模式 = 单价×数量
+      const subtotal = rsItem ? rsItem.price : isAmount ? (c.amount ?? 0) : (asset?.salePrice ?? 0) * c.qty
+      return { cart: c, asset, price: rsItem ? rsItem.price : asset?.salePrice ?? 0, subtotal, isAmount, rsItem }
     })
     .filter((r): r is CartRow => !!r.asset),
 )
 
 const totalQty = computed(() => db.cart.reduce((s, c) => s + c.qty, 0))
 const totalAmount = computed(() => cartRows.value.reduce((s, r) => s + r.subtotal, 0))
-/** 当前购物车主体（购物车强制同主体，取第一条展示全称） */
-const cartSubject = computed(() => cartRows.value[0]?.asset.subject ?? '')
+
+// ==================== 行级客户（ADR-007：结算时按客户分组拆合同） ====================
+/** 客户校验失败（标红）的购物车行 id 集合 */
+const customerErrors = reactive(new Set<number>())
+
+// ==================== 行级合同金额（ADR-008：仅包量定价行，整数元权威输入） ====================
+/** 合同金额未填/非法（标红置灰）的购物车行 id 集合 */
+const amountErrors = reactive(new Set<number>())
+
+/** 金额输入：仅保留整数位（元口径，禁止小数） */
+function onAmountInput(row: CartRow, v: string) {
+  const digits = (v ?? '').replace(/[^\d]/g, '')
+  row.cart.amount = digits === '' ? undefined : Number(digits)
+  if (row.cart.amount) amountErrors.delete(row.cart.id)
+}
+
+/** 失焦提交：正整数校验通过后同步后端（400 时回滚到后端值） */
+async function onAmountChange(row: CartRow) {
+  const n = row.cart.amount
+  if (!n || !Number.isInteger(n) || n <= 0) {
+    amountErrors.add(row.cart.id)
+    return
+  }
+  amountErrors.delete(row.cart.id)
+  try {
+    // 回传该行当前 qty：后端 PUT 对 qty<=0 会删行，金额提交绝不能触发删除
+    await setCartAmount(row.cart.id, row.cart.qty, n)
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : '合同金额更新失败')
+    await refresh(true)
+  }
+}
+
+/** 结算预览：按客户分组（保持行序），每组 = 未来一份合同 */
+const previewGroups = computed(() => {
+  const groups: { customer: string; qty: number; amount: number }[] = []
+  const idx = new Map<string, number>()
+  for (const r of cartRows.value) {
+    const customer = (r.cart.customer ?? '').trim()
+    if (!customer) continue
+    const i = idx.get(customer)
+    if (i === undefined) {
+      idx.set(customer, groups.length)
+      groups.push({ customer, qty: r.cart.qty, amount: r.subtotal })
+    } else {
+      groups[i].qty += r.cart.qty
+      groups[i].amount += r.subtotal
+    }
+  }
+  return groups
+})
+
+/** 行内编辑客户：失焦 / 回车提交；400（同资产同客户已有行）弹后端文案并回滚 */
+async function onCustomerChange(row: CartRow) {
+  const id = row.cart.id
+  const next = (row.cart.customer ?? '').trim()
+  if (next) customerErrors.delete(id)
+  try {
+    await patchCartItem(id, next)
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : '客户修改失败')
+    await refresh(true) // 回滚到后端值
+  }
+}
 
 onMounted(async () => {
   await refresh()
@@ -59,6 +131,8 @@ function goAssetDetail(assetId: number) {
 }
 
 async function onQtyChange(row: CartRow) {
+  // ADR-011：遥感明细行数量恒 1（输入禁用，双保险拦截）
+  if (row.rsItem) return
   const avail = availOf(row.asset)
   if (avail !== null && row.cart.qty > avail) {
     ElMessage.error(`「${row.asset.name}」可售库存仅 ${avail}${row.asset.unit}，已为你回退`)
@@ -111,20 +185,45 @@ const orderVisible = ref(false)
 const orderLoading = ref(false)
 
 const orderItems = computed<OrderItem[]>(() =>
-  cartRows.value.map((r) => ({ asset: r.asset, qty: r.cart.qty })),
+  cartRows.value.map((r) => ({
+    asset: r.asset,
+    qty: r.cart.qty,
+    // ADR-008：包量定价行携带行内合同金额（整数元）
+    ...(r.isAmount ? { amount: r.cart.amount ?? 0 } : {}),
+    // ADR-011：遥感明细行携带 itemId（数量恒 1，单价 = 明细 price）
+    ...(r.rsItem ? { itemId: r.rsItem.id, amount: r.rsItem.price } : {}),
+  })),
 )
 
 function openOrder() {
   if (!db.cart.length) return
+  // 结算前置校验：任一行为空客户 → 不发请求，标红输入框（validate=error）
+  const missing = cartRows.value.filter((r) => !(r.cart.customer ?? '').trim())
+  if (missing.length) {
+    missing.forEach((r) => customerErrors.add(r.cart.id))
+    ElMessage.warning('请为每件资产填写客户')
+    return
+  }
+  // ADR-008：包量定价行未填合同金额（整数元）→ 该行结算禁用，标红提示
+  const missingAmount = cartRows.value.filter(
+    (r) => r.isAmount && !(r.cart.amount && Number.isInteger(r.cart.amount) && r.cart.amount > 0),
+  )
+  if (missingAmount.length) {
+    missingAmount.forEach((r) => amountErrors.add(r.cart.id))
+    ElMessage.warning('请为包量定价资产填写合同金额（整数元）')
+    return
+  }
   orderVisible.value = true
 }
 
-async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: number; qty: number }[] }) {
+async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: number; qty: number; amount?: number }[] }) {
   orderLoading.value = true
   try {
-    const p = await checkoutCart(payload.fields)
+    // ADR-008：包量定价行合同金额已由行内失焦 PUT /cart/{id} 持久化，结算只传订单字段（后端 CheckoutInput 无 items）
+    const p = await checkoutCart({ ...payload.fields })
     orderVisible.value = false
-    ElMessage.success(`下单成功，已生成销售项目 ${p.code}（进行中）`)
+    const cc = p.contractCount ?? previewGroups.value.length
+    ElMessage.success(`下单成功，已生成销售项目 ${p.code}（进行中 · ${cc} 份合同）`)
     await refresh(true)
     router.push(`/sales/projects/${p.id}/detail`)
   } catch (e) {
@@ -143,7 +242,7 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
       <div>
         <div class="crumb">销售管理 / 购物车</div>
         <h1>购物车</h1>
-        <div class="desc">汇总待售资产，可调整数量、移除或清空；下单后生成进行中销售项目并锁定库存，确认交付后在项目页置「已完成」即出库。</div>
+        <div class="desc">汇总待售资产，可调整数量、移除或清空；为每件资产填写客户后下单，按客户分组生成合同并锁定库存，交付在项目详情页对合同执行「交付」即出库。</div>
       </div>
     </div>
 
@@ -158,7 +257,7 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
       <!-- 提示条 -->
       <div class="info-bar">
         <el-icon aria-hidden="true"><InfoFilled /></el-icon>
-        <span>当前购物车主体：{{ cartSubject }}。购物车仅可添加「同一主体」的资产，且数量受资产「可售库存」约束：暂无可售库存的资产不可加入，超出可售库存的数量会被自动拦截；可重复售卖资产不受限。点击「下单」将生成进行中销售项目并锁定库存，确认交付后在项目页置「已完成」即出库。</span>
+        <span>购物车可混装不同主体的资产，数量受资产「可售库存」约束：暂无可售库存的资产不可加入，超出可售库存的数量会被自动拦截；可重复售卖资产不受限。包量定价（Token）资产按包售卖，需为该行填写合同金额（整数元），结算以合同金额为准。点击「下单」前请为每件资产填写客户：按客户分组生成合同（同一客户的资产须同一主体，否则请拆分到不同客户），生成进行中销售项目并锁定库存，交付在项目详情页对合同执行「交付」即出库。</span>
       </div>
 
       <!-- 表格卡 -->
@@ -167,41 +266,88 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
           <span class="t">待售资产</span>
           <div class="th-right">
             <span class="c">共 {{ totalQty }} 件</span>
-            <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="bottom">
-              <span>
-                <el-button type="danger" plain :icon="Delete" :disabled="!canWrite || !db.cart.length" @click="clearAll">
-                  清空购物车
-                </el-button>
-              </span>
-            </el-tooltip>
+            <!-- ADR-009：清空购物车对三角色均可用（后端 require_order，已登录即可）；仅空车禁用 -->
+            <el-button type="danger" plain :icon="Delete" :disabled="!db.cart.length" @click="clearAll">
+              清空购物车
+            </el-button>
           </div>
         </div>
         <el-table :data="cartRows" border stripe>
           <el-table-column label="资产名称" min-width="220" align="left">
             <template #default="{ row }">
+              <!-- ADR-011：遥感明细行两行展示——主行父资产名，次级行明细名（省/市 精度 月份） -->
               <a class="cart-asset-name" @click="goAssetDetail(row.asset.id)">{{ row.asset.name }}</a>
-              <div class="muted cart-asset-sub">{{ row.asset.code }} · {{ row.asset.type }}</div>
+              <div v-if="row.rsItem" class="muted cart-asset-sub">{{ rsItemName(row.rsItem) }}</div>
+              <div v-else class="muted cart-asset-sub">{{ row.asset.code }} · {{ row.asset.type }} · {{ entityShort(row.asset.subject) }}</div>
             </template>
           </el-table-column>
-          <el-table-column label="销售单价" width="130" align="right" header-align="right">
-            <template #default="{ row }">{{ formatMoney(row.price) }}</template>
+          <el-table-column label="客户" width="180" align="left">
+            <template #default="{ row }">
+              <!-- 行级客户对三角色均可编辑（含生态人员） -->
+              <el-tooltip content="结算时按客户分组生成合同" placement="top">
+                <el-input
+                  v-model="row.cart.customer"
+                  size="small"
+                  :placeholder="customerErrors.has(row.cart.id) ? '必填' : '填写客户'"
+                  :class="{ 'cart-customer-error': customerErrors.has(row.cart.id) }"
+                  @change="onCustomerChange(row)"
+                />
+              </el-tooltip>
+            </template>
+          </el-table-column>
+          <el-table-column label="销售单价" width="140" align="right" header-align="right">
+            <template #default="{ row }">
+              <!-- ADR-008：包量定价行单价为参考口径（元/万Token），不参与计价 -->
+              <span v-if="row.isAmount" class="muted">约 ¥{{ row.price }}/万Token</span>
+              <span v-else>{{ formatMoney(row.price) }}</span>
+            </template>
           </el-table-column>
           <el-table-column label="数量" width="160" align="center">
             <template #default="{ row }">
-              <el-input-number
-                v-model="row.cart.qty"
-                :min="1"
-                :max="qtyMax(row)"
-                :precision="0"
-                controls-position="right"
-                style="width: 110px;"
-                @change="onQtyChange(row)"
-              />
-              <div v-if="row.asset.repeatSale" class="muted cart-qty-hint">不限</div>
+              <!-- ADR-011：遥感明细行数量恒 1（禁用输入 + tooltip 提示） -->
+              <el-tooltip :content="row.rsItem ? '遥感明细数量固定 1' : ''" :disabled="!row.rsItem" placement="top">
+                <el-input-number
+                  v-model="row.cart.qty"
+                  :min="1"
+                  :max="row.rsItem ? 1 : qtyMax(row)"
+                  :precision="0"
+                  controls-position="right"
+                  style="width: 110px;"
+                  :disabled="!!row.rsItem"
+                  @change="onQtyChange(row)"
+                />
+              </el-tooltip>
+              <div v-if="row.rsItem" class="muted cart-qty-hint">遥感明细数量固定 1</div>
+              <div v-else-if="row.isAmount" class="muted cart-qty-hint">{{ formatTokens(row.cart.qty) }} Token</div>
+              <div v-else-if="row.asset.repeatSale" class="muted cart-qty-hint">不限</div>
               <div v-else-if="row.cart.qty >= (availOf(row.asset) ?? 0)" class="cart-sellable-max">
                 已达上限 {{ availOf(row.asset) }}
               </div>
               <div v-else class="muted cart-qty-hint">可售 {{ availOf(row.asset) }}</div>
+            </template>
+          </el-table-column>
+          <!-- ADR-008：包量定价行合同金额（整数元，权威输入）；未填时该行结算禁用 -->
+          <el-table-column label="合同金额（元）" width="180" align="center">
+            <template #default="{ row }">
+              <template v-if="row.isAmount">
+                <el-tooltip
+                  :content="row.cart.amount ? '包量定价：合同金额（整数元）为权威输入' : '请填写合同金额（整数元）后方可结算'"
+                  placement="top"
+                >
+                  <el-input
+                    :model-value="row.cart.amount ?? ''"
+                    placeholder="整数元"
+                    size="small"
+                    :class="{
+                      'cart-amount-empty': !row.cart.amount,
+                      'cart-customer-error': amountErrors.has(row.cart.id),
+                    }"
+                    @input="onAmountInput(row, $event)"
+                    @change="onAmountChange(row)"
+                  />
+                </el-tooltip>
+              </template>
+              <span v-else class="muted">-</span>
             </template>
           </el-table-column>
           <el-table-column label="小计" width="130" align="right" header-align="right">
@@ -211,13 +357,10 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
           </el-table-column>
           <el-table-column label="操作" width="70" align="center">
             <template #default="{ row }">
-              <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="top">
-                <span>
-                  <el-button link type="danger" size="small" :disabled="!canWrite" @click="removeRow(row)">
-                    移除
-                  </el-button>
-                </span>
-              </el-tooltip>
+              <!-- 删行对三角色均可用（含生态人员） -->
+              <el-button link type="danger" size="small" @click="removeRow(row)">
+                移除
+              </el-button>
             </template>
           </el-table-column>
         </el-table>
@@ -226,23 +369,23 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
           <span class="muted cart-settle-qty">合计 {{ totalQty }} 件</span>
           <div class="cart-settle-right">
             <span class="cart-total-value">{{ formatMoney(totalAmount) }}</span>
-            <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="top">
-              <span>
-                <el-button type="primary" :icon="Sell" :disabled="!canWrite || !db.cart.length" @click="openOrder">
-                  下单
-                </el-button>
-              </span>
-            </el-tooltip>
+            <!-- 结算下单对三角色均可用（含生态人员） -->
+            <el-button type="primary" :icon="Sell" :disabled="!db.cart.length" @click="openOrder">
+              下单
+            </el-button>
           </div>
         </div>
       </el-card>
     </template>
 
-    <!-- 下单对话框（共用组件：主体只读 / 无行业 / ¥ 金额） -->
+    <!-- 下单对话框（共用组件：主体只读 / 无行业 / ¥ 金额；购物车场景带按客户分组的结算预览）
+         cartMode：客户已在行级填写 → 对话框无「客户名称」字段，合同金额只读汇总，项目名称默认「采购订单」 -->
     <SalesOrderDialog
       v-model="orderVisible"
       title="购物车下单"
       :items="orderItems"
+      :preview-groups="previewGroups"
+      :cart-mode="true"
       :loading="orderLoading"
       @submit="onOrderSubmit"
     />
@@ -277,6 +420,14 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
 .cart-qty-hint {
   font-size: 12px;
   margin-top: 4px;
+}
+/* 空客户校验标红（EP 2.14 独立 el-input 无 validate 态，按 wrapper box-shadow 描边） */
+.cart-customer-error :deep(.el-input__wrapper) {
+  box-shadow: 0 0 0 1px var(--danger-color) inset;
+}
+/* ADR-008：合同金额未填时置灰（该行结算禁用，tooltip 提示） */
+.cart-amount-empty :deep(.el-input__wrapper) {
+  opacity: 0.45;
 }
 .th-right {
   display: flex;

@@ -34,25 +34,43 @@ import {
   boardLabel,
   entityShort,
   expiryText,
+  formatAssetQty,
   formatMoney,
-  formatWan,
+  isAmountMode,
   noSellableStock,
   tagInfo,
+  rsItemName,
+  type AssetFlow,
   type DeliverableCategory,
   type FlowType,
+  type Project,
+  type ProjectItem,
+  type RsItem,
 } from '@/types'
 import {
   addAssetDeliverable,
+  addRsItem,
   assetFlows,
+  createSaleOrder,
   deleteAsset,
+  deleteRsItem,
   getAsset,
   getAssetDeliverables,
-  getFeatureCatalog,
   projectItemsOfAsset,
+  refresh,
+  rsItemsOfAsset,
+  translateFileNames,
   updateAssetDeliverable,
+  updateRsItem,
   db,
+  type OrderFields,
+  type RsItemInput,
 } from '@/api'
-import { canWrite, READONLY_TIP } from '@/auth'
+import SalesOrderDialog from '@/components/SalesOrderDialog.vue'
+import RsItemPicker from '@/components/RsItemPicker.vue'
+import type { OrderItem } from '@/components/SalesOrderDialog.vue'
+import { PROVINCES } from '@/constants'
+import { canWrite, isViewer, READONLY_TIP } from '@/auth'
 
 const route = useRoute()
 const router = useRouter()
@@ -83,13 +101,61 @@ function isWipBoard() {
 // ============================================================
 // 顶部动作
 // ============================================================
+// ---- 登记销售：admin/editor 走销售模块创建页（原行为）；viewer（生态人员）无销售模块入口，
+//      直接打开下单对话框（与资产列表抽屉「销售」同一表单，单资产 + 数量） ----
+const saleItem = ref<OrderItem | null>(null)
+const saleVisible = ref(false)
+const saleLoading = ref(false)
+/** ADR-011：遥感数据「登记销售」勾选的明细行（订单级客户 + N 行明细，行带 itemId、qty=1） */
+const rsSaleItems = ref<OrderItem[]>([])
+const saleItems = computed<OrderItem[]>(() =>
+  rsSaleItems.value.length ? rsSaleItems.value : saleItem.value ? [saleItem.value] : [],
+)
+
+// ---- ADR-011：遥感数据明细选择弹窗（登记销售入口；加购统一走资产列表）----
+const rsPickerVisible = ref(false)
+
+function onRsPickerConfirm(items: RsItem[]) {
+  const a = asset.value
+  if (!a) return
+  rsSaleItems.value = items.map((it) => ({ asset: a, qty: 1, amount: it.price, itemId: it.id }))
+  saleItem.value = null
+  saleVisible.value = true
+}
+
 function goRegisterSale() {
   if (!asset.value) return
+  // ADR-011：遥感数据父资产 → 明细选择弹窗（父资产本身不可直接下单，库存校验不适用）
+  if (asset.value.type === '遥感数据') {
+    rsPickerVisible.value = true
+    return
+  }
   if (noSellableStock(asset.value)) {
     ElMessage.warning('该资产当前无可售库存（可售数量为 0），无法登记销售。请待库存释放（取消锁定或补充入库）后再操作。')
     return
   }
+  if (isViewer.value) {
+    rsSaleItems.value = []
+    saleItem.value = { asset: asset.value, qty: 1 }
+    saleVisible.value = true
+    return
+  }
   router.push({ path: '/sales/projects/create', query: { assetId: String(asset.value.id) } })
+}
+
+async function onSaleSubmit(payload: { fields: OrderFields; items: { assetId: number; qty: number; amount?: number }[] }) {
+  saleLoading.value = true
+  try {
+    const p = await createSaleOrder({ ...payload.fields, items: payload.items })
+    saleVisible.value = false
+    ElMessage.success(`下单成功，已生成销售项目 ${p.code}（进行中）`)
+    await refresh(true)
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : '下单失败')
+    await refresh(true)
+  } finally {
+    saleLoading.value = false
+  }
 }
 
 /** 编辑资产：无可售库存时提示（不阻止，允许补入库） */
@@ -203,7 +269,7 @@ const defaultScope = computed(() =>
 
 /** 交付三步（右侧说明栏时间线） */
 const DELIVERY_STEPS = [
-  { t: '项目关联', d: '销售人员在销售项目中选择资产及数量。' },
+  { t: '项目关联', d: '生态人员在销售项目中选择资产及数量。' },
   { t: '选择交付包', d: '交付人员确认本次需使用的交付物版本。' },
   { t: '完成交付', d: '记录序列号、客户、日期和经办人，生成交付凭证。' },
 ]
@@ -250,21 +316,137 @@ async function setDelStatus(status: 'ready' | 'todo') {
   ElMessage.success(status === 'ready' ? '已置为「已就绪」' : '已置为「待完善」')
 }
 
-// ---- 功能清单（结构化模块树）----
-const featureDialog = ref(false)
-const featureCatalog = computed(() => getFeatureCatalog(asset.value?.type ?? ''))
-const activeModule = ref(0)
-const activeSub = ref(0)
+// ============================================================
+// 可售明细（ADR-011：仅 type='遥感数据' 显示页签；CRUD 走 rs-items 接口，require_editor）
+// ============================================================
+const rsItems = computed<RsItem[]>(() => (asset.value ? rsItemsOfAsset(asset.value.id) : []))
 
-function openFeature(delName: string) {
-  if (featureCatalog.value.length === 0) {
-    ElMessage.info('该资产类型暂未配置结构化功能清单')
+/** 精度选项（米） */
+const RS_RESOLUTIONS = [0.5, 1, 1.5, 2]
+
+/** 已售次数（派生）：db 中该 itemId 已完成（delivered）合同明细计次；统计不到显示 0 */
+function rsSoldCount(itemId: number): number {
+  return db.contracts
+    .filter((c) => c.status === 'delivered')
+    .reduce((s, c) => s + c.items.filter((it) => it.itemId === itemId).length, 0)
+}
+
+const rsForm = reactive({
+  visible: false,
+  editing: null as RsItem | null,
+  province: '',
+  city: '',
+  resolution: undefined as number | undefined,
+  saleMonth: '',
+  price: undefined as number | undefined,
+})
+
+function openRsCreate() {
+  rsForm.editing = null
+  rsForm.province = ''
+  rsForm.city = ''
+  rsForm.resolution = undefined
+  rsForm.saleMonth = ''
+  rsForm.price = undefined
+  rsForm.visible = true
+}
+
+function openRsEdit(it: RsItem) {
+  rsForm.editing = it
+  rsForm.province = it.province
+  rsForm.city = it.city
+  rsForm.resolution = it.resolution
+  rsForm.saleMonth = it.saleMonth
+  rsForm.price = it.price
+  rsForm.visible = true
+}
+
+async function saveRsItem() {
+  if (!asset.value) return
+  if (!rsForm.province) {
+    ElMessage.warning('请选择省份')
     return
   }
-  void delName
-  activeModule.value = 0
-  activeSub.value = 0
-  featureDialog.value = true
+  if (!rsForm.resolution) {
+    ElMessage.warning('请选择精度')
+    return
+  }
+  if (!rsForm.saleMonth) {
+    ElMessage.warning('请选择月份')
+    return
+  }
+  if (!rsForm.price || !Number.isInteger(rsForm.price) || rsForm.price <= 0) {
+    ElMessage.warning('单价须为整数元（大于 0）')
+    return
+  }
+  const data: RsItemInput = {
+    province: rsForm.province,
+    city: rsForm.city,
+    resolution: rsForm.resolution,
+    saleMonth: rsForm.saleMonth,
+    price: rsForm.price,
+    // 编辑沿用既有可重复售卖设置；新增默认 true（只计次不扣量）
+    repeatSale: rsForm.editing ? rsForm.editing.repeatSale : true,
+  }
+  try {
+    if (rsForm.editing) {
+      await updateRsItem(rsForm.editing.id, data)
+      ElMessage.success('明细已更新')
+    } else {
+      await addRsItem(asset.value.id, data)
+      ElMessage.success('明细已新增')
+    }
+    rsForm.visible = false
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : '保存失败')
+  }
+}
+
+async function removeRsItem(it: RsItem) {
+  try {
+    await ElMessageBox.confirm(
+      `确定删除明细「${rsItemName(it)}」吗？`,
+      '删除确认',
+      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  try {
+    await deleteRsItem(it.id)
+    ElMessage.success('明细已删除')
+  } catch (e) {
+    // 后端 400「该明细存在销售关联，无法删除」原样 toast
+    ElMessage.error(e instanceof Error ? e.message : '删除失败')
+  }
+}
+
+/**
+ * 签约主体（ADR-007，三级兜底）：
+ * 1. 项目自身 subject（派生：单合同=该合同值，多合同=空）；
+ * 2. 为空时取**本行明细所属合同**的 subject（合同内强制同一资产主体，最贴近本行）；
+ * 3. 仍无（存量明细 contractId=null）→ 兜底明细资产自身主体；仍无 → '-'。
+ */
+function projectSubject(p: Project, item: ProjectItem): string {
+  if (p.subject) return p.subject
+  if (item.contractId) {
+    const c = db.contracts.find((c) => c.id === item.contractId)
+    if (c?.subject) return c.subject
+  }
+  const it = item.assetId != null ? item : p.items.find((i) => i.assetId != null)
+  const assetId = it?.assetId
+  return (assetId != null ? getAsset(assetId)?.subject : '') || '-'
+}
+
+/** 合同数（ADR-007）：contractCount 缺失/0 的存量项目按单合同口径显示「1 份合同」 */
+function contractCountText(p: Project): string {
+  return p.contractCount ? `${p.contractCount} 份合同` : '1 份合同'
+}
+
+/** 流水操作人：空 → -；system → 系统 */
+function operatorText(f: AssetFlow): string {
+  if (!f.operator) return '-'
+  return f.operator === 'system' ? '系统' : f.operator
 }
 </script>
 
@@ -304,11 +486,8 @@ function openFeature(delName: string) {
                 </el-button>
               </span>
             </el-tooltip>
-            <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="bottom">
-              <span>
-                <el-button plain :icon="Link" :disabled="!canWrite" @click="goRegisterSale">登记销售</el-button>
-              </span>
-            </el-tooltip>
+            <!-- 登记销售对三角色均可用（含生态人员；viewer 打开直接下单对话框） -->
+            <el-button plain :icon="Link" @click="goRegisterSale">登记销售</el-button>
             <el-dropdown trigger="click">
               <span class="more-btn">
                 更多
@@ -381,15 +560,19 @@ function openFeature(delName: string) {
                 <div class="info-grid info-grid-1">
                   <div class="info-item">
                     <span class="il">资产总数</span>
-                    <span class="iv">{{ formatWan(asset.quantity) }} {{ asset.unit }}</span>
+                    <span class="iv">{{ formatAssetQty(asset, asset.quantity) }} {{ asset.unit }}</span>
                   </div>
                   <div class="info-item">
                     <span class="il">可售数量</span>
-                    <span class="iv">{{ asset.repeatSale ? '不限' : `${formatWan(availableQty(asset))} ${asset.unit}` }}</span>
+                    <span class="iv">{{ asset.repeatSale ? '不限' : `${formatAssetQty(asset, availableQty(asset))} ${asset.unit}` }}</span>
                   </div>
                   <div class="info-item">
                     <span class="il">销售单价</span>
-                    <span class="iv">{{ asset.salePrice ? formatMoney(asset.salePrice) : '-' }}<template v-if="asset.repeatSale"> / {{ asset.unit }}</template></span>
+                    <!-- ADR-008：包量定价资产单价为参考口径（元/万Token），不参与计价 -->
+                    <span v-if="isAmountMode(asset)" class="iv">
+                      {{ asset.salePrice ? `约 ¥${asset.salePrice}/万Token（参考）` : '-' }}
+                    </span>
+                    <span v-else class="iv">{{ asset.salePrice ? formatMoney(asset.salePrice) : '-' }}<template v-if="asset.repeatSale"> / {{ asset.unit }}</template></span>
                   </div>
                   <div class="info-item">
                     <span class="il">入库时间</span>
@@ -409,6 +592,75 @@ function openFeature(delName: string) {
                   <span>资产基础信息登记入库后生成；修改关键字段将记录操作日志。</span>
                 </div>
               </div>
+            </div>
+          </el-tab-pane>
+
+          <!-- 1.5 可售明细（ADR-011：仅遥感数据父资产显示；CRUD 明细） -->
+          <el-tab-pane v-if="asset.type === '遥感数据'" :label="`可售明细（${rsItems.length}）`" name="rsItems">
+            <div class="detail-card">
+              <div class="card-head">
+                <div>
+                  <div class="card-title">可售明细</div>
+                  <div class="card-desc">按 省/精度/月份 维护可售卖明细，每份明细独立计价（整数元/份），默认可重复售卖（只计次不扣量）。</div>
+                </div>
+                <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="bottom">
+                  <span>
+                    <el-button type="primary" size="small" :icon="Plus" :disabled="!canWrite" @click="openRsCreate">
+                      新增明细
+                    </el-button>
+                  </span>
+                </el-tooltip>
+              </div>
+              <el-table v-if="rsItems.length" :data="rsItems" border stripe>
+                <el-table-column label="省 / 市" min-width="180" align="left">
+                  <template #default="{ row }">{{ row.city ? `${row.province} / ${row.city}` : row.province }}</template>
+                </el-table-column>
+                <el-table-column label="精度" width="90" align="center">
+                  <template #default="{ row }">{{ row.resolution }}m</template>
+                </el-table-column>
+                <el-table-column label="月份" width="110" align="center" prop="saleMonth" />
+                <el-table-column label="单价" width="110" align="center">
+                  <template #default="{ row }">{{ formatMoney(row.price) }}</template>
+                </el-table-column>
+                <el-table-column label="可重复售卖" width="110" align="center">
+                  <template #default="{ row }">
+                    <!-- 胶囊标签：重复售卖 = 紫蓝、单次 = 灰（平台 token 色，参照 stock-pill） -->
+                    <span class="rs-pill" :class="row.repeatSale ? 'repeat' : 'once'">
+                      {{ row.repeatSale ? '重复售卖' : '单次' }}
+                    </span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="已售次数" width="100" align="center">
+                  <template #default="{ row }">{{ rsSoldCount(row.id) }}</template>
+                </el-table-column>
+                <el-table-column label="操作" width="120" align="center">
+                  <template #default="{ row }">
+                    <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="top">
+                      <span>
+                        <el-button link type="primary" size="small" :disabled="!canWrite" @click="openRsEdit(row)">
+                          编辑
+                        </el-button>
+                      </span>
+                    </el-tooltip>
+                    <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="top">
+                      <span>
+                        <el-button link type="danger" size="small" :disabled="!canWrite" @click="removeRsItem(row)">
+                          删除
+                        </el-button>
+                      </span>
+                    </el-tooltip>
+                  </template>
+                </el-table-column>
+              </el-table>
+              <el-empty v-else description="暂无可售明细" :image-size="70">
+                <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="top">
+                  <span>
+                    <el-button type="primary" size="small" :icon="Plus" :disabled="!canWrite" @click="openRsCreate">
+                      新增明细
+                    </el-button>
+                  </span>
+                </el-tooltip>
+              </el-empty>
             </div>
           </el-tab-pane>
 
@@ -494,13 +746,6 @@ function openFeature(delName: string) {
                       </div>
                     </div>
                     <div class="dl-right">
-                      <a
-                        v-if="d.category === 'feature'"
-                        class="dl-link"
-                        @click.stop="openFeature(d.name)"
-                      >
-                        查看功能清单
-                      </a>
                       <span class="dl-pill" :class="d.status === 'ready' ? 'ok' : 'wip'">
                         {{ d.status === 'ready' ? '已就绪' : '待完善' }}
                       </span>
@@ -546,15 +791,18 @@ function openFeature(delName: string) {
                 <el-table-column label="项目名称" min-width="200">
                   <template #default="{ row }">
                     <a class="link" @click="router.push(`/sales/projects/${row.project.id}/detail`)">{{ row.project.name }}</a>
-                    <div class="muted" style="font-size: 12px;">{{ row.project.code }}</div>
+                    <div class="muted" style="font-size: 12px;">{{ row.project.code }} · {{ contractCountText(row.project) }}</div>
                   </template>
                 </el-table-column>
                 <el-table-column prop="project.customer" label="客户名称" width="150" show-overflow-tooltip />
-                <el-table-column label="销售人员" width="110" align="left">
+                <el-table-column label="生态人员" width="110" align="left">
                   <template #default="{ row }">{{ row.project.rep || '-' }}</template>
                 </el-table-column>
-                <el-table-column label="关联数量" width="110" align="right">
-                  <template #default="{ row }">{{ formatWan(row.item.qty) }} {{ row.item.unit }}</template>
+                <el-table-column label="签约主体" width="130" align="left">
+                  <template #default="{ row }">{{ entityShort(projectSubject(row.project, row.item)) }}</template>
+                </el-table-column>
+                <el-table-column label="关联数量" width="120" align="right">
+                  <template #default="{ row }">{{ formatAssetQty(asset, row.item.qty) }} {{ row.item.unit }}</template>
                 </el-table-column>
                 <el-table-column label="销售金额" width="120" align="right">
                   <template #default="{ row }">{{ formatMoney(row.item.amount) }}</template>
@@ -574,13 +822,9 @@ function openFeature(delName: string) {
                 <el-icon class="empty-icon" aria-hidden="true"><Link /></el-icon>
                 <div class="empty-title">暂无销售关联</div>
                 <div class="empty-desc muted">登记销售项目后，关联资产会在这里显示，并自动更新锁定数量和销售金额。</div>
-                <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="top">
-                  <span>
-                    <el-button v-if="!isWipBoard()" type="primary" size="small" :disabled="!canWrite" @click="goRegisterSale">
-                      登记销售
-                    </el-button>
-                  </span>
-                </el-tooltip>
+                <el-button v-if="!isWipBoard()" type="primary" size="small" @click="goRegisterSale">
+                  登记销售
+                </el-button>
               </div>
             </div>
           </el-tab-pane>
@@ -609,9 +853,10 @@ function openFeature(delName: string) {
                     <div class="fl-title">
                       <span class="fl-dot" :class="FLOW_CLS[f.type]" aria-hidden="true"></span>
                       {{ FLOW_TYPES[f.type].label }}
+                      <span class="fl-operator muted">操作人：{{ operatorText(f) }}</span>
                     </div>
                     <div class="fl-desc">
-                      {{ asset.name }} · {{ FLOW_TYPES[f.type].label }} {{ formatWan(f.qty) }} {{ f.unit }}
+                      {{ asset.name }} · {{ FLOW_TYPES[f.type].label }} {{ formatAssetQty(asset, f.qty) }} {{ f.unit }}
                       <template v-if="f.amount"> · 金额 {{ formatMoney(f.amount) }}</template>
                     </div>
                     <div class="fl-meta muted">
@@ -644,6 +889,7 @@ function openFeature(delName: string) {
                   placement="top"
                 >
                   <div class="log-action">{{ log.action }}</div>
+                  <div v-if="log.changes" class="log-changes muted">{{ translateFileNames(log.changes) }}</div>
                   <div class="log-detail muted">{{ log.detail }}</div>
                 </el-timeline-item>
               </el-timeline>
@@ -657,10 +903,10 @@ function openFeature(delName: string) {
       <el-dialog
         v-model="delCreate.visible"
         :title="`新增交付物 · ${asset.name}`"
-        width="560px"
+        class="dlg-form"
         :close-on-click-modal="false"
       >
-        <el-form label-width="90px">
+        <el-form label-width="96px">
           <el-form-item label="交付物名称" required>
             <el-input v-model="delCreate.form.name" placeholder="如：部署与运维手册" />
           </el-form-item>
@@ -725,9 +971,6 @@ function openFeature(delName: string) {
           </div>
         </template>
         <template #footer>
-          <el-button v-if="viewing?.category === 'feature'" @click="openFeature(viewing.name)">
-            查看功能清单
-          </el-button>
           <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="top">
             <el-button
               v-if="viewing && viewing.status !== 'ready'"
@@ -751,55 +994,72 @@ function openFeature(delName: string) {
         </template>
       </el-dialog>
 
-      <!-- 功能清单：左侧模块树 + 右侧能力详情 -->
+      <!-- 登记销售（生态人员直接下单；遥感数据 = 订单级客户 + N 行明细） -->
+      <SalesOrderDialog
+        v-model="saleVisible"
+        title="销售下单"
+        :items="saleItems"
+        :allow-qty-edit="true"
+        :loading="saleLoading"
+        @submit="onSaleSubmit"
+      />
+
+      <!-- ADR-011：遥感数据明细选择弹窗（登记销售入口） -->
+      <RsItemPicker
+        v-if="asset.type === '遥感数据'"
+        v-model="rsPickerVisible"
+        :parent-asset="asset"
+        @confirm="onRsPickerConfirm"
+      />
+
+      <!-- ADR-011：新增 / 编辑可售明细 -->
       <el-dialog
-        v-model="featureDialog"
-        :title="`产品功能清单 · ${asset.name}`"
-        width="880px"
+        v-model="rsForm.visible"
+        :title="rsForm.editing ? `编辑明细 · ${asset.name}` : `新增明细 · ${asset.name}`"
+        class="dlg-form"
         :close-on-click-modal="false"
       >
-        <div class="feature-layout">
-          <div class="feature-tree">
-            <div v-for="(m, mi) in featureCatalog" :key="m.name" class="ft-group">
-              <div class="ft-l1">{{ m.name }}</div>
-              <div
-                v-for="(s, si) in m.subs"
-                :key="s.name"
-                class="ft-l2"
-                :class="{ active: mi === activeModule && si === activeSub }"
-                @click="activeModule = mi; activeSub = si"
-              >
-                {{ s.name }}（{{ s.capabilities.length }}）
-              </div>
-            </div>
-          </div>
-          <div
-            v-if="featureCatalog[activeModule]?.subs[activeSub]"
-            class="feature-detail"
-          >
-            <div class="fd-head">
-              <div class="card-title">{{ featureCatalog[activeModule].subs[activeSub].name }}</div>
-              <div class="card-desc">共 {{ featureCatalog[activeModule].subs[activeSub].capabilities.length }} 项能力</div>
-            </div>
-            <div
-              v-for="cap in featureCatalog[activeModule].subs[activeSub].capabilities"
-              :key="cap.name"
-              class="cap-card"
-            >
-              <div class="cap-name">{{ cap.name }}</div>
-              <div class="cap-block">
-                <div class="cap-label muted">功能说明</div>
-                <div class="cap-text">{{ cap.desc }}</div>
-              </div>
-              <div class="cap-block value">
-                <div class="cap-label">核心价值</div>
-                <div class="cap-text">{{ cap.value }}</div>
-              </div>
-            </div>
-          </div>
-        </div>
+        <el-form label-width="96px">
+          <el-form-item label="省份" required>
+            <el-select v-model="rsForm.province" placeholder="选择省 / 自治区 / 直辖市" style="width: 100%;">
+              <el-option v-for="p in PROVINCES" :key="p" :label="p" :value="p" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="城市">
+            <el-input v-model="rsForm.city" placeholder="选填，如：石家庄市" />
+          </el-form-item>
+          <el-form-item label="精度" required>
+            <el-select v-model="rsForm.resolution" placeholder="选择精度" style="width: 100%;">
+              <el-option v-for="r in RS_RESOLUTIONS" :key="r" :label="`${r}m`" :value="r" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="月份" required>
+            <el-date-picker
+              v-model="rsForm.saleMonth"
+              type="month"
+              value-format="YYYY-MM"
+              placeholder="选择售卖月份"
+              style="width: 100%;"
+            />
+          </el-form-item>
+          <el-form-item label="单价（元）" required>
+            <el-input-number
+              v-model="rsForm.price"
+              :min="1"
+              :precision="0"
+              :step="1"
+              :controls="false"
+              placeholder="整数元/份"
+              style="width: 100%;"
+            />
+            <div class="dlg-hint">整数元/份，须大于 0</div>
+          </el-form-item>
+        </el-form>
+        <template #footer>
+          <el-button @click="rsForm.visible = false">取消</el-button>
+          <el-button type="primary" @click="saveRsItem">确定</el-button>
+        </template>
       </el-dialog>
-
     </template>
 
     <!-- 未找到资产：空态 + 返回列表（避免直达无效 URL 时白屏） -->
@@ -897,6 +1157,25 @@ function openFeature(delName: string) {
 .status-pill.off {
   color: #c62828;
   background: #fdecea;
+}
+
+/* 可售明细「可重复售卖」胶囊标签：重复售卖 = 紫蓝、单次 = 灰（平台 token 色，与 stock-pill 同款） */
+.rs-pill {
+  display: inline-flex;
+  align-items: center;
+  font-size: 12px;
+  line-height: 18px;
+  padding: 2px 10px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+.rs-pill.repeat {
+  color: #4e63a8;
+  background: #eef0ff;
+}
+.rs-pill.once {
+  color: #71829a;
+  background: #eef2f8;
 }
 
 /* ============ 页签 ============ */
@@ -1275,6 +1554,11 @@ function openFeature(delName: string) {
 .fl-dot.orange {
   background: #a86514;
 }
+.fl-operator {
+  margin-left: 4px;
+  font-size: 12px;
+  font-weight: 400;
+}
 .fl-desc {
   margin-top: 4px;
   font-size: 13px;
@@ -1299,6 +1583,11 @@ function openFeature(delName: string) {
   font-weight: 600;
   color: var(--text-primary);
 }
+.log-changes {
+  margin-top: 3px;
+  font-size: 12px;
+  line-height: 1.6;
+}
 .log-detail {
   margin-top: 3px;
   font-size: 13px;
@@ -1312,95 +1601,4 @@ function openFeature(delName: string) {
   gap: 10px;
 }
 
-/* ============ 功能清单 ============ */
-.feature-layout {
-  display: grid;
-  grid-template-columns: 240px 1fr;
-  gap: 16px;
-  min-height: 420px;
-}
-@media (max-width: 860px) {
-  .feature-layout {
-    grid-template-columns: 1fr;
-  }
-}
-.feature-tree {
-  border-right: 1px solid var(--divider-color);
-  padding-right: 12px;
-}
-@media (max-width: 860px) {
-  .feature-tree {
-    border-right: none;
-    border-bottom: 1px solid var(--divider-color);
-    padding-right: 0;
-    padding-bottom: 12px;
-  }
-}
-.ft-group {
-  margin-bottom: 12px;
-}
-.ft-l1 {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text-primary);
-  margin-bottom: 6px;
-}
-.ft-l2 {
-  font-size: 13px;
-  color: var(--text-body);
-  padding: 5px 10px;
-  border-radius: 6px;
-  cursor: pointer;
-  margin-left: 4px;
-}
-.ft-l2:hover {
-  background: var(--row-hover);
-}
-.ft-l2.active {
-  background: var(--primary-light);
-  color: var(--primary-color);
-  font-weight: 500;
-}
-.feature-detail {
-  min-width: 0;
-}
-.fd-head {
-  margin-bottom: 12px;
-}
-.cap-card {
-  border: 1px solid var(--divider-color);
-  border-radius: 8px;
-  padding: 14px 16px;
-  margin-bottom: 10px;
-}
-.cap-name {
-  font-size: 15px;
-  font-weight: 600;
-  color: var(--text-primary);
-  margin-bottom: 10px;
-}
-.cap-block {
-  margin-bottom: 10px;
-}
-.cap-block:last-child {
-  margin-bottom: 0;
-}
-.cap-label {
-  font-size: 12px;
-  margin-bottom: 3px;
-}
-.cap-block.value .cap-label {
-  color: var(--primary-color);
-}
-.cap-block.value {
-  background: #f5f9ff;
-  border-left: 3px solid #cfe0f5;
-  border-radius: 4px;
-  padding: 8px 10px;
-}
-.cap-text {
-  font-size: 13px;
-  color: var(--text-body);
-  line-height: 1.6;
-}
 </style>

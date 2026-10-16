@@ -23,6 +23,7 @@ import {
   type AssetStatus,
   type AssetFlow,
   type BaseRecord,
+  type FileMeta,
   type CartItem,
   type AssetDeliverable,
   type DeliverableTemplateItem,
@@ -33,8 +34,9 @@ import {
   type OutboundType,
   type Project,
   type ProjectItem,
-  type ProjectStatus,
+  type Contract,
   type Board,
+  type RsItem,
 } from '@/types'
 import { CATEGORY_UNITS, FEATURE_CATALOGS } from '@/constants'
 import {
@@ -49,13 +51,33 @@ import {
 
 const http = axios.create({ baseURL: '/api', timeout: 20000 })
 
+/**
+ * viewer（生态人员）放行的写端点白名单（与后端 `require_order` 对齐，ADR-009）：
+ * 下单链路（加购 / 批量加购 / 改数量 / 改行级客户 / 删行 / 清空 / 购物车结算 / 资产直接下单）
+ * 后端已全部改为 require_order（认证即放行），前端白名单同步覆盖全部购物车端点。
+ */
+const VIEWER_ALLOWED_REQUESTS: { method: string; pattern: RegExp }[] = [
+  { method: 'post', pattern: /^\/cart\/?$/ },
+  { method: 'post', pattern: /^\/cart\/batch$/ },
+  { method: 'post', pattern: /^\/cart\/checkout$/ },
+  { method: 'put', pattern: /^\/cart\/\d+$/ },
+  { method: 'patch', pattern: /^\/cart\/\d+$/ },
+  { method: 'delete', pattern: /^\/cart\/\d+$/ },
+  { method: 'delete', pattern: /^\/cart$/ },
+  { method: 'post', pattern: /^\/sales\/order$/ },
+]
+
 // 请求拦截器：已登录时统一携带 Bearer token；
-// 全局写操作兜底：viewer（只读）的任何非 GET 请求在发出前直接拒绝（避免 UI 漏网点）
+// 全局写操作兜底：viewer（生态人员）的非 GET 请求仅放行下单链路白名单，其余在发出前直接拒绝（避免 UI 漏网点）
 http.interceptors.request.use((config) => {
   const token = getToken()
   if (token) config.headers.Authorization = `Bearer ${token}`
   if (config.method && config.method !== 'get' && currentUser.value?.role === 'viewer') {
-    return Promise.reject(new Error(READONLY_TIP))
+    const url = config.url || ''
+    const allowed = VIEWER_ALLOWED_REQUESTS.some(
+      (r) => r.method === config.method && r.pattern.test(url),
+    )
+    if (!allowed) return Promise.reject(new Error(READONLY_TIP))
   }
   return config
 })
@@ -124,6 +146,7 @@ http.interceptors.response.use(
 export const db = reactive({
   assets: [] as Asset[],
   projects: [] as Project[],
+  contracts: [] as Contract[],
   outbounds: [] as Outbound[],
   cart: [] as CartItem[],
   suppliers: [] as BaseRecord[],
@@ -133,6 +156,8 @@ export const db = reactive({
   logs: [] as OpLog[],
   deliverableTemplates: {} as Record<string, DeliverableTemplateItem[]>,
   assetDeliverables: {} as Record<number, AssetDeliverable[]>,
+  files: [] as FileMeta[],
+  rsItems: [] as RsItem[], // 遥感数据可售明细（ADR-011，bootstrap 顶层字段）
 })
 
 let refreshing: Promise<void> | null = null
@@ -145,6 +170,7 @@ export function refresh(force = false): Promise<void> {
       const { data } = await http.get('/bootstrap')
       db.assets = data.assets
       db.projects = data.projects
+      db.contracts = data.contracts ?? []
       db.outbounds = data.outbounds
       db.cart = data.cart
       db.suppliers = data.suppliers
@@ -154,6 +180,8 @@ export function refresh(force = false): Promise<void> {
       db.logs = data.logs
       db.deliverableTemplates = data.deliverableTemplates
       db.assetDeliverables = data.assetDeliverables
+      db.files = data.files ?? []
+      db.rsItems = data.rsItems ?? []
     } finally {
       refreshing = null
     }
@@ -195,7 +223,18 @@ export interface AssetInput {
   spec: string
   saleDetail?: IWorkbookData
   contractFile?: string
+  featureDoc?: string
   remark: string
+}
+
+/** 遥感数据可售明细入参（ADR-011，RsItemInput：POST /assets/{id}/rs-items 与 PUT /rs-items/{id} 同构） */
+export interface RsItemInput {
+  province: string
+  city?: string // 选填，默认 ""
+  resolution: number // 米
+  saleMonth: string // YYYY-MM
+  price: number // 整数元/份
+  repeatSale?: boolean // 默认 true
 }
 
 export interface ProjectItemInput {
@@ -206,11 +245,20 @@ export interface ProjectItemInput {
   deliveryReq: string
 }
 
+/** 合同入参（ADR-007）：POST /projects 的 contracts[] 元素；合同内强制同一资产主体（后端校验） */
+export interface ContractInput {
+  customer: string // 必填：合同客户
+  items: ProjectItemInput[]
+  contractAmount?: number | null // 元；缺省由后端按明细 price×qty 合计重算
+  remark?: string
+}
+
 export interface ProjectInput {
   name: string
-  customer: string
+  customer: string // 派生字段（后端不采信）：多合同传 ""，单合同可传该客户
   industry: string
   rep: string
+  businessOwner?: string // 商务负责人（可选，默认空）
   subject: string
   expectedAmount: number
   quoteAmount: number
@@ -219,7 +267,8 @@ export interface ProjectInput {
   expectedSignDate: string
   lastFollowDate: string
   remark: string
-  items: ProjectItemInput[]
+  items: ProjectItemInput[] // 兼容路径：不传 contracts 时按单合同自动包装
+  contracts?: ContractInput[] // ADR-007：合同结构入参（每客户一个合同）
 }
 
 export interface OutboundInput {
@@ -370,8 +419,43 @@ export function getDashboard(): DashboardData {
 // ============================================================
 // 文件（产品清单等）上传 / 预览
 // ============================================================
-export function fileUrl(filename: string): string {
-  return `/api/files/${encodeURIComponent(filename)}`
+/**
+ * 文件访问 URL（端点已挂双通道鉴权：Bearer 头或 ?token= 查询参数）。
+ * 此处统一走查询参数通道（iframe/img/a[download]/fetch 均无法带请求头），
+ * token 读取与 axios 拦截器同源（auth.getToken）。
+ * @param inline true → `&inline=true`（Content-Disposition: inline，内联预览）；缺省为下载语义
+ */
+export function fileUrl(filename: string, inline = false): string {
+  const params = new URLSearchParams()
+  const token = getToken()
+  if (token) params.set('token', token)
+  if (inline) params.set('inline', 'true')
+  const qs = params.toString()
+  return `/api/files/${encodeURIComponent(filename)}${qs ? `?${qs}` : ''}`
+}
+
+/** 散列名 → 原始文件名（展示用）；无映射记录（存量文件）返回散列名本身兜底 */
+export function fileDisplayName(storedName: string): string {
+  return db.files.find((f) => f.storedName === storedName)?.name ?? storedName
+}
+
+/**
+ * 将整段文本中的散列 storedName 翻译为原始文件名（纯展示层，不修改数据）。
+ * - 仅取 db.files 中 name !== storedName 的条目参与替换；
+ * - 按 storedName 长度降序替换，避免短名是长名子串时误替换；
+ * - 无映射的散列保持原样（回退）。
+ */
+export function translateFileNames(text: string): string {
+  if (!text) return text
+  const pairs = db.files
+    .filter((f) => f.name && f.name !== f.storedName)
+    .map((f) => [f.storedName, f.name] as const)
+    .sort((a, b) => b[0].length - a[0].length)
+  let out = text
+  for (const [stored, name] of pairs) {
+    if (out.includes(stored)) out = out.split(stored).join(name)
+  }
+  return out
 }
 
 export async function uploadFile(
@@ -413,8 +497,18 @@ export async function updateProject(id: number, input: ProjectInput): Promise<vo
   await afterWrite()
 }
 
-export async function changeProjectStatus(id: number, status: ProjectStatus, reason: string): Promise<void> {
-  await http.patch(`/projects/${id}/status`, { status, reason })
+/**
+ * 合同状态流转（ADR-007，库存联动最小单位）：
+ *  - delivered：逐明细交付（释放锁定/扣 shippedQty/生成出库记录）
+ *  - terminated：active 合同释放锁定；delivered 合同撤销出库并回退售出数量与金额
+ * 项目 status/expectedAmount/customer/subject 由后端按合同派生重算。
+ */
+export async function changeContractStatus(
+  id: number,
+  status: 'delivered' | 'terminated',
+  reason = '',
+): Promise<void> {
+  await http.patch(`/contracts/${id}/status`, { status, reason })
   await afterWrite()
 }
 
@@ -494,10 +588,41 @@ export async function removeAssetDeliverable(assetId: number, id: number): Promi
 }
 
 // ============================================================
-// 购物车（预留账号权限；当前 user_id 固定 admin）
+// 遥感数据可售明细（ADR-011：require_editor，admin/editor 可维护；viewer 不在白名单，403 兜底）
 // ============================================================
-export async function addToCart(assetId: number, qty = 1): Promise<void> {
-  await http.post('/cart', { assetId, qty })
+export function rsItemsOfAsset(assetId: number): RsItem[] {
+  return db.rsItems.filter((r) => r.assetId === assetId)
+}
+
+export function rsItemById(id: number | null | undefined): RsItem | undefined {
+  if (id == null) return undefined
+  return db.rsItems.find((r) => r.id === id)
+}
+
+/** 新增明细：后端返回新建的 RsItemOut（response_model=schemas.RsItemOut） */
+export async function addRsItem(assetId: number, data: RsItemInput): Promise<RsItem> {
+  const { data: d } = await http.post<RsItem>(`/assets/${assetId}/rs-items`, data)
+  await afterWrite()
+  return d
+}
+
+export async function updateRsItem(id: number, data: RsItemInput): Promise<void> {
+  await http.put(`/rs-items/${id}`, data)
+  await afterWrite()
+}
+
+/** 删除明细：后端 400「该明细存在销售关联，无法删除」（任一 project_items.itemId 引用，含已完成合同） */
+export async function deleteRsItem(id: number): Promise<void> {
+  await http.delete(`/rs-items/${id}`)
+  await afterWrite()
+}
+
+// ============================================================
+// 购物车（ADR-009：按登录用户隔离，后端以当前登录用户为准；bootstrap.cart 仅含当前用户行）
+// ============================================================
+/** 加购：含 itemId（遥感明细，ADR-011）时数量恒 1（后端校验 qty≠1 → 400），行级客户由购物车页行内填写 */
+export async function addToCart(assetId: number, qty = 1, itemId?: number): Promise<void> {
+  await http.post('/cart', { assetId, qty, ...(itemId != null ? { itemId } : {}) })
   await afterWrite()
 }
 
@@ -514,7 +639,10 @@ export interface CartBatchResult {
   cart: CartItem[]
 }
 
-export async function addCartBatch(items: { assetId: number; qty: number }[]): Promise<CartBatchResult> {
+/** 批量加购：行可含 itemId（遥感明细，ADR-011），含 itemId 行数量恒 1 */
+export async function addCartBatch(
+  items: { assetId: number; qty: number; itemId?: number }[],
+): Promise<CartBatchResult> {
   const { data } = await http.post<CartBatchResult>('/cart/batch', { items })
   await afterWrite()
   return data
@@ -522,6 +650,21 @@ export async function addCartBatch(items: { assetId: number; qty: number }[]): P
 
 export async function setCartQty(id: number, qty: number): Promise<void> {
   await http.put(`/cart/${id}`, { qty })
+  await afterWrite()
+}
+
+/**
+ * 修改购物车行合同金额（ADR-008，仅包量定价资产行）：整数元，后端校验 int > 0。
+ * ⚠️ 后端 PUT /cart/{id} 对 qty<=0 执行删行，必须同时回传该行当前 qty（缺省=0 会误删行）。
+ */
+export async function setCartAmount(id: number, qty: number, amount: number): Promise<void> {
+  await http.put(`/cart/${id}`, { qty, amount })
+  await afterWrite()
+}
+
+/** 修改购物车行级客户（ADR-007）：400「购物车中该资产在客户「X」下已有行，无法修改客户（请先删除原行）」 */
+export async function patchCartItem(id: number, customer: string): Promise<void> {
+  await http.patch(`/cart/${id}`, { customer })
   await afterWrite()
 }
 
@@ -537,18 +680,25 @@ export async function clearCart(): Promise<void> {
 
 export interface OrderFields {
   projectName: string
-  customer: string
+  /** 直接下单必填；购物车结算不带（后端按行级客户分组，CheckoutInput.customer 可选且不参与分组） */
+  customer?: string
   rep?: string
-  contractAmount?: number // 单位：万元（与后端 Project.contractAmount 一致）
+  businessOwner?: string // 商务负责人（可选，默认空）
+  contractAmount?: number // 单位：元（与后端 Project.contractAmount 一致，ADR-006）
   expectedSignDate?: string
   remark?: string
   deliveryReq?: string
 }
 
-export interface CheckoutInput extends OrderFields {}
+/**
+ * 购物车结算入参（ADR-008）：后端 `CheckoutInput` 无 items 字段——
+ * 包量定价行的合同金额权威值已由 PUT/PATCH /cart/{id} 持久化到 cart_items.amount，结算不再携带。
+ */
+export type CheckoutInput = OrderFields
 
 export interface SaleOrderInput extends OrderFields {
-  items: { assetId: number; qty: number }[]
+  // amount：包量定价行的合同金额（整数元，ADR-008）；itemId：遥感明细行（ADR-011，qty 恒 1，金额后端按 rs_items.price 权威重算）
+  items: { assetId: number; qty: number; amount?: number; itemId?: number }[]
 }
 
 export interface ProjectOut {
@@ -556,6 +706,7 @@ export interface ProjectOut {
   code: string
   name: string
   status: string
+  contractCount?: number // ADR-007：合同数量（=客户组数）
 }
 
 /** 购物车下单：生成「进行中」销售项目并锁定库存（不自动出库），随后清空购物车 */

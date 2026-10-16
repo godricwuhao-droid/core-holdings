@@ -133,6 +133,11 @@ def require_editor(user: models.User = Depends(get_current_user)) -> models.User
     return user
 
 
+def require_order(user: models.User = Depends(get_current_user)) -> models.User:
+    """下单链路（购物车 + 直接下单）：已认证即可，admin/editor/viewer 均放行"""
+    return user
+
+
 def require_admin(user: models.User = Depends(get_current_user)) -> models.User:
     """账号管理 / 审计查询：仅 admin"""
     if user.role != "admin":
@@ -175,3 +180,32 @@ def user_out(user: models.User) -> dict:
         "role": user.role,
         "enabled": user.enabled,
     }
+
+
+# ============================================================
+# 登录失败限流（进程内计数，标准库实现，无新依赖）
+# 同一用户名 15 分钟内连续失败 ≥ 10 次 → 锁定 15 分钟（防撞库；
+# 单实例部署够用；多 worker 部署下为每进程独立计数，保守但仍有效）。
+# ============================================================
+_LOGIN_FAIL_WINDOW = 15 * 60   # 秒
+_LOGIN_FAIL_LIMIT = 10
+_login_fails: dict[str, list[float]] = {}
+
+
+def login_locked(username: str) -> bool:
+    """该用户名当前是否处于登录失败锁定中"""
+    now = time.time()
+    fails = [t for t in _login_fails.get(username, []) if now - t < _LOGIN_FAIL_WINDOW]
+    _login_fails[username] = fails
+    return len(fails) >= _LOGIN_FAIL_LIMIT
+
+
+def login_failed(username: str) -> None:
+    now = time.time()
+    fails = [t for t in _login_fails.get(username, []) if now - t < _LOGIN_FAIL_WINDOW]
+    fails.append(now)
+    _login_fails[username] = fails
+
+
+def login_succeeded(username: str) -> None:
+    _login_fails.pop(username, None)

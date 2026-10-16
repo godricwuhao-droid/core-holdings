@@ -7,6 +7,7 @@
 """
 import uuid
 from datetime import date, datetime
+from decimal import Decimal
 
 from fastapi import HTTPException
 from sqlalchemy import select
@@ -27,6 +28,15 @@ BOARD_CODE = {
 }
 
 PROJECT_FLOW = ["active", "delivered"]
+
+# 金额精度（ADR-006）：单位=元，累加/重算/比较一律 decimal.Decimal，
+# 落库前转 float（SQLite REAL）。禁止对金额使用 round(x, 4) 旧单位式写法。
+CENT = Decimal("0.01")
+
+
+def _dec(v) -> Decimal:
+    """float/Decimal/str → Decimal（经 str 中转，避免 float 二进制误差进入十进制运算）"""
+    return Decimal(str(v))
 
 
 def today() -> str:
@@ -63,20 +73,35 @@ def get_project(db: Session, project_id: int | None) -> models.Project | None:
     return db.get(models.Project, project_id)
 
 
+def get_contract(db: Session, contract_id: int | None) -> models.Contract | None:
+    if not contract_id:
+        return None
+    return db.get(models.Contract, contract_id)
+
+
 def add_flow(db: Session, asset_id: int, type: str, qty: int, unit: str,
-             amount: float, date: str, ref: str, note: str) -> None:
+             amount: float, date: str, ref: str, note: str, operator: str = "",
+             contract_id: int | None = None) -> None:
+    # operator：流水操作账号（登录 username；启动 seed 路径传 "system"）；存量流水保持空
+    # contract_id（ADR-007）：合同级交付/终止产生的流水记录关联合同；非合同场景为 None
     db.add(models.AssetFlow(
         assetId=asset_id, type=type, qty=qty, unit=unit,
-        amount=amount, date=date, ref=ref, note=note,
+        amount=amount, date=date, ref=ref, note=note, operator=operator,
+        contractId=contract_id,
     ))
 
 
 def add_log(db: Session, target: str, target_name: str, action: str, detail: str,
-            asset_id: int | None = None) -> None:
+            asset_id: int | None = None, changes: str = "",
+            contract_id: int | None = None, operator: str = "admin") -> None:
+    # FIX-5：operator 真实化——有当前用户上下文的路径由 router 透传登录用户名；
+    # 无上下文的内部路径（seed/内部复用）保持默认 "admin"（兼容存量口径）。
     db.add(models.OpLog(
         target=target, targetName=target_name, action=action,
-        detail=detail, operator="admin", time=now_str(),
+        detail=detail, operator=operator, time=now_str(),
         assetId=asset_id if target == "asset" else None,
+        changes=changes,
+        contractId=contract_id,
     ))
 
 
@@ -99,6 +124,36 @@ def item_status_of_input(it: schemas.ProjectItemInput) -> str:
     return "locked"
 
 
+def _is_amount_mode(a: models.Asset) -> bool:
+    """ADR-008：是否包量计价（合同金额整数元权威，salePrice 仅参考值）"""
+    return (a.pricingMode or "unit") == "amount"
+
+
+def _validate_amount_yuan(amount) -> Decimal:
+    """ADR-008：包量计价金额校验——整数元且 > 0，否则 400。返回 Decimal（元）。"""
+    if amount is None:
+        raise HTTPException(400, "包量计价资产的销售金额须为整数元")
+    amt = _dec(amount)
+    if amt <= 0 or amt != amt.to_integral_value():
+        raise HTTPException(400, "包量计价资产的销售金额须为整数元")
+    return amt
+
+
+def _derived_price(amt: Decimal, qty: int) -> float:
+    """ADR-008：amount 模式派生展示单价 price = round(amount / qty, 6)（不参与金额计算）"""
+    return float((amt / qty).quantize(Decimal("0.000001")))
+
+
+def _item_pricing(a: models.Asset | None, it: schemas.ProjectItemInput) -> tuple[float, float]:
+    """销售明细计价分支（ADR-008），返回 (price, amount)：
+    - amount 模式：amount 为权威输入（整数元校验），跳过 price×qty 重算，price 为派生值；
+    - unit 模式：price×qty Decimal 权威重算（行为完全不变）。"""
+    if a is not None and _is_amount_mode(a):
+        amt = _validate_amount_yuan(it.amount)
+        return _derived_price(amt, it.qty), float(amt)
+    return float(it.price), float((_dec(it.price) * it.qty).quantize(CENT))
+
+
 def _validate_item_stock(a: models.Asset, qty: int) -> None:
     """H1：加锁前校验可售库存，避免超卖；负数量/零数量直接拒绝。
 
@@ -113,9 +168,15 @@ def _validate_item_stock(a: models.Asset, qty: int) -> None:
         raise HTTPException(400, f"库存不足：{a.name} 可售 {available}{a.unit}，本单需 {qty}")
 
 
-def apply_item_lock(db: Session, asset_id: int | None, qty: int, add: bool, ref: str) -> None:
+def apply_item_lock(db: Session, asset_id: int | None, qty: int, add: bool, ref: str,
+                    operator: str = "", contract_id: int | None = None,
+                    repeat_override: bool | None = None) -> None:
     a = get_asset(db, asset_id)
-    if not a or a.repeatSale or qty <= 0:
+    # repeat_override（ADR-011）：遥感明细行以 rs_items.repeatSale 为权威（父资产 repeatSale 无意义），
+    # 非明细行保持资产口径（None → a.repeatSale）
+    if not a or qty <= 0:
+        return
+    if a.repeatSale if repeat_override is None else repeat_override:
         return
     a.lockedQty = max(0, a.lockedQty + (qty if add else -qty))
     add_flow(
@@ -123,6 +184,7 @@ def apply_item_lock(db: Session, asset_id: int | None, qty: int, add: bool, ref:
         "project_lock" if add else "cancel_release",
         qty, a.unit, 0, today(), ref,
         "销售项目锁定" if add else "项目释放锁定",
+        operator=operator, contract_id=contract_id,
     )
     refresh_status(a)
 
@@ -140,41 +202,120 @@ def _default_outbound_type(board: str) -> str:
 # ============================================================
 # 资产
 # ============================================================
-def create_asset(db: Session, data: schemas.AssetInput) -> models.Asset:
+def create_asset(db: Session, data: schemas.AssetInput, operator: str = "") -> models.Asset:
+    # ADR-011：遥感数据按普通父资产登记（容器，本身不可直接加购/下单），
+    # 售卖粒度走 rs_items 明细表（POST /assets/{id}/rs-items）；
+    # ADR-010 的三维必填/判重逻辑已移除，服务层不再读写 assets 的 4 个废弃列。
     asset = models.Asset(
         lockedQty=0, shippedQty=0, soldAmount=0, soldCount=0,
         name=data.name, board=data.board, type=data.type, subject=data.subject,
         unit=data.unit, quantity=data.quantity, repeatSale=data.repeatSale,
-        salePrice=data.salePrice, status=data.status,
+        salePrice=data.salePrice, status=data.status,  # 占位，下方按库存自动判定覆盖
         inboundDate=data.inboundDate, expiryDate=data.expiryDate,
         perpetual=data.perpetual, spec=data.spec, saleDetail=data.saleDetail,
+        featureDoc=data.featureDoc,
         contractFile=data.contractFile,
         remark=data.remark, updatedAt=today(),
+        # ADR-008：计价模式由后端按类型权威决定（卫星Token → 'amount'，其余恒 'unit'），
+        # 不接受前端传 pricingMode 篡改类型映射
+        pricingMode="amount" if data.type == "卫星Token" else "unit",
     )
+    # 状态两态规则：由库存自动判定，不采信前端 status（与 update_asset/refresh_status 口径一致）
+    # ——修复：此前直接信任 data.status（前端恒传 in_stock），quantity=0 的非重复售卖资产会被误存为「库存可售」
+    asset.status = auto_status(asset)
     # 不手写主键：flush 由 DB 生成 id，再据此拼写编号，编号格式保持 CH-{板块}-{3位序号}
     _flush_with_code(db, asset, lambda aid: f"CH-{BOARD_CODE.get(data.board, 'GEN')}-{str(aid).zfill(3)}")
     # 新登记资产即已入库（库存可售口径）
     add_flow(db, asset.id, "purchase_in", asset.quantity, asset.unit, 0,
-             data.inboundDate or today(), asset.code, "入库")
+             data.inboundDate or today(), asset.code, "入库", operator=operator)
     add_log(db, "asset", asset.name, "新增资产",
             f"新建资产 {asset.code}，状态：{'库存可售' if asset.status == 'in_stock' else '全部出售'}",
-            asset_id=asset.id)
+            asset_id=asset.id, operator=operator)
     db.commit()
     db.refresh(asset)
     return asset
 
 
-def update_asset(db: Session, asset_id: int, patch: dict) -> None:
+# update_asset 字段级 diff 的中文映射（未映射字段用原名）
+ASSET_FIELD_LABELS = {
+    "name": "资产名称", "board": "所属板块", "type": "资产类型", "subject": "所属主体",
+    "unit": "单位", "quantity": "资产总数", "repeatSale": "可重复售卖",
+    "salePrice": "销售单价", "status": "资产状态", "inboundDate": "入库日期",
+    "expiryDate": "到期日期", "perpetual": "永久授权", "spec": "规格描述",
+    "saleDetail": "销售明细", "featureDoc": "功能清单", "contractFile": "产品清单",
+    "remark": "备注",
+}
+# 长文本字段变化时只记「已变更」，不贴全文
+ASSET_LONG_TEXT_FIELDS = {"spec", "saleDetail", "remark"}
+# 文件类字段（存散列落盘名）：diff 展示时还原为原始文件名（查 file_meta，无记录用散列名兜底）
+ASSET_FILE_FIELDS = {"featureDoc", "contractFile"}
+# 金额类字段（存「元」口径，ADR-006）：diff 展示直接按元值千分位（平台口径禁止「万」字）
+ASSET_AMOUNT_FIELDS = {"salePrice"}
+
+
+def _fmt_amount_yuan(v) -> str:
+    """元值千分位展示（ADR-006 后库内即元值，直接格式化，不再 ×10000）。
+    空值/0 显示「0 元」，平台口径禁止「万」字。"""
+    try:
+        yuan = float(v)
+    except (TypeError, ValueError):
+        yuan = 0.0
+    if yuan == 0:
+        return "0 元"
+    if abs(yuan - round(yuan)) < 1e-6:
+        return f"{int(round(yuan)):,} 元"
+    return f"{yuan:,.2f} 元"
+
+
+def _file_display_name(db: Session, stored: str) -> str:
+    """散列落盘名 → 原始文件名（查 file_meta，无记录用散列名兜底；空值返回空串）。"""
+    if not stored:
+        return ""
+    m = db.get(models.FileMeta, stored)
+    return m.name if (m and m.name) else stored
+
+
+def _arrow(old: str, new: str) -> str:
+    """diff 值连接（空值不留多余空格）：如「→ 产品说明书.pdf」/「A → B」。"""
+    if old == "" and new == "":
+        return "→"
+    if old == "":
+        return f"→ {new}"
+    if new == "":
+        return f"{old} →"
+    return f"{old} → {new}"
+
+
+def update_asset(db: Session, asset_id: int, patch: dict, operator: str = "admin") -> None:
     a = get_asset(db, asset_id)
     if not a:
         raise HTTPException(404, "资产不存在")
     allowed = {"name", "board", "type", "subject", "unit", "quantity", "repeatSale",
                "salePrice", "status", "inboundDate", "expiryDate", "perpetual",
-               "spec", "saleDetail", "contractFile", "remark"}
+               "spec", "saleDetail", "featureDoc", "contractFile", "remark"}
+    # ADR-011：ADR-010 的 4 个废弃列（province/city/resolution/imageDate）不再接受修改
     old_repeat = a.repeatSale
+    # 字段级 diff：仅对本次实际变更的字段生成中文描述（金额类展示原值不换算）
+    changes: list[str] = []
     for k, v in patch.items():
-        if k in allowed:
-            setattr(a, k, v)
+        if k not in allowed:
+            continue
+        old = getattr(a, k)
+        if old == v:
+            continue
+        setattr(a, k, v)
+        label = ASSET_FIELD_LABELS.get(k, k)
+        if k in ASSET_LONG_TEXT_FIELDS:
+            changes.append(f"{label}: 已变更")
+        elif k in ASSET_FILE_FIELDS:
+            # 文件字段：散列名 → 原始名（如「功能清单: → 产品说明书.pdf」）
+            changes.append(f"{label}: {_arrow(_file_display_name(db, old), _file_display_name(db, v))}")
+        elif k in ASSET_AMOUNT_FIELDS:
+            # 金额字段：元值直显千分位（如「销售单价: 330,000 元 → 3,200,000 元」）
+            changes.append(f"{label}: {_fmt_amount_yuan(old)} → {_fmt_amount_yuan(v)}")
+        else:
+            unit = {"quantity": a.unit}.get(k, "")
+            changes.append(f"{label}: {old} → {v}" + (f" {unit}" if unit else ""))
     # BUG1 修复：repeatSale false→true 时，存量 lockedQty 残留会成为"幽灵锁定"
     # （apply_item_lock 对 repeatSale 资产直接 return，交付/终止都无法释放）。
     # 故切换瞬间清零 lockedQty 并留痕；lockedQty=0 时无事发生不打日志。
@@ -184,22 +325,47 @@ def update_asset(db: Session, asset_id: int, patch: dict) -> None:
         a.lockedQty = 0
         add_log(db, "asset", a.name, "清零锁定",
                 f"repeatSale 切换为 true，清零存量锁定 {old_locked}{a.unit}（可重复售卖不再占用库存）",
-                asset_id=a.id)
+                asset_id=a.id, operator=operator)
+    # 库存不变量守卫：资产总数不得低于「锁定 + 已出库」（否则可售变负，破坏可售=总数−锁定−出库口径）。
+    # 校验放在锁定清零之后——repeatSale 切换释放的锁定不应阻塞数量下调。
+    # 入参类型/范围（quantity≥0 整数、salePrice≥0）由路由层 Pydantic（schemas.AssetUpdate）拦截。
+    if a.quantity < a.lockedQty + a.shippedQty:
+        raise HTTPException(
+            400,
+            f"资产总数不能低于已锁定 {a.lockedQty}{a.unit} + 已出库 {a.shippedQty}{a.unit}"
+            f"（合计 {a.lockedQty + a.shippedQty}{a.unit}），请先处理相关销售项目/出库记录",
+        )
     refresh_status(a)
-    add_log(db, "asset", a.name, "编辑", "更新资产信息", asset_id=a.id)
+    # 仅当有实际变更时打编辑日志（无变更不打日志）
+    if changes:
+        add_log(db, "asset", a.name, "编辑", "更新资产信息", asset_id=a.id,
+                changes="；".join(changes), operator=operator)
     db.commit()
 
 
-def delete_asset(db: Session, asset_id: int) -> None:
+def delete_asset(db: Session, asset_id: int, operator: str = "admin") -> None:
     a = get_asset(db, asset_id)
     if not a:
         return
     # H7：引用完整性校验（SQLite 不加外键——迁移风险高；改用服务层校验实现同等约束）
-    # 1) 被任何非 terminated 项目的明细引用 → 拒绝
+    # 1a) FIX-4（合同感知）：合同明细（contractId 非空）——仅当存在 status='active' 合同引用时拒绝；
+    #     delivered/terminated 合同的引用放行（前端已有「未关联资产」兜底，交付分支已有 if a: 防御）。
+    ref_contract = db.execute(
+        select(models.Contract)
+        .join(models.ProjectItem, models.ProjectItem.contractId == models.Contract.id)
+        .where(models.ProjectItem.assetId == asset_id, models.Contract.status == "active")
+        .limit(1)
+    ).scalars().first()
+    if ref_contract:
+        raise HTTPException(400,
+            f"该资产仍被进行中的合同 {ref_contract.code}（客户 {ref_contract.customer}）引用，请先终止该合同后再删除")
+    # 1b) 无合同 legacy 项目明细引用：保持原规则（项目 status != terminated → 拒绝）
     ref_item = db.execute(
         select(models.ProjectItem)
         .join(models.Project, models.Project.id == models.ProjectItem.project_id)
-        .where(models.ProjectItem.assetId == asset_id, models.Project.status != "terminated")
+        .where(models.ProjectItem.assetId == asset_id,
+               models.ProjectItem.contractId.is_(None),
+               models.Project.status != "terminated")
         .limit(1)
     ).scalars().first()
     # 2) 存在 status='done' 的出库记录引用 → 拒绝
@@ -210,144 +376,594 @@ def delete_asset(db: Session, asset_id: int) -> None:
     ).scalars().first()
     if ref_item or ref_ob:
         raise HTTPException(400, "该资产仍被销售项目或出库记录引用，请先终止相关项目/撤销出库后再删除")
-    # 3) 清理引用了该资产的购物车项
+    # 3) 清理引用了该资产的购物车项（含 ADR-011 遥感明细行）
     for c in db.execute(select(models.CartItem).where(models.CartItem.assetId == asset_id)).scalars():
         db.delete(c)
-    # 4) 级联删除该资产的交付物 + 流水
+    # 4) 级联删除该资产的交付物 + 流水 + 遥感数据明细（ADR-011：父资产删除，明细随之删除；
+    #    走到这里说明无 active 合同/非 terminated 项目引用，其明细行也不可能有销售关联）
     for d in list(a.deliverables):
         db.delete(d)
     for f in db.execute(select(models.AssetFlow).where(models.AssetFlow.assetId == asset_id)).scalars():
         db.delete(f)
+    for r in db.execute(select(models.RsItem).where(models.RsItem.assetId == asset_id)).scalars():
+        db.delete(r)
     name, code = a.name, a.code
     db.delete(a)
-    add_log(db, "asset", name, "删除", f"删除资产 {code}", asset_id=asset_id)
+    add_log(db, "asset", name, "删除", f"删除资产 {code}", asset_id=asset_id, operator=operator)
+    db.commit()
+
+
+# ============================================================
+# 遥感数据可售明细（ADR-011：父资产 + 明细两层模型）
+# ============================================================
+def _rs_item_desc(it: models.RsItem) -> str:
+    """明细可读描述：省/市 · 精度 · 月份（市为空时省略）"""
+    loc = f"{it.province}/{it.city}" if it.city else it.province
+    return f"{loc} {it.resolution:g}m {it.saleMonth}"
+
+
+def _rs_item_dup(db: Session, asset_id: int, province: str, city: str,
+                 resolution: float, sale_month: str,
+                 exclude_id: int | None = None) -> models.RsItem | None:
+    """(assetId, province, city, resolution, saleMonth) 组合判重（Python 层，与全库风格一致）。
+
+    resolution 为 FLOAT 列，比较用容差（1e-9）避免二进制浮点误差误判。
+    """
+    q = select(models.RsItem).where(
+        models.RsItem.assetId == asset_id,
+        models.RsItem.province == province,
+        models.RsItem.city == city,
+        models.RsItem.saleMonth == sale_month,
+    )
+    if exclude_id is not None:
+        q = q.where(models.RsItem.id != exclude_id)
+    for r in db.execute(q).scalars().all():
+        if abs(float(r.resolution) - float(resolution)) < 1e-9:
+            return r
+    return None
+
+
+def _rs_item_fields(data: schemas.RsItemInput) -> tuple[str, str, float, str, float]:
+    """明细字段归一化 + 校验：省必填、price 整数元 > 0（saleMonth 格式/resolution>0 由 Pydantic 422）。"""
+    province = (data.province or "").strip()
+    if not province:
+        raise HTTPException(400, "遥感数据明细必须填写省份")
+    price = _dec(data.price)
+    if price <= 0 or price != price.to_integral_value():
+        raise HTTPException(400, "遥感数据明细单价须为整数元且大于 0")
+    return province, (data.city or "").strip(), float(data.resolution), data.saleMonth, float(price)
+
+
+def _get_rs_item_or_404(db: Session, item_id: int) -> models.RsItem:
+    it = db.get(models.RsItem, item_id)
+    if not it:
+        raise HTTPException(404, "遥感数据明细不存在")
+    return it
+
+
+def create_rs_item(db: Session, asset_id: int, data: schemas.RsItemInput,
+                   operator: str = "") -> models.RsItem:
+    a = get_asset(db, asset_id)
+    if not a:
+        raise HTTPException(404, "资产不存在")
+    if a.type != "遥感数据":
+        raise HTTPException(400, "仅遥感数据资产可维护可售明细")
+    province, city, resolution, sale_month, price = _rs_item_fields(data)
+    if _rs_item_dup(db, asset_id, province, city, resolution, sale_month):
+        raise HTTPException(400, "该父资产下已存在相同 省/市 + 精度 + 月份 的明细")
+    it = models.RsItem(
+        assetId=asset_id, province=province, city=city, resolution=resolution,
+        saleMonth=sale_month, price=price, repeatSale=data.repeatSale,
+        createdAt=now_str(), updatedAt=now_str(),
+    )
+    db.add(it)
+    db.flush()
+    add_log(db, "asset", a.name, "新增可售明细",
+            f"新增明细 #{it.id}：{_rs_item_desc(it)}，单价 {_fmt_amount_yuan(price)}",
+            asset_id=a.id, operator=operator)
+    db.commit()
+    db.refresh(it)
+    return it
+
+
+def update_rs_item(db: Session, item_id: int, data: schemas.RsItemInput,
+                   operator: str = "") -> models.RsItem:
+    it = _get_rs_item_or_404(db, item_id)
+    a = get_asset(db, it.assetId)
+    if not a:
+        raise HTTPException(404, "明细所属父资产不存在")
+    province, city, resolution, sale_month, price = _rs_item_fields(data)
+    if _rs_item_dup(db, it.assetId, province, city, resolution, sale_month, exclude_id=it.id):
+        raise HTTPException(400, "该父资产下已存在相同 省/市 + 精度 + 月份 的明细")
+    it.province, it.city, it.resolution = province, city, resolution
+    it.saleMonth, it.price, it.repeatSale = sale_month, price, data.repeatSale
+    it.updatedAt = now_str()
+    add_log(db, "asset", a.name, "编辑可售明细",
+            f"明细 #{it.id} 更新为：{_rs_item_desc(it)}，单价 {_fmt_amount_yuan(price)}",
+            asset_id=a.id, operator=operator)
+    db.commit()
+    db.refresh(it)
+    return it
+
+
+def delete_rs_item(db: Session, item_id: int, operator: str = "") -> None:
+    it = _get_rs_item_or_404(db, item_id)
+    a = get_asset(db, it.assetId)
+    # 引用完整性（服务层校验，同 delete_asset 风格）：任一销售关联（项目明细/购物车行）→ 400
+    ref_cnt = db.execute(
+        select(models.ProjectItem).where(models.ProjectItem.itemId == item_id).limit(1)
+    ).scalars().first()
+    if ref_cnt is None:
+        ref_cnt = db.execute(
+            select(models.CartItem).where(models.CartItem.itemId == item_id).limit(1)
+        ).scalars().first()
+    if ref_cnt is not None:
+        raise HTTPException(400, "该明细存在销售关联，无法删除")
+    desc = _rs_item_desc(it)
+    db.delete(it)
+    add_log(db, "asset", a.name if a else f"资产 #{it.assetId}", "删除可售明细",
+            f"删除明细 #{item_id}：{desc}",
+            asset_id=it.assetId if a else None, operator=operator)
     db.commit()
 
 
 # ============================================================
 # 销售项目
 # ============================================================
-def create_project(db: Session, data: schemas.ProjectInput) -> models.Project:
-    project = _create_project_core(db, data)
+def create_project(db: Session, data: schemas.ProjectInput, operator: str = "") -> models.Project:
+    project = _create_project_core(db, data, operator=operator)
     db.commit()
     db.refresh(project)
     return project
 
 
-def _create_project_core(db: Session, data: schemas.ProjectInput) -> models.Project:
-    """建项目核心（不提交）：校验库存 → 生成项目（状态强制 active）→ 锁定明细。
+def _normalize_contracts(db: Session, data: schemas.ProjectInput) -> list[tuple[str, list[schemas.ProjectItemInput], Decimal, str]]:
+    """归一化合同结构（ADR-007）→ [(customer, items, contractAmount, remark), ...]。
+
+    两种入参都支持（向后兼容）：
+    - 传 contracts：按合同建项目（每客户一个合同）；
+    - 不传（仅 items）：按**单合同**自动包装，customer 取项目 customer 字段，
+      contractAmount 缺省=该组明细 amount 合计。
+    返回的 contractAmount 为 Decimal（元口径，ADR-006），缺省时按明细计价合计：
+    amount 模式=Σ 权威 amount（整数元，ADR-008），unit 模式=Σ price×qty。
+    """
+    def _item_total(it: schemas.ProjectItemInput) -> Decimal:
+        a = get_asset(db, it.assetId)
+        if a is not None and _is_amount_mode(a):
+            return _validate_amount_yuan(it.amount)
+        return (_dec(it.price) * it.qty).quantize(CENT)
+
+    if data.contracts:
+        out = []
+        for c in data.contracts:
+            total = sum((_item_total(it) for it in c.items), Decimal("0"))
+            amt = _dec(c.contractAmount).quantize(CENT) if c.contractAmount is not None else total.quantize(CENT)
+            out.append((c.customer, c.items, amt, c.remark))
+        return out
+    # 兼容路径：items 自动包装为单合同
+    total = sum((_item_total(it) for it in data.items), Decimal("0"))
+    return [(data.customer, data.items, total.quantize(CENT), "")]
+
+
+def _item_repeat(db: Session, asset: models.Asset | None,
+                 item_id: int | None) -> bool:
+    """ADR-011：明细行（itemId 非空）以 rs_items.repeatSale 为权威（父资产 repeatSale 无意义）；
+    非明细行用资产 repeatSale。"""
+    if item_id:
+        rs = db.get(models.RsItem, item_id)
+        if rs is not None:
+            return rs.repeatSale
+    return asset.repeatSale if asset else True
+
+
+def _validate_rs_item_ref(db: Session, it: schemas.ProjectItemInput) -> models.RsItem | None:
+    """ADR-011：含 itemId 的明细行统一校验（三个下单入口共用）：
+    明细存在且归属 assetId；qty 强制 1。返回 RsItem（无 itemId 返回 None）。"""
+    if not it.itemId:
+        return None
+    rs = db.get(models.RsItem, it.itemId)
+    if rs is None or rs.assetId != it.assetId:
+        raise HTTPException(400, "遥感数据明细不存在或不属于该资产")
+    if it.qty != 1:
+        raise HTTPException(400, "遥感数据明细行数量固定为 1")
+    return rs
+
+
+def _create_project_core(db: Session, data: schemas.ProjectInput,
+                         operator: str = "") -> models.Project:
+    """建项目核心（不提交）：归一化合同 → 逐合同校验同主体 → 按 assetId 聚合校验库存
+    → 生成项目（状态强制 active）+ 合同（HT-xxxx）+ 明细（挂 contractId）→ 锁定。
 
     抽成 core 供 create_project / checkout / sales order 复用，以收敛为单一事务（H8）。
+    项目 subject/customer/expectedAmount 均由合同派生（_recompute_project），
+    请求体中的 subject/expectedAmount/contractAmount 不再采信（派生口径，ADR-007）。
+    ADR-011：含 itemId 的明细行——明细存在/归属/qty=1 校验、金额=明细 price 权威、
+    锁定按明细 repeatSale（true 不锁，false 锁父资产 qty=1）。
     """
+    # 项目名非空（后端权威校验；Pydantic 无 min_length，前端直调 API 可传空串）
+    if not (data.name or "").strip():
+        raise HTTPException(400, "项目名称不能为空")
+    data.name = data.name.strip()
+    contracts_in = _normalize_contracts(db, data)
+    # ADR-011：明细行前置校验（存在/归属/qty=1），并缓存 RsItem 供计价/锁定复用
+    rs_map: dict[int, models.RsItem] = {}
+    for _customer, items, _amt, _remark in contracts_in:
+        for it in items:
+            rs = _validate_rs_item_ref(db, it)
+            if rs is not None:
+                rs_map[it.itemId] = rs
+    # 逐合同校验：合同内强制同一资产主体（ADR-007）
+    for customer, items, _amt, _remark in contracts_in:
+        subjects = set()
+        for it in items:
+            a = get_asset(db, it.assetId)
+            if a and a.subject:
+                subjects.add(a.subject)
+        if len(subjects) > 1:
+            raise HTTPException(400, f"客户「{customer}」的资产主体不一致，请拆分")
+    # H1：先整体校验库存，再统一加锁，避免部分加锁后中途失败
+    # 超卖修复（H10）：校验必须**按 assetId 聚合**全项目（跨合同）需求量后再比较可售。
+    # WHY：同一项目可能含多条引用同一 assetId 的明细（如 qty 各 1、可售仅 1），
+    # 逐条按"全量可售"校验会全部通过，合计却超卖/超锁；故先汇总该资产在本单的 qty 合计。
+    demand: dict[int, int] = {}
+    for _customer, items, _amt, _remark in contracts_in:
+        for it in items:
+            if not it.assetId:
+                continue
+            # ADR-011：明细行仅当明细 repeatSale=false 才计入父资产锁定需求（true 只计次不占库存）
+            if it.itemId and rs_map.get(it.itemId) is not None and rs_map[it.itemId].repeatSale:
+                continue
+            demand[it.assetId] = demand.get(it.assetId, 0) + it.qty
+    for aid, total_qty in demand.items():
+        asset = get_asset(db, aid)
+        if asset is not None:
+            _validate_item_stock(asset, total_qty)
+    # 建项目（customer/subject/expectedAmount 建完合同后由 _recompute_project 派生落库）
     project = models.Project(
         name=data.name, customer=data.customer, industry=data.industry, rep=data.rep,
-        subject=data.subject, status="active",  # 契约 3：不采信请求体 status，后端强制 active
-        expectedAmount=data.expectedAmount, quoteAmount=data.quoteAmount,
-        contractAmount=data.contractAmount, paidAmount=data.paidAmount,
+        businessOwner=data.businessOwner,  # 商务负责人（可选，默认 ""）
+        subject="", status="active",  # 契约 3：不采信请求体 status，后端强制 active
+        expectedAmount=0, quoteAmount=data.quoteAmount,
+        contractAmount=0, paidAmount=data.paidAmount,
         expectedSignDate=data.expectedSignDate, lastFollowDate=data.lastFollowDate,
         remark=data.remark, createdAt=today(), updatedAt=today(),
     )
     # D1：不手写主键，flush 生成 id 后拼 SP-{3位} 编号
     _flush_with_code(db, project, lambda pid: f"SP-{str(pid).zfill(3)}")
-    # H1：先整体校验库存，再统一加锁，避免部分加锁后中途失败
-    # 超卖修复（H10）：校验必须**按 assetId 聚合**本单需求量后再比较可售。
-    # WHY：同一项目可能含多条引用同一 assetId 的明细（如 qty 各 1、可售仅 1），
-    # 逐条按"全量可售"校验会全部通过，合计却超卖/超锁；故先汇总该资产在本单的 qty 合计。
-    validated: list[tuple[schemas.ProjectItemInput, models.Asset | None]] = []
-    demand: dict[int, int] = {}
-    for it in data.items:
-        asset = get_asset(db, it.assetId)
-        validated.append((it, asset))
-        if it.assetId:
-            demand[it.assetId] = demand.get(it.assetId, 0) + it.qty
-    for aid, total_qty in demand.items():
-        asset = get_asset(db, aid)
-        if asset is not None:
-            _validate_item_stock(asset, total_qty)
-    for it, asset in validated:
-        status = item_status_of_input(it)
-        if status == "locked":
-            apply_item_lock(db, it.assetId, it.qty, True, project.code)
-        project.items.append(models.ProjectItem(
-            assetId=it.assetId, qty=it.qty, unit=asset.unit if asset else "",
-            price=it.price, amount=round(it.price * it.qty, 4),  # 契约 5：后端权威重算，忽略前端 amount
-            status=status, deliveryReq=it.deliveryReq,
-            # 契约 2：落「下单时刻是否真实加锁」事实（repeatSale 资产下单不加锁）
-            locked=bool(asset is not None and not asset.repeatSale),
-            lockedDate=today() if status == "locked" else "",
-            confirmedDate="", shippedDate="",
-        ))
+    # 建合同 + 明细（合同 code = HT-{4位序号}）
+    total_item_count = 0
+    for customer, items, amt, remark in contracts_in:
+        # 签约主体后端权威推导：取合同内首条有资产明细的资产主体（同主体校验已保证唯一）
+        subject = ""
+        for it in items:
+            a = get_asset(db, it.assetId)
+            if a and a.subject:
+                subject = a.subject
+                break
+        contract = models.Contract(
+            projectId=project.id, customer=customer, subject=subject,
+            contractAmount=float(amt), status="active", remark=remark,
+            createdAt=today(), updatedAt=today(),
+        )
+        _flush_with_code(db, contract, lambda cid: f"HT-{str(cid).zfill(4)}")
+        for it in items:
+            asset = get_asset(db, it.assetId)
+            rs = rs_map.get(it.itemId) if it.itemId else None
+            eff_repeat = rs.repeatSale if rs is not None else (asset.repeatSale if asset else True)
+            status = item_status_of_input(it)
+            if status == "locked" and not eff_repeat:
+                apply_item_lock(db, it.assetId, it.qty, True, project.code, operator=operator,
+                                repeat_override=eff_repeat)
+            # 计价分支：
+            # - ADR-011 明细行：amount 权威 = 明细 price × 1（Decimal 重算，忽略前端传值）
+            # - ADR-008 amount 模式：amount 权威（整数元）+ price 派生
+            # - unit 模式：price×qty 后端权威重算（契约 5，Decimal 精确到分，元口径 ADR-006）
+            if rs is not None:
+                price = float(_dec(rs.price))
+                amount = float((_dec(rs.price) * 1).quantize(CENT))
+            else:
+                price, amount = _item_pricing(asset, it)
+            project.items.append(models.ProjectItem(
+                contractId=contract.id,
+                assetId=it.assetId, qty=it.qty, unit=asset.unit if asset else "",
+                price=price, amount=amount,
+                status=status, deliveryReq=it.deliveryReq,
+                itemId=it.itemId,  # ADR-011：遥感明细行落库（非明细行 NULL）
+                # 契约 2：落「下单时刻是否真实加锁」事实（repeatSale/明细 repeatSale 下单不加锁）
+                locked=bool(asset is not None and not eff_repeat),
+                lockedDate=today() if status == "locked" else "",
+                confirmedDate="", shippedDate="",
+            ))
+            total_item_count += 1
+    # 项目派生字段落库：status/customer/subject/expectedAmount=Σ合同（ADR-007）
+    _recompute_project(project)
     add_log(db, "project", project.name, "新增项目",
-            f"创建销售项目 {project.code}，关联资产 {len(data.items)} 项")
+            f"创建销售项目 {project.code}，合同 {len(contracts_in)} 份，关联资产 {total_item_count} 项",
+            operator=operator)
     db.flush()
     return project
 
 
-def update_project(db: Session, project_id: int, data: schemas.ProjectInput) -> None:
+# ============================================================
+# 合同（ADR-007）：库存联动的最小单位
+# ============================================================
+def _apply_item_delivery(db: Session, it: models.ProjectItem, operator: str = "",
+                         ref: str = "", remark: str = "",
+                         customer: str = "", contract_id: int | None = None,
+                         project: models.Project | None = None) -> None:
+    """单明细交付（项目级/合同级共用，避免两套逻辑漂移）：
+    释放锁定（仅 it.locked）→ 非 repeatSale 扣 shippedQty → 累计 soldCount/soldAmount
+    → 写 sale_out 流水 → 生成出库记录（精确关联合同）。
+    ADR-011：明细行（it.itemId）以 rs_items.repeatSale 为权威（父资产 repeatSale 无意义）。"""
+    a = get_asset(db, it.assetId)
+    eff_repeat = _item_repeat(db, a, it.itemId)
+    if a:
+        if not eff_repeat:
+            # BUG2 修复：仅当下单时真实加锁（it.locked）才释放锁定，
+            # 消灭 repeatSale 期间下单（从未加锁）→ 改回 false → 交付时的幽灵释放
+            # ADR-011：明细行传 repeat_override（父资产 repeatSale 无意义，不传会误跳过释放）
+            if it.locked:
+                apply_item_lock(db, it.assetId, it.qty, False, ref, operator=operator,
+                                contract_id=contract_id, repeat_override=eff_repeat)
+            # 防御存量脏数据：shippedQty 不得超 quantity（正常路径 locked 守恒时 min 不生效）
+            a.shippedQty = min(a.quantity, a.shippedQty + it.qty)
+        # ADR-007：repeatSale 与非 repeatSale 交付均累计 soldCount/soldAmount（交付=一次销售）
+        a.soldCount += 1
+        # 契约 5：Decimal 累加（元口径，ADR-006），禁止夹零；落库前转 float
+        a.soldAmount = float(_dec(a.soldAmount) + _dec(it.amount))
+        refresh_status(a)
+        add_flow(db, a.id, "sale_out", it.qty, a.unit, it.amount,
+                 today(), ref, "交付完成出库", operator=operator, contract_id=contract_id)
+        # D1：不手写主键；flush 由 DB 生成 id 后再拼出库单号，循环内逐条唯一
+        ob = models.Outbound(
+            projectId=project.id if project else None,
+            contractId=contract_id,
+            projectName=project.name if project else "",
+            customer=customer,
+            assetId=a.id, assetName=a.name, qty=it.qty, unit=a.unit,
+            amount=it.amount, type=_default_outbound_type(a.board),
+            mode="new", date=today(),
+            operator=(project.rep if project else "") or "admin",
+            status="done", remark=remark,
+        )
+        _flush_with_code(db, ob, lambda oid: f"CK-{str(oid).zfill(4)}")
+    it.status = "shipped"
+    it.shippedDate = today()
+
+
+def _apply_item_release(db: Session, it: models.ProjectItem, operator: str = "",
+                        ref: str = "", contract_id: int | None = None) -> bool:
+    """单明细释放（项目级/合同级共用）：仅 locked/confirmed 且 it.locked（下单时真实加锁）
+    才写 cancel_release 流水释放锁定；标记 released。返回是否实际释放。
+    ADR-011：明细行以 rs_items.repeatSale 判定（repeat_override，父资产口径无意义）。"""
+    if it.status in ("locked", "confirmed"):
+        if it.locked:
+            a = get_asset(db, it.assetId)
+            apply_item_lock(db, it.assetId, it.qty, False, ref, operator=operator,
+                            contract_id=contract_id,
+                            repeat_override=_item_repeat(db, a, it.itemId))
+        it.status = "released"
+        return True
+    return False
+
+
+def _derive_project_status(p: models.Project) -> str:
+    """项目状态派生（ADR-007）：无合同→active（存量兼容）；有 active→active；
+    全 delivered→delivered；全 terminated→terminated；
+    混合 delivered+terminated（无 active）→terminated（保守：项目已不可继续推进）。"""
+    contracts = p.contracts
+    if not contracts:
+        return "active"
+    statuses = {c.status for c in contracts}
+    if "active" in statuses:
+        return "active"
+    if statuses == {"delivered"}:
+        return "delivered"
+    return "terminated"
+
+
+def _recompute_project(p: models.Project) -> None:
+    """合同变更后重算项目派生字段（ADR-007）：
+    status（派生）+ expectedAmount=Σ合同 contractAmount（Decimal）+ customer/subject
+    （多合同=空字符串，前端显示「N 位客户」；单合同=该合同值；无合同=保持存量值不动）。"""
+    contracts = p.contracts
+    p.status = _derive_project_status(p)
+    total = sum((_dec(c.contractAmount) for c in contracts), Decimal("0"))
+    p.expectedAmount = float(total.quantize(CENT))
+    p.contractAmount = float(total.quantize(CENT))  # 项目级 contractAmount 兼容口径同 expectedAmount
+    if contracts:
+        if len(contracts) == 1:
+            p.customer = contracts[0].customer
+            p.subject = contracts[0].subject
+        else:
+            p.customer = ""
+            p.subject = ""
+    p.updatedAt = today()
+
+
+def change_contract_status(db: Session, contract_id: int, status: str,
+                           reason: str = "", operator: str = "") -> None:
+    """合同状态变更（ADR-007，库存联动的最小单位）：
+    - delivered：逐明细交付（释放锁定+扣 shippedQty+累计销售+生成出库，精确关联合同）；
+    - terminated：active 合同→释放锁定；delivered 合同→撤销该合同名下 done 出库并回退；
+    - 每次动作后重算项目派生字段（status/expectedAmount/customer/subject）。
+    单事务，任一步失败整体回滚（H8）。"""
+    c = get_contract(db, contract_id)
+    if not c:
+        raise HTTPException(404, "合同不存在")
+    if not get_project(db, c.projectId):
+        raise HTTPException(404, "合同所属项目不存在")
+    if status not in ("active", "delivered", "terminated"):
+        raise HTTPException(400, f"不支持的合同状态：{status}")
+    if c.status == "terminated":
+        raise HTTPException(400, "合同已终止，不可再变更状态")
+    if c.status == "delivered" and status == "active":
+        raise HTTPException(400, "已交付完成的合同不可回退到进行中")
+    _change_contract_status_core(db, c, status, reason, operator=operator)
+    db.commit()
+
+
+def _release_contract_items(db: Session, c: models.Contract, operator: str = "") -> int:
+    """合同级联释放（项目删除用）：active 合同释放全部 locked/confirmed 明细锁定。"""
+    released = 0
+    for it in c.items:
+        if _apply_item_release(db, it, operator=operator, ref=c.code, contract_id=c.id):
+            released += 1
+    return released
+
+
+def _revert_contract_outbounds(db: Session, c: models.Contract, operator: str = "") -> int:
+    """合同级联撤销（项目删除用）：delivered 合同撤销名下全部 done 出库并回退数量/金额。"""
+    obs = db.execute(
+        select(models.Outbound).where(
+            models.Outbound.contractId == c.id,
+            models.Outbound.status == "done",
+        )
+    ).scalars().all()
+    for ob in obs:
+        _revert_outbound_inner(db, ob.id, "项目删除回滚", operator=operator)
+    for it in c.items:
+        if it.status == "shipped":
+            it.status = "released"
+    return len(obs)
+
+
+def update_project(db: Session, project_id: int, data: schemas.ProjectInput,
+                   operator: str = "") -> None:
+    """编辑项目（ADR-007 起）：仅保留**项目基本信息**编辑
+    （name/industry/rep/businessOwner/remark/日期/quoteAmount/paidAmount）。
+
+    - 合同与明细的结构编辑本次不做：合同一经生成不可增删改明细（终止再重下），
+      故入参中的 items / contracts / customer / subject / expectedAmount / contractAmount
+      **一律忽略**（customer/subject/expectedAmount 为合同派生字段，见 _recompute_project）。
+    - 编辑约束（判断改为合同口径）：存在 delivered 合同则不可编辑；
+      存量无合同项目沿用旧规则（status != active 不可编辑）。
+    """
     p = get_project(db, project_id)
     if not p:
         raise HTTPException(404, "项目不存在")
-    # 契约 4 / H2 / H3：仅进行中项目可编辑；忽略传入 status（不写入 p.status）
-    if p.status != "active":
-        raise HTTPException(400, "已完成/已终止项目不可编辑")
-    # 1. 释放旧明细中的锁定（仅已锁定/已确认）；仅 it.locked（下单时真实加锁）才释放，
-    # 与交付/终止分支同一根因：repeatSale 期间下单的明细从未加锁，不可写幽灵 cancel_release
-    for it in list(p.items):
-        if it.status in ("locked", "confirmed") and it.locked:
-            apply_item_lock(db, it.assetId, it.qty, False, p.code)
-    # 2. 覆盖基础字段（不含 status）
-    for k in ("name", "customer", "industry", "rep", "subject",
-              "expectedAmount", "quoteAmount", "contractAmount", "paidAmount",
+    # 项目名非空（防止被清空；与 _create_project_core 口径一致）
+    if not (data.name or "").strip():
+        raise HTTPException(400, "项目名称不能为空")
+    data.name = data.name.strip()
+    if p.contracts:
+        # FIX-6a：与前端 canEditProject 对齐——派生状态 terminated（全合同终止/混合 delivered+terminated）不可编辑
+        if _derive_project_status(p) == "terminated":
+            raise HTTPException(400, "项目已终止，不可编辑")
+        if any(c.status == "delivered" for c in p.contracts):
+            raise HTTPException(400, "已交付完成的项目不可编辑")
+    else:
+        # 存量兼容：无合同项目沿用旧规则（terminated 单列新文案，与合同口径一致）
+        if p.status == "terminated":
+            raise HTTPException(400, "项目已终止，不可编辑")
+        if p.status != "active":
+            raise HTTPException(400, "已完成/已终止项目不可编辑")
+    # 仅覆盖项目基本信息（不含 status/customer/subject/expectedAmount/contractAmount——派生字段）
+    for k in ("name", "industry", "rep", "businessOwner", "quoteAmount", "paidAmount",
               "expectedSignDate", "lastFollowDate", "remark"):
         setattr(p, k, getattr(data, k))
     p.updatedAt = today()
-    # 3. 重建明细：H2 保留已出库(shipped)明细不被误删/误改 shippedQty，仅删除其余明细
-    for it in list(p.items):
-        if it.status != "shipped":
-            db.delete(it)
-    db.flush()
-    # 4. H1：释放旧锁定之后再校验新明细库存（避免把本单自身占用算进可售）
-    # 超卖修复（H10）：同样按 assetId 聚合新明细需求量后校验；旧明细已在上方释放锁定并删除，
-    # 故只需按新明细聚合即可，不会把本单旧占用重复计入。
-    validated: list[tuple[schemas.ProjectItemInput, models.Asset | None]] = []
-    demand: dict[int, int] = {}
-    for it in data.items:
-        asset = get_asset(db, it.assetId)
-        validated.append((it, asset))
-        if it.assetId:
-            demand[it.assetId] = demand.get(it.assetId, 0) + it.qty
-    for aid, total_qty in demand.items():
-        asset = get_asset(db, aid)
-        if asset is not None:
-            _validate_item_stock(asset, total_qty)
-    for it, asset in validated:
-        status = item_status_of_input(it)
-        if status == "locked":
-            apply_item_lock(db, it.assetId, it.qty, True, p.code)
-        p.items.append(models.ProjectItem(
-            assetId=it.assetId, qty=it.qty, unit=asset.unit if asset else "",
-            price=it.price, amount=round(it.price * it.qty, 4),  # 契约 5：后端权威重算
-            status=status, deliveryReq=it.deliveryReq,
-            # 契约 2：重建明细同样落「下单时刻是否真实加锁」事实
-            locked=bool(asset is not None and not asset.repeatSale),
-            lockedDate=today() if status == "locked" else "",
-            confirmedDate="", shippedDate="",
-        ))
-    add_log(db, "project", p.name, "编辑", "更新销售项目")
+    add_log(db, "project", p.name, "编辑", "更新销售项目", operator=operator)
     db.commit()
 
 
-def change_project_status(db: Session, project_id: int, data: schemas.StatusInput) -> None:
-    _change_project_status_core(db, project_id, data)
-    db.commit()
+def change_project_status(db: Session, project_id: int, data: schemas.StatusInput,
+                          operator: str = "") -> None:
+    """项目级状态变更（ADR-007 起，批量快捷语义）：
 
-
-def _change_project_status_core(db: Session, project_id: int, data: schemas.StatusInput) -> None:
-    """项目状态变更核心（不提交），供 API 与下单流程复用，便于收敛为单一事务（H8）。"""
+    项目 status 为合同派生字段，本接口保留为**批量快捷入口**——
+    对名下全部 active 合同批量执行该状态动作（delivered=全部交付、terminated=全部终止），
+    前端主入口用合同级 PATCH /contracts/{id}/status。
+    存量无合同项目走旧的项目级明细逻辑（兼容路径）。
+    """
     p = get_project(db, project_id)
     if not p:
         raise HTTPException(404, "项目不存在")
     status, reason = data.status, data.reason
+    if p.contracts:
+        # 批量语义：仅 delivered / terminated 是合同动作；active 由合同派生，不可直接设置
+        if status not in ("delivered", "terminated"):
+            raise HTTPException(400, "项目状态由合同状态派生，仅支持批量 delivered/terminated（active 请直接变更合同状态）")
+        if p.status == "terminated" and status == "delivered":
+            raise HTTPException(400, "项目已终止，不可再变更状态")
+        targets = [c for c in p.contracts if c.status == "active"]
+        if not targets:
+            raise HTTPException(400, "项目下没有进行中的合同，无可批量执行")
+        for c in targets:
+            # 复用合同级核心（不提交），单事务收敛（H8）
+            _change_contract_status_core(db, c, status, reason, operator=operator)
+        add_log(db, "project", p.name, "状态变更",
+                f"项目批量{('交付' if status == 'delivered' else '终止')}：名下 {len(targets)} 份进行中合同已执行",
+                operator=operator)
+        db.commit()
+        return
+    # 存量兼容：无合同项目走旧的项目级明细逻辑
+    _legacy_change_project_status(db, p, status, reason, operator=operator)
+    db.commit()
+
+
+def _change_contract_status_core(db: Session, c: models.Contract, status: str,
+                                 reason: str = "", operator: str = "") -> None:
+    """合同状态变更核心（不提交）：供 change_contract_status / 项目级批量复用（H8）。"""
+    p = get_project(db, c.projectId)
+    from_status = c.status
+    if status == from_status:
+        return
+    if status == "delivered":
+        # 待关联资产明细（assetId=null，仅手动建项目 API 可产生）无法交付——
+        # 若放行，合同会被置 delivered、项目派生「已完成」，明细永久悬挂。
+        pending = [it for it in c.items if it.status == "pending_asset"]
+        if pending:
+            raise HTTPException(400,
+                f"合同 {c.code} 尚有 {len(pending)} 项明细未关联资产，无法交付完成（请先终止该合同）")
+        for it in c.items:
+            # H4：locked/confirmed 均处理（含零价 amount=0 明细），不再因金额为 0 被跳过
+            if it.status in ("confirmed", "locked"):
+                _apply_item_delivery(
+                    db, it, operator=operator, ref=c.code,
+                    remark=f"合同「{c.code}」交付完成自动生成",
+                    customer=c.customer, contract_id=c.id, project=p,
+                )
+        c.status = "delivered"
+        c.updatedAt = today()
+        _recompute_project(p)
+        add_log(db, "project", p.name, "合同状态变更",
+                f"合同 {c.code}（客户 {c.customer}）交付完成，已生成出库记录并累计销售金额",
+                contract_id=c.id, operator=operator)
+    elif status == "terminated":
+        released = 0
+        reverted = 0
+        if from_status == "active":
+            # active 合同终止：释放锁定（仅 it.locked，沿用 ADR 修复机制）
+            for it in c.items:
+                if _apply_item_release(db, it, operator=operator, ref=c.code,
+                                       contract_id=c.id):
+                    released += 1
+        else:  # delivered 合同终止：撤销该合同名下 done 出库 + 回退 shippedQty/soldCount/soldAmount
+            obs = db.execute(
+                select(models.Outbound).where(
+                    models.Outbound.contractId == c.id,
+                    models.Outbound.status == "done",
+                )
+            ).scalars().all()
+            for ob in obs:
+                _revert_outbound_inner(db, ob.id, f"合同终止（{c.code}）", operator=operator)
+                reverted += 1
+            for it in c.items:
+                if it.status == "shipped":
+                    it.status = "released"
+        c.status = "terminated"
+        c.updatedAt = today()
+        _recompute_project(p)
+        add_log(db, "project", p.name, "合同状态变更",
+                f"合同 {c.code}（客户 {c.customer}）终止：释放锁定 {released} 项，撤销出库 {reverted} 条"
+                + (f"，原因：{reason}" if reason else ""),
+                contract_id=c.id, operator=operator)
+
+
+def _legacy_change_project_status(db: Session, p: models.Project, status: str,
+                                  reason: str = "", operator: str = "") -> None:
+    """存量兼容（无合同项目）：旧的项目级明细状态逻辑，行为与 ADR-007 前一致。"""
     from_status = p.status
     if status != from_status:
         if from_status == "terminated":
@@ -361,50 +977,40 @@ def _change_project_status_core(db: Session, project_id: int, data: schemas.Stat
     p.updatedAt = today()
 
     if status == "delivered":
+        # 与合同口径一致：待关联资产明细无法交付，放行会留下「已完成项目悬挂 pending 明细」
+        pending = [it for it in p.items if it.status == "pending_asset"]
+        if pending:
+            raise HTTPException(400,
+                f"项目 {p.code} 尚有 {len(pending)} 项明细未关联资产，无法交付完成（请先终止该项目）")
         for it in p.items:
-            # H4：locked/confirmed 均处理（含零价 amount=0 明细），不再因金额为 0 被跳过
             if it.status in ("confirmed", "locked"):
-                a = get_asset(db, it.assetId)
-                if a:
-                    if a.repeatSale:
-                        a.soldCount += 1
-                    else:
-                        # BUG2 修复：仅当下单时真实加锁（it.locked）才释放锁定，
-                        # 消灭 repeatSale 期间下单（从未加锁）→ 改回 false → 交付时的幽灵释放
-                        if it.locked:
-                            apply_item_lock(db, it.assetId, it.qty, False, p.code)
-                        # 防御存量脏数据：shippedQty 不得超 quantity（正常路径 locked 守恒时 min 不生效）
-                        a.shippedQty = min(a.quantity, a.shippedQty + it.qty)
-                    a.soldAmount = round(a.soldAmount + it.amount, 4)  # 契约 5：万元 4 位小数，禁止夹零
-                    refresh_status(a)
-                    add_flow(db, a.id, "sale_out", it.qty, a.unit, it.amount,
-                             today(), p.code, "项目交付完成出库")
-                    # D1：不手写主键；flush 由 DB 生成 id 后再拼出库单号，循环内逐条唯一
-                    ob = models.Outbound(
-                        projectId=p.id, projectName=p.name, customer=p.customer,
-                        assetId=a.id, assetName=a.name, qty=it.qty, unit=a.unit,
-                        amount=it.amount, type=_default_outbound_type(a.board),
-                        mode="new", date=today(), operator=p.rep or "admin",
-                        status="done", remark=f"项目「{p.name}」交付完成自动生成",
-                    )
-                    _flush_with_code(db, ob, lambda oid: f"CK-{str(oid).zfill(4)}")
-                it.status = "shipped"
-                it.shippedDate = today()
-        add_log(db, "project", p.name, "状态变更", "交付完成，已生成出库记录并累计销售金额")
+                _apply_item_delivery(
+                    db, it, operator=operator, ref=p.code,
+                    remark=f"项目「{p.name}」交付完成自动生成",
+                    customer=p.customer, project=p,
+                )
+        add_log(db, "project", p.name, "状态变更", "交付完成，已生成出库记录并累计销售金额",
+                operator=operator)
 
     if status == "terminated":
-        _terminate_project(db, p, reason)
+        _terminate_project(db, p, reason, operator=operator)
 
 
-def _terminate_project(db: Session, p: models.Project, reason: str) -> None:
-    """项目终止：释放未出库的锁定 + 撤销该项目名下已完成的出库（回退 shippedQty/soldAmount/soldCount）。"""
+def _terminate_project(db: Session, p: models.Project, reason: str,
+                       operator: str = "") -> None:
+    """项目终止：释放未出库的锁定 + 撤销该项目名下已完成的出库（回退 shippedQty/soldAmount/soldCount）。
+
+    FIX-2 说明（终止≠删除）：合同口径下项目终止**不做**「挂项目手动出库（contractId == null）」
+    的回滚——手动出库是独立动作，终止只影响合同名下出库（见 _change_contract_status_core）；
+    手动出库的撤销仅在「删除项目」时发生（delete_project）。本函数仅服务于**存量无合同**
+    legacy 路径（终止/删除共用旧的全量撤销语义），不新增合同口径逻辑。"""
     released = 0
     for it in p.items:
         if it.status in ("locked", "confirmed"):
             # BUG2 修复：仅当下单时真实加锁（it.locked）才释放，
             # 消灭 repeatSale 期间下单（从未加锁）→ 终止时的 cancel_release 幽灵流水
             if it.locked:
-                apply_item_lock(db, it.assetId, it.qty, False, p.code)
+                apply_item_lock(db, it.assetId, it.qty, False, p.code, operator=operator)
             it.status = "released"
             released += 1
     # 撤销该项目名下所有已完成出库（含交付完成自动生成 + 手动登记）
@@ -415,34 +1021,58 @@ def _terminate_project(db: Session, p: models.Project, reason: str) -> None:
         )
     ).scalars().all()
     for ob in obs:
-        _revert_outbound_inner(db, ob.id, "项目终止")
+        _revert_outbound_inner(db, ob.id, "项目终止", operator=operator)
     # 已出库明细标记为已释放
     for it in p.items:
         if it.status == "shipped":
             it.status = "released"
     add_log(db, "project", p.name, "状态变更",
             f"项目终止：释放锁定 {released} 项，撤销出库 {len(obs)} 条，回退对应数量与累计销售金额"
-            + (f"，原因：{reason}" if reason else ""))
+            + (f"，原因：{reason}" if reason else ""), operator=operator)
 
 
-def delete_project(db: Session, project_id: int) -> None:
-    """删除项目（D2）：先回滚（释放未出库锁定 + 撤销该项目名下所有 done 出库，
-    回退 shippedQty/soldAmount/soldCount）→ 再硬删项目及其明细 → 写 OpLog。
-    回滚直接复用 _terminate_project，不重复实现。单事务，任一步失败整体回滚（H8）。"""
+def delete_project(db: Session, project_id: int, operator: str = "") -> None:
+    """删除项目（ADR-007 起，合同级联）：先按合同回滚——
+    active 合同释放锁定、delivered 合同撤销名下 done 出库（回退 shippedQty/soldCount/soldAmount）
+    → FIX-2：再撤销挂项目的手动出库（contractId == null 的 done 出库）
+    → 再硬删项目及其合同、明细（cascade）→ 写 OpLog。
+    存量无合同项目沿用旧逻辑（_terminate_project，其全量撤销已含手动出库）。
+    单事务，任一步失败整体回滚（H8）。"""
     p = get_project(db, project_id)
     if not p:
         raise HTTPException(404, "项目不存在")
     name, code = p.name, p.code
-    _terminate_project(db, p, "项目删除回滚")
-    db.delete(p)  # 级联删除明细（Project.items: cascade delete-orphan）
-    add_log(db, "project", name, "删除", f"删除项目 {code}（已回滚锁定与出库）")
+    if p.contracts:
+        for c in list(p.contracts):
+            if c.status == "active":
+                _release_contract_items(db, c, operator=operator)
+            elif c.status == "delivered":
+                _revert_contract_outbounds(db, c, operator=operator)
+        # FIX-2：同时撤销挂项目的手动出库（contractId == null 的 done 出库）——
+        # 合同出库已在 _revert_contract_outbounds 按 contractId 撤销，此处补齐手动登记部分，
+        # 与前端删除确认文案「撤销该项目已生成的出库记录」对齐（复用 _revert_outbound_inner：
+        # 写「出库撤销」日志 + 回退流水 + 回退 shippedQty/soldCount/soldAmount）。
+        manual_obs = db.execute(
+            select(models.Outbound).where(
+                models.Outbound.projectId == p.id,
+                models.Outbound.contractId.is_(None),
+                models.Outbound.status == "done",
+            )
+        ).scalars().all()
+        for ob in manual_obs:
+            _revert_outbound_inner(db, ob.id, "项目删除回滚", operator=operator)
+    else:
+        # 存量兼容：无合同项目走旧的项目级回滚
+        _terminate_project(db, p, "项目删除回滚", operator=operator)
+    db.delete(p)  # 级联删除合同 + 明细（cascade delete-orphan）
+    add_log(db, "project", name, "删除", f"删除项目 {code}（已回滚锁定与出库）", operator=operator)
     db.commit()
 
 
 # ============================================================
 # 出库
 # ============================================================
-def create_outbound(db: Session, data: schemas.OutboundInput) -> models.Outbound:
+def create_outbound(db: Session, data: schemas.OutboundInput, operator: str = "") -> models.Outbound:
     a = get_asset(db, data.assetId)
     if not a:
         raise HTTPException(400, "资产不存在")
@@ -453,38 +1083,53 @@ def create_outbound(db: Session, data: schemas.OutboundInput) -> models.Outbound
         if items and all(it.status in ("shipped", "released") for it in items):
             raise HTTPException(400,
                 f"项目「{p.name}」下该资产的明细已全部出库/释放，请勿重复登记；历史记录请改用「历史补录」")
+    # FIX-1：手动出库补可售校验——mode != "history"（补录不扣库存）且资产非 repeatSale（可重复售卖
+    # 不占库存，跳过）时，按当前库值校验 qty <= quantity - lockedQty - shippedQty，超量 400。
+    # 出库是独立动作，仅按当前库值校验（本单其它明细/合同锁定不在其范围）。
+    if data.mode != "history" and not a.repeatSale:
+        avail = a.quantity - a.lockedQty - a.shippedQty
+        if data.qty > avail:
+            raise HTTPException(400,
+                f"出库数量超出可售库存：{a.name} 可售 {avail}{a.unit}，本次出库 {data.qty}{a.unit}")
     ob = models.Outbound(
         projectId=p.id if p else None,
         projectName=p.name if p else (f"补录-{data.customer}" if data.customer else "补录"),
         customer=p.customer if p else data.customer,
         assetId=a.id, assetName=a.name, qty=data.qty, unit=a.unit,
-        amount=round(data.amount, 4), type=data.type, mode=data.mode, date=data.date,
-        operator=data.operator or "admin", status="done", remark=data.remark,
+        amount=float(_dec(data.amount).quantize(CENT)),  # 元口径，精确到分（ADR-006）
+        type=data.type, mode=data.mode, date=data.date,
+        # 操作人取路由层真实登录账号（require_editor 已保证非空），
+        # 不再采信前端入参 data.operator（可伪造，导致业务表与审计表操作人不一致）
+        operator=operator or "admin", status="done", remark=data.remark,
     )
     # D1：flush 生成 id 后再拼 CK-{4位} 单号（不手写主键）
     _flush_with_code(db, ob, lambda oid: f"CK-{str(oid).zfill(4)}")
     if data.mode != "history":
-        if a.repeatSale:
-            a.soldCount += 1
-        else:
+        # 口径统一（与 _apply_item_delivery 对齐）：出库即一次销售，soldCount 一律 +1
+        # （修复：此前仅 repeatSale 分支 +1，与合同交付路径「交付=计次」口径不一致）
+        a.soldCount += 1
+        if not a.repeatSale:
             a.lockedQty = max(0, a.lockedQty - data.qty)
             a.shippedQty += data.qty
-        a.soldAmount = round(a.soldAmount + ob.amount, 4)  # 契约 5：万元 4 位小数
+        # 契约 5：Decimal 累加（元口径，ADR-006），禁止夹零
+        a.soldAmount = float(_dec(a.soldAmount) + _dec(ob.amount))
         refresh_status(a)
     add_flow(
         db, a.id, "sale_out", data.qty, a.unit, ob.amount, data.date, ob.code,
         "历史出库补录（不扣减库存）" if data.mode == "history" else ("销售出库" if p else "出库补录"),
+        operator=operator,
     )
     add_log(db, "outbound", a.name,
             "历史补录" if data.mode == "history" else "销售出库",
-            f"{ob.code} 出库 {data.qty}{a.unit}，金额 {ob.amount} 万"
-            + ("（不扣减库存）" if data.mode == "history" else ""))
+            f"{ob.code} 出库 {data.qty}{a.unit}，金额 {_fmt_amount_yuan(ob.amount)}"
+            + ("（不扣减库存）" if data.mode == "history" else ""), operator=operator)
     db.commit()
     db.refresh(ob)
     return ob
 
 
-def _revert_outbound_inner(db: Session, outbound_id: int, reason: str) -> bool:
+def _revert_outbound_inner(db: Session, outbound_id: int, reason: str,
+                           operator: str = "") -> bool:
     """撤销出库（不提交事务，供批量回退复用）；返回是否实际撤销"""
     ob = db.get(models.Outbound, outbound_id)
     if not ob or ob.status == "reverted":
@@ -492,25 +1137,43 @@ def _revert_outbound_inner(db: Session, outbound_id: int, reason: str) -> bool:
     a = get_asset(db, ob.assetId)
     ob.status = "reverted"
     if a and ob.mode != "history":
-        if a.repeatSale:
-            a.soldCount = max(0, a.soldCount - 1)
-        else:
+        # ADR-011：合同出库的 shippedQty 回退按明细行权威——按 contractId+assetId 查明细取 itemId，
+        # 明细行以 rs_items.repeatSale 判定（父资产 repeatSale 无意义）；手动出库保持资产口径
+        eff_repeat = a.repeatSale
+        if ob.contractId is not None:
+            it = db.execute(
+                select(models.ProjectItem).where(
+                    models.ProjectItem.contractId == ob.contractId,
+                    models.ProjectItem.assetId == ob.assetId,
+                ).limit(1)
+            ).scalars().first()
+            if it is not None and it.itemId:
+                rs = db.get(models.RsItem, it.itemId)
+                if rs is not None:
+                    eff_repeat = rs.repeatSale
+        if not eff_repeat:
             a.shippedQty = max(0, a.shippedQty - ob.qty)
-        # 契约 5：回退同样保留 4 位小数；不再用 max(0,...) 静默夹零（若为负将直接暴露）
-        a.soldAmount = round(a.soldAmount - ob.amount, 4)
+        # FIX-3 + 口径统一：创建侧（合同交付 _apply_item_delivery / 手动出库 create_outbound）
+        # 现均一律 soldCount+1（出库=一次销售，历史补录除外）→ 撤销一律 -1。
+        # 注意：口径统一前创建的非 repeatSale 手动出库当时未 +1，其撤销会 -1，
+        # max(0, …) 夹零保证不为负（存量数据最多少计一次，可接受）。
+        a.soldCount = max(0, a.soldCount - 1)
+        # 契约 5：Decimal 回退（元口径，ADR-006）；不再用 max(0,...) 静默夹零（若为负将直接暴露）
+        a.soldAmount = float(_dec(a.soldAmount) - _dec(ob.amount))
         refresh_status(a)
         add_flow(db, a.id, "manual_adjust", -ob.qty, a.unit, -ob.amount, today(), ob.code,
-                 f"出库撤销：{reason}")
+                 f"出库撤销：{reason}", operator=operator)
     elif a:
         add_flow(db, a.id, "manual_adjust", 0, a.unit, 0, today(), ob.code,
-                 f"撤销历史补录（不调整库存）：{reason}")
+                 f"撤销历史补录（不调整库存）：{reason}", operator=operator)
     add_log(db, "outbound", ob.assetName, "出库撤销",
-            f"{ob.code} 已撤销" + ("（历史补录，不调整库存）" if ob.mode == "history" else "") + f"，原因：{reason}")
+            f"{ob.code} 已撤销" + ("（历史补录，不调整库存）" if ob.mode == "history" else "") + f"，原因：{reason}",
+            operator=operator)
     return True
 
 
-def revert_outbound(db: Session, outbound_id: int, reason: str) -> None:
-    _revert_outbound_inner(db, outbound_id, reason)
+def revert_outbound(db: Session, outbound_id: int, reason: str, operator: str = "") -> None:
+    _revert_outbound_inner(db, outbound_id, reason, operator=operator)
     db.commit()
 
 
@@ -626,9 +1289,20 @@ def remove_asset_deliverable(db: Session, asset_id: int, item_id: int) -> None:
 # Bootstrap（一次性拉取全量，供前端填充响应式缓存）
 # ============================================================
 # ============================================================
-# 购物车（预留 userId 维度，为后续账号权限管控做准备；当前默认 admin）
+# 购物车（ADR-009：按登录用户隔离——router 层传 get_current_user 的 user.id）
 # ============================================================
+# DEFAULT_USER 常量保留（seed/兼容），router 不再使用
 DEFAULT_USER = "admin"
+
+
+def _cart_amount(a: models.Asset | None, amount: float | None) -> float | None:
+    """购物车行级合同金额（ADR-008）：amount 模式资产校验整数元后返回；
+    未传返回 None（结算时再强制必填）；unit 模式忽略（不采信、不落库）。"""
+    if amount is None:
+        return None
+    if a is not None and _is_amount_mode(a):
+        return float(_validate_amount_yuan(amount))
+    return None
 
 
 def _cart_list(db: Session, user_id: str) -> list[models.CartItem]:
@@ -639,13 +1313,21 @@ def _cart_list(db: Session, user_id: str) -> list[models.CartItem]:
     ).scalars().all()
 
 
-def _cart_qty_of(db: Session, user_id: str, asset_id: int) -> int:
-    c = db.execute(
-        select(models.CartItem).where(
-            models.CartItem.userId == user_id,
-            models.CartItem.assetId == asset_id,
-        )
-    ).scalar_one_or_none()
+def _cart_qty_of(db: Session, user_id: str, asset_id: int, customer: str = "",
+                 item_id: int | None = None) -> int:
+    """唯一键语义：(userId, assetId, customer) 相同才合并（ADR-007）；
+    ADR-011 升级为 (userId, assetId, itemId, customer)——item_id=None 匹配无明细行（itemId IS NULL），
+    非空匹配对应明细行（无 itemId 行口径不变）。"""
+    q = select(models.CartItem).where(
+        models.CartItem.userId == user_id,
+        models.CartItem.assetId == asset_id,
+        models.CartItem.customer == (customer or ""),
+    )
+    if item_id is None:
+        q = q.where(models.CartItem.itemId.is_(None))
+    else:
+        q = q.where(models.CartItem.itemId == item_id)
+    c = db.execute(q).scalar_one_or_none()
     return c.qty if c else 0
 
 
@@ -664,52 +1346,130 @@ def _check_stock(db: Session, asset_id: int, target_qty: int) -> None:
         )
 
 
-def _cart_subject(db: Session, user_id: str) -> str | None:
-    """购物车当前主体（首个可解析资产的 subject）；购物车为空返回 None"""
-    for c in _cart_list(db, user_id):
-        a = get_asset(db, c.assetId)
-        if a:
-            return a.subject
-    return None
+# ADR-007：删除购物车同主体限制（_cart_subject/_check_entity 已移除）——
+# 购物车支持跨主体加购，结算时按行级 customer 分组，每客户一个合同（合同内再校验同主体）。
 
 
-def _check_entity(db: Session, user_id: str, a: models.Asset) -> None:
-    """购物车仅允许同一主体资产；与现有主体不一致时抛 400"""
-    cs = _cart_subject(db, user_id)
-    if cs is not None and a.subject != cs:
-        raise HTTPException(400, f"购物车内已有「{cs}」的资产，仅可添加同一主体；「{a.name}」属于「{a.subject}」")
+def _resolve_cart_rs_item(db: Session, asset: models.Asset, item_id: int | None) -> models.RsItem | None:
+    """ADR-011：购物车明细行解析——itemId 非空时校验明细存在且归属该资产，返回 RsItem。"""
+    if item_id is None:
+        return None
+    rs = db.get(models.RsItem, item_id)
+    if rs is None or rs.assetId != asset.id:
+        raise HTTPException(400, "遥感数据明细不存在或不属于该资产")
+    return rs
 
 
-def add_to_cart(db: Session, data: schemas.CartItemInput, user_id: str = DEFAULT_USER) -> models.CartItem:
+def _resolve_cart_rs_item_soft(db: Session, asset: models.Asset, item_id: int | None) -> models.RsItem | None:
+    """批量加购用：同 _resolve_cart_rs_item 但校验失败返回 None（批量语义=跳过该行，不整单 400）。"""
+    if item_id is None:
+        return None
+    rs = db.get(models.RsItem, item_id)
+    return rs if (rs is not None and rs.assetId == asset.id) else None
+
+
+def _cart_add_inner(db: Session, data: schemas.CartItemInput, user_id: str = DEFAULT_USER) -> models.CartItem:
+    """加购核心（**不提交**，供 add_to_cart / add_to_cart_batch 复用，批量可收敛为单一事务）"""
     a = get_asset(db, data.assetId)
     if not a:
         raise HTTPException(404, "资产不存在")
-    qty = max(1, int(data.qty or 1))
-    cur = _cart_qty_of(db, user_id, data.assetId)
-    _check_stock(db, data.assetId, cur + qty)
-    _check_entity(db, user_id, a)
-    existing = db.execute(
-        select(models.CartItem).where(
-            models.CartItem.userId == user_id,
-            models.CartItem.assetId == data.assetId,
-        )
-    ).scalar_one_or_none()
+    customer = (data.customer or "").strip()
+    # ADR-011：明细行——校验归属 + qty 恒 1（≠1 → 400）
+    rs = _resolve_cart_rs_item(db, a, data.itemId)
+    if rs is not None and data.qty != 1:
+        raise HTTPException(400, "遥感数据明细行数量固定为 1")
+    qty = 1 if rs is not None else max(1, int(data.qty or 1))
+    # 判重口径按 (userId, assetId, itemId, customer)（无 itemId 行 = itemId IS NULL，口径不变）
+    cur = _cart_qty_of(db, user_id, data.assetId, customer, data.itemId)
+    # 库存上限按该资产**全部行**（跨 customer）合计 + 本次**净增**校验；
+    # 明细行按**明细** repeatSale 判定（true 不占库存；false 按父资产可售校验）。
+    # 净增口径修复：total_in_cart 已含目标行存量 cur——
+    #  - 普通行合并后为 cur+qty，净增 = qty（原 total+qty 口径正确）；
+    #  - 明细行重复加购幂等合并（恒 1，不累加），净增 = 0（原口径 double-count，
+    #    可售恰为 1 时重复加购同一明细会被误判「库存不足」）。
+    delta = 0 if (rs is not None and cur > 0) else qty
+    if rs is None or not rs.repeatSale:
+        total_in_cart = sum(c.qty for c in _cart_list(db, user_id) if c.assetId == data.assetId)
+        if not a.repeatSale and total_in_cart + delta > _avail(a):
+            raise HTTPException(
+                400,
+                f"「{a.name}」可售库存仅 {_avail(a)}{a.unit}，无法加入/设置为 {total_in_cart + delta}{a.unit}，请调整数量",
+            )
+    amount = _cart_amount(a, data.amount)  # ADR-008：amount 模式校验整数元；unit 模式忽略
+    q = select(models.CartItem).where(
+        models.CartItem.userId == user_id,
+        models.CartItem.assetId == data.assetId,
+        models.CartItem.customer == customer,
+    )
+    if data.itemId is None:
+        q = q.where(models.CartItem.itemId.is_(None))
+    else:
+        q = q.where(models.CartItem.itemId == data.itemId)
+    existing = db.execute(q).scalar_one_or_none()
     if existing:
-        existing.qty = cur + qty
+        # 明细行 qty 恒 1：重复加购幂等合并（不累加）；普通行累加
+        existing.qty = 1 if rs is not None else cur + qty
+        if amount is not None:
+            existing.amount = amount
         existing.updatedAt = now_str()
     else:
         existing = models.CartItem(
-            userId=user_id, assetId=data.assetId, qty=qty,
-            createdAt=now_str(), updatedAt=now_str(),
+            userId=user_id, assetId=data.assetId, customer=customer, qty=qty,
+            amount=amount, itemId=data.itemId, createdAt=now_str(), updatedAt=now_str(),
         )
         db.add(existing)
+    # 批量路径必需：flush 让同批后续行的 SELECT（判重/合计）能看到本行——
+    # session autoflush=False，不 flush 则同键第二行会判为「不存在」而重复插入；
+    # flush 仍在同一事务内，任一步 400 时整体回滚，原子性不变
+    db.flush()
+    return existing
+
+
+def add_to_cart(db: Session, data: schemas.CartItemInput, user_id: str = DEFAULT_USER) -> models.CartItem:
+    existing = _cart_add_inner(db, data, user_id)
     db.commit()
     db.refresh(existing)
     return existing
 
 
+def patch_cart_item(db: Session, cart_id: int, customer: str, user_id: str = DEFAULT_USER,
+                    amount: float | None = None) -> None:
+    """修改购物车行级客户（ADR-007）；可选携带合同金额（ADR-008，amount 模式行）。
+    目标 (userId, assetId, customer) 已存在其它行时 400（避免静默合并产生歧义，前端可先删除原行）。"""
+    c = db.get(models.CartItem, cart_id)
+    if not c or c.userId != user_id:
+        raise HTTPException(404, "购物车项不存在")
+    # ADR-008：行级合同金额（amount 模式校验整数元；unit 模式忽略）
+    if amount is not None:
+        a = get_asset(db, c.assetId)
+        amt = _cart_amount(a, amount)
+        if amt is not None:
+            c.amount = amt
+            c.updatedAt = now_str()
+    new_customer = (customer or "").strip()
+    if new_customer != (c.customer or ""):
+        dup_q = select(models.CartItem).where(
+            models.CartItem.userId == user_id,
+            models.CartItem.assetId == c.assetId,
+            models.CartItem.customer == new_customer,
+            models.CartItem.id != c.id,
+        )
+        # ADR-011：判重键含 itemId（明细行与无明细行互不冲突）
+        if c.itemId is None:
+            dup_q = dup_q.where(models.CartItem.itemId.is_(None))
+        else:
+            dup_q = dup_q.where(models.CartItem.itemId == c.itemId)
+        dup = db.execute(dup_q).scalar_one_or_none()
+        if dup:
+            raise HTTPException(400, f"购物车中该资产在客户「{new_customer}」下已有行，无法修改客户（请先删除原行）")
+        c.customer = new_customer
+        c.updatedAt = now_str()
+    db.commit()
+
+
 def add_to_cart_batch(db: Session, data: schemas.CartBatchInput, user_id: str = DEFAULT_USER) -> dict:
-    """批量加购：逐条校验可售库存，超量的跳过并记录，其余正常加入"""
+    """批量加购：逐条校验可售库存（按资产全部行合计口径），超量的跳过并记录，其余正常加入。
+    ADR-007：行级带 customer，跨主体加购不再拦截。"""
     skipped: list[dict] = []
     added = 0
     for it in data.items:
@@ -717,23 +1477,32 @@ def add_to_cart_batch(db: Session, data: schemas.CartBatchInput, user_id: str = 
         if not a:
             skipped.append({"assetId": it.assetId, "name": f"资产 #{it.assetId}", "available": 0, "reason": "资产不存在"})
             continue
-        qty = max(1, int(it.qty or 1))
-        cur = _cart_qty_of(db, user_id, it.assetId)
-        if not a.repeatSale and cur + qty > _avail(a):
+        # ADR-011：明细行——归属校验失败跳过（批量语义不整单 400）；qty 恒 1
+        rs = _resolve_cart_rs_item_soft(db, a, it.itemId)
+        if it.itemId is not None and rs is None:
+            skipped.append({"assetId": it.assetId, "name": a.name, "available": 0,
+                            "reason": "遥感数据明细不存在或不属于该资产"})
+            continue
+        qty = 1 if rs is not None else max(1, int(it.qty or 1))
+        customer = (it.customer or "").strip()
+        cur = _cart_qty_of(db, user_id, it.assetId, customer, it.itemId)
+        total_in_cart = sum(c.qty for c in _cart_list(db, user_id) if c.assetId == it.assetId)
+        # 明细行按明细 repeatSale 判定（true 不占库存）；普通行按资产 repeatSale。
+        # 净增口径与 _cart_add_inner 一致：明细行已在车（幂等合并恒 1）时净增 = 0
+        delta = 0 if (rs is not None and cur > 0) else qty
+        repeat = rs.repeatSale if rs is not None else a.repeatSale
+        if not repeat and total_in_cart + delta > _avail(a):
             skipped.append({
                 "assetId": it.assetId, "name": a.name, "available": _avail(a),
-                "reason": f"可售仅 {_avail(a)}{a.unit}（购物车已有 {cur}{a.unit}）",
+                "reason": f"可售仅 {_avail(a)}{a.unit}（购物车已有 {total_in_cart}{a.unit}）",
             })
             continue
-        cs = _cart_subject(db, user_id)
-        if cs is not None and a.subject != cs:
-            skipped.append({
-                "assetId": it.assetId, "name": a.name, "available": _avail(a),
-                "reason": f"主体不一致（购物车为「{cs}」，该项为「{a.subject}」）",
-            })
-            continue
-        add_to_cart(db, schemas.CartItemInput(assetId=it.assetId, qty=qty), user_id)
+        # 原子性修复：走不提交的 _cart_add_inner，整批末尾统一 commit——
+        # 任一行硬 400（如 amount 模式金额校验）整体回滚，不再「加一半」
+        _cart_add_inner(db, schemas.CartItemInput(assetId=it.assetId, qty=qty, customer=customer,
+                                                  amount=it.amount, itemId=it.itemId), user_id)
         added += 1
+    db.commit()
     return {
         "addedCount": added,
         "skipped": skipped,
@@ -741,16 +1510,33 @@ def add_to_cart_batch(db: Session, data: schemas.CartBatchInput, user_id: str = 
     }
 
 
-def set_cart_qty(db: Session, cart_id: int, qty: int, user_id: str = DEFAULT_USER) -> None:
+def set_cart_qty(db: Session, cart_id: int, qty: int, user_id: str = DEFAULT_USER,
+                 amount: float | None = None) -> None:
+    """PUT /cart/{id}：改数量；可选携带合同金额（ADR-008，amount 模式行校验整数元，unit 模式忽略）。
+    删除行仅走 DELETE /cart/{id}——PUT 语义不再兼作删除（qty<=0 直接 400，
+    修复：此前 PUT 漏传 qty 会默认 0 → 静默删行，调用方极易误触发）。"""
     c = db.get(models.CartItem, cart_id)
     if not c or c.userId != user_id:
         raise HTTPException(404, "购物车项不存在")
     if qty <= 0:
-        db.delete(c)
-    else:
-        _check_stock(db, c.assetId, int(qty))
-        c.qty = int(qty)
-        c.updatedAt = now_str()
+        raise HTTPException(400, "数量必须大于 0（移除行请使用删除操作）")
+    # ADR-011：明细行 qty 恒 1（前端本就不允许改；删除走 DELETE /cart/{id}）
+    if c.itemId is not None and qty != 1:
+        raise HTTPException(400, "遥感数据明细行数量固定为 1")
+    # FIX-6b：数量上限从「本行 qty ≤ 可售」升级为「该资产在购物车全部行合计（本次修改后）≤ 可售」
+    # （与 add_to_cart / add_to_cart_batch 的行级合计口径对齐；repeatSale 资产跳过）
+    a = get_asset(db, c.assetId)
+    if a and not a.repeatSale:
+        total_after = sum(x.qty for x in _cart_list(db, user_id) if x.assetId == c.assetId) \
+            - c.qty + int(qty)
+        if total_after > _avail(a):
+            raise HTTPException(400, f"购物车中 {a.name} 合计 {total_after} 超出可售 {_avail(a)}")
+    c.qty = int(qty)
+    if amount is not None:
+        amt = _cart_amount(a, amount)
+        if amt is not None:
+            c.amount = amt
+    c.updatedAt = now_str()
     db.commit()
 
 
@@ -774,93 +1560,206 @@ def _clear_cart(db: Session, user_id: str = DEFAULT_USER) -> None:
 
 
 def _order_core(
-    db: Session, data, asset_qty: list[tuple[models.Asset, int]]
+    db: Session, data, asset_qty: list[tuple[models.Asset, int, float | None, int | None]],
+    operator: str = ""
 ) -> models.Project:
-    """通用下单：校验同一主体 + 可售库存，生成进行中销售项目并锁定库存
-    （交付由人工置"已完成"触发）。主体（subject）由资产自动带出，无需前端传入。"""
+    """通用下单（直接下单，单合同语义）：校验同一主体 + 可售库存，
+    生成进行中销售项目（单合同）并锁定库存（交付由人工触发，不自动交付）。
+    主体（subject）由资产自动带出，无需前端传入。
+    asset_qty 四元组 (资产, 数量, 前端传入 amount, itemId)：
+    - amount 模式资产以第三元为权威输入（ADR-008）；
+    - 明细行（第四元非空，ADR-011）：qty 恒 1（≠1 → 400），金额权威 = 明细 price × 1（忽略前端传值）。"""
     if not asset_qty:
         raise HTTPException(400, "没有可下单的资产")
-    subjects = {a.subject for a, _ in asset_qty}
+    subjects = {a.subject for a, _, _, _ in asset_qty}
     if len(subjects) > 1:
-        raise HTTPException(400, "下单资产必须属于同一主体，请清空购物车后重新选择")
-    subject = next(iter(subjects))
+        raise HTTPException(400, "下单资产必须属于同一主体，请拆分下单")
     items: list[schemas.ProjectItemInput] = []
-    total = 0.0
-    for a, qty in asset_qty:
-        if not a.repeatSale and qty > _avail(a):
+    total = Decimal("0")
+    for a, qty, in_amount, item_id in asset_qty:
+        rs = db.get(models.RsItem, item_id) if item_id else None
+        if rs is not None and rs.assetId != a.id:
+            raise HTTPException(400, "遥感数据明细不存在或不属于该资产")
+        if rs is not None and qty != 1:
+            raise HTTPException(400, "遥感数据明细行数量固定为 1")
+        # 库存校验：明细行按明细 repeatSale（true 不占库存）；普通行按资产 repeatSale
+        repeat = rs.repeatSale if rs is not None else a.repeatSale
+        if not repeat and qty > _avail(a):
             raise HTTPException(400, f"「{a.name}」可售库存仅 {_avail(a)}{a.unit}，无法下单 {qty}{a.unit}")
-        price = a.salePrice or 0
-        amount = round(price * qty, 4)  # 契约 5：与项目编辑路径完全一致，万元 4 位小数
+        if rs is not None:
+            # ADR-011：明细行金额权威 = 明细 price × 1（Decimal 重算，忽略前端传值，整数元天然成立）
+            price = float(_dec(rs.price))
+            amount = _dec(rs.price).quantize(CENT)
+        elif _is_amount_mode(a):
+            # ADR-008：amount 权威（整数元校验），price 派生展示值
+            amount = _validate_amount_yuan(in_amount)
+            price = _derived_price(amount, qty)
+        else:
+            # 契约 5：与项目创建路径完全一致，Decimal 精确到分（元口径，ADR-006）
+            price = a.salePrice or 0
+            amount = (_dec(price) * qty).quantize(CENT)
         total += amount
         items.append(
-            schemas.ProjectItemInput(assetId=a.id, qty=qty, price=price, amount=amount, deliveryReq=data.deliveryReq)
+            schemas.ProjectItemInput(assetId=a.id, qty=qty, price=price, amount=float(amount),
+                                     deliveryReq=data.deliveryReq, itemId=item_id)
         )
     project_input = schemas.ProjectInput(
         name=data.projectName,
         customer=data.customer,
         industry="",
         rep=data.rep,
-        subject=subject,
-        expectedAmount=round(total, 4),
+        businessOwner=data.businessOwner,  # 商务负责人（可选，默认 ""）
+        subject="",  # ADR-007：主体由合同派生，不再采信
+        expectedAmount=float(total),  # ADR-007：派生字段，_recompute_project 会重算落库
         quoteAmount=0,
         contractAmount=data.contractAmount,
         paidAmount=0,
         expectedSignDate=data.expectedSignDate or today(),
         lastFollowDate=today(),
         remark=data.remark,
+        # ADR-007：单合同语义——items 自动包装为单合同（customer 取项目 customer 字段）
         items=items,
     )
     # H8：建项目走 core（不提交），由调用方在一个事务内提交
     # WHY：销售与交付是两个独立动作——下单只锁定库存（active），交付（扣库存+出库）
-    # 由人工把项目置为"已完成"触发；分离便于纠错编辑与审计留痕各自独立。
-    project = _create_project_core(db, project_input)
+    # 由人工把合同/项目置为"已完成"触发；分离便于纠错编辑与审计留痕各自独立。
+    project = _create_project_core(db, project_input, operator=operator)
     return project
 
 
-def checkout(db: Session, data: schemas.CheckoutInput, user_id: str = DEFAULT_USER) -> models.Project:
-    """购物车下单：用购物车资产生成进行中销售项目（锁定库存），随后清空购物车；
-    交付由人工置"已完成"触发"""
+def checkout(db: Session, data: schemas.CheckoutInput, user_id: str = DEFAULT_USER,
+             operator: str = "") -> models.Project:
+    """购物车结算（ADR-007）：按行级 customer 分组 → 每客户一个合同（合同内校验同主体）
+    → 建项目（active + 锁定）→ 清空购物车。全部单事务，任一步失败整体回滚（H8）。
+    不自动交付（下单=active+锁定）。"""
     cart = _cart_list(db, user_id)
     if not cart:
         raise HTTPException(400, "购物车为空，请先添加资产")
-    asset_qty: list[tuple[models.Asset, int]] = []
+    # 按客户分组（保持购物车行序）；amount 模式行在此校验合同金额（缺失/非整数 400，ADR-008）
+    # 四元组 (资产, 数量, 权威 amount, itemId)：明细行 qty 恒 1、金额=明细 price（ADR-011）
+    groups: dict[str, list[tuple[models.Asset, int, Decimal | None, int | None]]] = {}
     for c in cart:
         a = get_asset(db, c.assetId)
         if not a:
             raise HTTPException(400, f"购物车中的资产（#{c.assetId}）已删除，请先移除后再下单")
-        asset_qty.append((a, c.qty))
-    # H8：建项目 → 交付出库 → 清空购物车 收敛为同一事务，任一步失败整体回滚
-    project = _order_core(db, data, asset_qty)
+        customer = (c.customer or "").strip()
+        if not customer:
+            raise HTTPException(400, "请为每件资产填写客户")
+        if c.itemId is not None:
+            rs = db.get(models.RsItem, c.itemId)
+            if rs is None or rs.assetId != c.assetId:
+                raise HTTPException(400, "购物车中的遥感数据明细已删除或不属于该资产，请先移除后再下单")
+            groups.setdefault(customer, []).append((a, 1, None, c.itemId))
+            continue
+        if _is_amount_mode(a):
+            amt = _validate_amount_yuan(c.amount)  # 缺失/非整数元 → 400
+        else:
+            amt = None  # unit 模式忽略行级 amount
+        groups.setdefault(customer, []).append((a, c.qty, amt, None))
+    # 每组（客户）→ 一个合同：组内校验同主体 + 计价
+    # （明细行=明细 price 权威 / amount 模式=权威金额 / unit 模式 price×qty）
+    contracts_in: list[schemas.ContractInput] = []
+    for customer, rows in groups.items():
+        subjects = {a.subject for a, _, _, _ in rows if a.subject}
+        if len(subjects) > 1:
+            raise HTTPException(400, f"客户「{customer}」的资产主体不一致，请拆分")
+        items: list[schemas.ProjectItemInput] = []
+        total = Decimal("0")
+        for a, qty, amt, item_id in rows:
+            rs = db.get(models.RsItem, item_id) if item_id else None
+            if rs is not None:
+                # ADR-011：明细行金额权威 = 明细 price × 1（整数元天然成立）
+                price = float(_dec(rs.price))
+                amount = _dec(rs.price).quantize(CENT)
+            elif amt is not None:
+                price = _derived_price(amt, qty)  # 派生展示值
+                amount = amt
+            else:
+                price = a.salePrice or 0
+                amount = (_dec(price) * qty).quantize(CENT)  # 元口径，Decimal 精确到分
+            total += amount
+            items.append(schemas.ProjectItemInput(
+                assetId=a.id, qty=qty, price=price, amount=float(amount),
+                deliveryReq=data.deliveryReq, itemId=item_id,
+            ))
+        contracts_in.append(schemas.ContractInput(
+            customer=customer, items=items, contractAmount=float(total.quantize(CENT)), remark="",
+        ))
+    project_input = schemas.ProjectInput(
+        name=data.projectName or f"销售项目-{today()}",
+        customer="",  # 多客户派生为空（前端显示「N 位客户」）；单客户由 _recompute_project 回填
+        industry="",
+        rep=data.rep,
+        businessOwner=data.businessOwner,  # 商务负责人（可选，默认 ""）
+        subject="",
+        expectedAmount=0,  # 派生 = Σ合同 contractAmount
+        quoteAmount=0,
+        contractAmount=0,
+        paidAmount=0,
+        expectedSignDate=data.expectedSignDate or today(),
+        lastFollowDate=today(),
+        remark=data.remark,
+        contracts=contracts_in,
+    )
+    # H8：建项目（含合同/明细/锁定）→ 清空购物车 收敛为同一事务
+    project = _create_project_core(db, project_input, operator=operator)
     _clear_cart(db, user_id)
     db.commit()
     db.refresh(project)
     return project
 
 
-def create_sale_order(db: Session, data: schemas.SaleOrderInput) -> models.Project:
-    """资产直接下单：单/多资产生成进行中销售项目（锁定库存，与购物车下单同一流程）；
-    交付由人工置"已完成"触发"""
-    asset_qty: list[tuple[models.Asset, int]] = []
+def create_sale_order(db: Session, data: schemas.SaleOrderInput,
+                      operator: str = "") -> models.Project:
+    """资产直接下单（单合同语义）：items 按各自资产主体校验同主体（原逻辑保留），
+    customer 必填 → 建项目 + 单合同（锁定库存，不自动交付）"""
+    asset_qty: list[tuple[models.Asset, int, float | None, int | None]] = []
     for it in data.items:
         a = get_asset(db, it.assetId)
         if not a:
             raise HTTPException(404, f"资产 #{it.assetId} 不存在")
-        asset_qty.append((a, max(1, int(it.qty or 1))))
-    # H8：建项目 + 交付出库同一事务
-    project = _order_core(db, data, asset_qty)
+        # ADR-011：明细行 qty 原样透传（_order_core 校验恒 1，≠1 → 400）
+        qty = it.qty if it.itemId is not None else max(1, int(it.qty or 1))
+        asset_qty.append((a, qty, it.amount, it.itemId))
+    # H8：建项目 + 锁定同一事务
+    project = _order_core(db, data, asset_qty, operator=operator)
     db.commit()
     db.refresh(project)
     return project
 
 
-def bootstrap(db: Session) -> dict:
-    assets = db.execute(select(models.Asset).order_by(models.Asset.id.desc())).scalars().all()
-    # 确保每个资产的交付物实例已初始化（惰性）
-    for a in assets:
-        _init_asset_deliverables(db, a)
+def add_file_meta(db: Session, stored_name: str, name: str, size: int,
+                  uploaded_by: str = "") -> None:
+    """写/更新上传文件原名映射（散列落盘名 → 原始文件名）。
+
+    上传不是资产操作，故只写 file_meta、不写 OpLog。
+    """
+    m = db.get(models.FileMeta, stored_name)
+    if m is None:
+        m = models.FileMeta(storedName=stored_name)
+        db.add(m)
+    m.name = name or stored_name
+    m.size = size
+    m.uploadedBy = uploaded_by or ""
+    m.createdAt = now_str()
     db.commit()
 
+
+def bootstrap(db: Session, user_id: str) -> dict:
+    """全量快照。cart 仅返回当前请求用户（ADR-009 按登录用户隔离）的行。"""
+    assets = db.execute(select(models.Asset).order_by(models.Asset.id.desc())).scalars().all()
+    # 确保每个资产的交付物实例已初始化（惰性）。
+    # 写副作用收敛：仅当确有资产尚未初始化时才进入写路径并提交；
+    # 稳态（全部已初始化）下 bootstrap 保持纯读，读接口不再抢 SQLite 写锁。
+    pending_assets = [a for a in assets if not a.deliverables]
+    if pending_assets:
+        for a in pending_assets:
+            _init_asset_deliverables(db, a)
+        db.commit()
+
     projects = db.execute(select(models.Project).order_by(models.Project.id.desc())).scalars().all()
+    # ADR-007：合同全量（含 items，明细挂 contractId）
+    contracts = db.execute(select(models.Contract).order_by(models.Contract.id.asc())).scalars().all()
     outbounds = db.execute(select(models.Outbound).order_by(models.Outbound.id.desc())).scalars().all()
     flows = db.execute(select(models.AssetFlow).order_by(models.AssetFlow.id.asc())).scalars().all()
     logs = db.execute(select(models.OpLog).order_by(models.OpLog.id.asc())).scalars().all()
@@ -882,11 +1781,18 @@ def bootstrap(db: Session) -> dict:
             deliv_map[str(a.id)] = [schemas.AssetDeliverableOut.model_validate(d).model_dump() for d in a.deliverables]
 
     category_units = db.execute(select(models.CategoryUnit).order_by(models.CategoryUnit.id.asc())).scalars().all()
-    cart = _cart_list(db, DEFAULT_USER)
+    # ADR-009：购物车按登录用户隔离——仅返回当前请求用户的行（不再用 DEFAULT_USER）
+    cart = _cart_list(db, user_id)
+    # 上传文件原名映射全量返回（当前量级小，无分页问题）
+    files = db.execute(select(models.FileMeta).order_by(models.FileMeta.storedName.asc())).scalars().all()
+    # ADR-011：遥感数据可售明细全量（读随 bootstrap 放行，前端 RsItemPicker/明细页签消费）
+    rs_items = db.execute(select(models.RsItem).order_by(models.RsItem.id.asc())).scalars().all()
 
     return {
         "assets": [schemas.AssetOut.model_validate(a).model_dump() for a in assets],
+        "rsItems": [schemas.RsItemOut.model_validate(r).model_dump() for r in rs_items],
         "projects": [schemas.ProjectOut.model_validate(p).model_dump() for p in projects],
+        "contracts": [schemas.ContractOut.model_validate(c).model_dump() for c in contracts],
         "outbounds": [schemas.OutboundOut.model_validate(o).model_dump() for o in outbounds],
         "suppliers": [schemas.BaseRecordOut.model_validate(x).model_dump() for x in suppliers],
         "customers": [schemas.BaseRecordOut.model_validate(x).model_dump() for x in customers],
@@ -897,4 +1803,5 @@ def bootstrap(db: Session) -> dict:
         "assetDeliverables": deliv_map,
         "categoryUnits": [schemas.CategoryUnitOut.model_validate(c).model_dump() for c in category_units],
         "cart": [schemas.CartItemOut.model_validate(c).model_dump() for c in cart],
+        "files": [schemas.FileMetaOut.model_validate(f).model_dump() for f in files],
     }

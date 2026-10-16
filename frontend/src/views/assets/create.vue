@@ -10,6 +10,10 @@
  *  - 数量单价：计量单位 / 资产总数 / 单价 / 可重复售卖
  *  - 状态与备注：状态由库存自动判定（库存可售 / 全部出售），备注 + 产品清单上传/预览
  *  资产编号自动生成，供应商/交付地点/序列号/预计金额等字段已移除
+ *  2026-10-15：功能清单附件上传已移除（后端字段保留，提交 payload 不再携带）；
+ *  产品清单附件 2026-10-15 误删后已恢复（上传/回显/预览）
+ *  2026-10-16（ADR-011）：遥感数据容器资产——提示条移至「资产类型」正下方，
+ *  隐藏「数量单价」卡，提交时兜底 quantity:1 / salePrice:0 / unit:'份（可售明细）'
  */
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
@@ -20,20 +24,20 @@ import {
   CircleCheck,
   Document,
   Goods,
+  InfoFilled,
   Upload,
 } from '@element-plus/icons-vue'
 import {
   ASSET_STOCK_STATE,
   BOARDS,
   ENTITIES,
-  assetStockState,
-  noSellableStock,
+  formatTokens,
   today,
   type AssetStatus,
   type AssetStockState,
   type Board,
 } from '@/types'
-import { createAsset, fileUrl, getAsset, refresh, updateAsset, uploadFile, type AssetInput } from '@/api'
+import { createAsset, fileDisplayName, getAsset, refresh, updateAsset, uploadFile, type AssetInput } from '@/api'
 import { canWrite, READONLY_TIP } from '@/auth'
 import FilePreview from '@/components/FilePreview.vue'
 
@@ -64,6 +68,15 @@ const form = reactive({
   remark: '',
 })
 
+/** ADR-011：是否遥感数据类型（容器资产，仅显示 info-bar 提示；三维字段组已移除） */
+const isRemote = computed(() => form.type === '遥感数据')
+
+/** ADR-008：是否包量定价——新建时卫星 Token 即 amount 模式（后端入库置 pricingMode='amount'）；编辑读存量值 */
+const isAmount = computed(() => {
+  if (isEdit.value) return getAsset(assetId.value)?.pricingMode === 'amount'
+  return form.type === '卫星Token'
+})
+
 const rules = {
   name: [{ required: true, message: '请输入资产名称', trigger: 'blur' }],
   board: [{ required: true, message: '请选择所属板块', trigger: 'change' }],
@@ -76,7 +89,7 @@ const rules = {
 
 const typeOptions: Record<Board, string[]> = {
   embodied: ['机器人', '数采设备', '平台软件'],
-  satellite: ['卫星Token', '卫星数据'],
+  satellite: ['卫星Token', '卫星数据', '遥感数据'],
   software: ['软件'],
   hardware: ['硬件集群'],
   compute: ['算力服务器'],
@@ -104,14 +117,9 @@ watch(
 const stockState = computed<AssetStockState>(() => {
   if (form.repeatSale) return 'in_stock'
   const a = isEdit.value ? getAsset(assetId.value) : null
-  return noSellableStock({
-    quantity: form.quantity,
-    lockedQty: a?.lockedQty ?? 0,
-    shippedQty: a?.shippedQty ?? 0,
-    repeatSale: false,
-  })
-    ? 'no_stock'
-    : 'in_stock'
+  // 与 noSellableStock/availableQty 同口径：quantity - lockedQty - shippedQty <= 0（repeatSale 已排除）
+  const noStock = form.quantity - (a?.lockedQty ?? 0) - (a?.shippedQty ?? 0) <= 0
+  return noStock ? 'no_stock' : 'in_stock'
 })
 
 function loadAsset() {
@@ -182,7 +190,11 @@ async function handleSubmit() {
     return
   }
   submitting.value = true
-  const payload: AssetInput = { ...form, name: form.name }
+  // ADR-011：遥感容器资产兜底——数量=明细数派生、单价在明细上，后端 AssetIn 对 quantity 有 >0 校验，
+  // 故传 quantity:1 / salePrice:0，单位与 constants.ts CATEGORY_UNITS 遥感条目一致；其余类型行为不变
+  const payload: AssetInput = isRemote.value
+    ? { ...form, name: form.name, quantity: 1, salePrice: 0, unit: '份（可售明细）' }
+    : { ...form, name: form.name }
   try {
     if (isEdit.value) {
       await updateAsset(assetId.value, payload)
@@ -250,6 +262,11 @@ onMounted(async () => {
                 <el-option v-for="t in typeOptions[form.board] || []" :key="t" :label="t" :value="t" />
               </el-select>
             </el-form-item>
+            <!-- 1.5 遥感数据容器资产提示（ADR-011：紧跟资产类型下方，三维字段组已移除，按普通父资产登记） -->
+            <div v-if="isRemote" class="info-bar">
+              <el-icon aria-hidden="true"><InfoFilled /></el-icon>
+              <span>遥感数据为容器资产，保存后请在资产详情「可售明细」页签维护 省/精度/月份 明细</span>
+            </div>
             <el-form-item label="资产名称" prop="name">
               <el-input v-model="form.name" placeholder="如：智元机器人-G1" />
             </el-form-item>
@@ -287,8 +304,8 @@ onMounted(async () => {
           </div>
         </div>
 
-        <!-- 2. 数量单价 -->
-        <div class="form-card">
+        <!-- 2. 数量单价（ADR-011：遥感容器资产隐藏——数量=明细数派生、单价在明细上，提交时兜底） -->
+        <div v-if="!isRemote" class="form-card">
           <div class="block-head">
             <span class="bh-icon" aria-hidden="true"><el-icon><Goods /></el-icon></span>
             <span class="bh-title">数量单价</span>
@@ -300,16 +317,18 @@ onMounted(async () => {
             </el-form-item>
             <el-form-item label="资产总数" prop="quantity">
               <el-input-number v-model="form.quantity" :min="0" :precision="0" :step="1" style="width: 100%;" />
+              <!-- ADR-008：Token 资产数量按 formatTokens 展示（库内仍存原始个数） -->
+              <div v-if="isAmount" class="muted" style="font-size: 12px; margin-top: 4px;">
+                {{ formatTokens(form.quantity) }} Token（按原始个数入库）
+              </div>
             </el-form-item>
-            <el-form-item label="销售单价（元）" prop="salePrice">
-              <el-input-number
-                :model-value="(form.salePrice || 0) * 10000"
-                :min="0"
-                :precision="0"
-                style="width: 100%;"
-                @update:model-value="(v) => { form.salePrice = (v || 0) / 10000 }"
-              />
+            <el-form-item :label="isAmount ? '参考单价（元/万Token）' : '销售单价（元）'" prop="salePrice">
+              <el-input-number v-model="form.salePrice" :min="0" :precision="2" style="width: 100%;" />
             </el-form-item>
+            <!-- ADR-008：包量定价说明（浅蓝提示条） -->
+            <div v-if="isAmount" class="info-bar soft">
+              Token 资产按包量售卖，下单时以合同金额（整数元）为准，参考单价不参与计价
+            </div>
             <el-form-item label="可重复售卖">
               <el-switch v-model="form.repeatSale" />
               <span class="muted" style="font-size: 12px; margin-left: 8px;">数据类资产建议开启，销售不扣减库存</span>
@@ -329,7 +348,7 @@ onMounted(async () => {
               <el-tag :type="ASSET_STOCK_STATE[stockState].tag" size="large" round>
                 {{ ASSET_STOCK_STATE[stockState].label }}
               </el-tag>
-              <span class="muted status-tip">状态由库存自动判定，无需手动修改</span>
+              <span class="status-tip muted">状态由库存自动判定，无需手动修改</span>
             </div>
           </el-form-item>
           <el-form-item label="备注" prop="remark">
@@ -356,7 +375,8 @@ onMounted(async () => {
               </template>
               <template v-else>
                 <el-icon class="cu-ic"><Document /></el-icon>
-                <span class="cu-name">产品清单（{{ contractTypeLabel(form.contractFile) }}）</span>
+                <span class="cu-name">{{ fileDisplayName(form.contractFile) }}</span>
+                <span class="cu-sub">产品清单 · {{ contractTypeLabel(form.contractFile) }}</span>
                 <el-button link type="primary" size="small" @click="previewContract">预览</el-button>
                 <el-button link type="primary" size="small" :loading="uploading" :disabled="!canWrite" @click="pickContract">替换</el-button>
                 <el-button link type="danger" size="small" :disabled="!canWrite" @click="removeContract">移除</el-button>
@@ -383,7 +403,6 @@ onMounted(async () => {
         <FilePreview
           v-if="previewVisible && form.contractFile"
           :filename="form.contractFile"
-          :title="`产品清单（${contractTypeLabel(form.contractFile)}）`"
         />
       </el-dialog>
 
@@ -417,6 +436,11 @@ onMounted(async () => {
   gap: 0;
 }
 
+/* 遥感提示条（ADR-011：位于基本信息 grid 内、资产类型正下方），下边距与表单行距一致 */
+.form-grid .info-bar {
+  margin-bottom: 18px;
+}
+
 /* 可重复售卖警示行：紧跟开关下方，muted 12px */
 .repeat-sale-hint {
   font-size: 12px;
@@ -424,14 +448,16 @@ onMounted(async () => {
   margin: -10px 0 18px;
 }
 
-/* ===== 资产状态行 ===== */
+/* ===== 资产状态行：tag 在上，muted 12px 提示置于其正下方，左缘与 tag 对齐 ===== */
 .status-line {
   display: flex;
-  align-items: center;
-  gap: 10px;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
 }
 .status-line .status-tip {
   font-size: 12px;
+  line-height: 18px;
 }
 
 /* ===== 产品清单 ===== */
@@ -449,5 +475,14 @@ onMounted(async () => {
   font-size: 13px;
   font-weight: 500;
   color: var(--text-primary);
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.contract-up .cu-sub {
+  font-size: 12px;
+  color: #9aa9bf;
+  flex-shrink: 0;
 }
 </style>

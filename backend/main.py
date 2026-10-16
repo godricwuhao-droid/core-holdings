@@ -31,12 +31,140 @@ def _ensure_migration() -> None:
         with engine.begin() as conn:
             conn.execute(text("ALTER TABLE logs ADD COLUMN assetId INTEGER"))
         print("[migration] logs.assetId 列已补充")
+    # 资产功能清单附件（替换 saleDetail 电子表格的 UI 载体；saleDetail 列保留不删）；幂等补列
+    if "featureDoc" not in cols:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE assets ADD COLUMN featureDoc VARCHAR(255) DEFAULT ''"))
+        print("[migration] assets.featureDoc 列已补充")
+    # 项目签约主体（后端权威推导）；幂等补列（现有库已有该列时为 no-op）
+    proj_cols = [c["name"] for c in insp.get_columns("projects")]
+    if "subject" not in proj_cols:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE projects ADD COLUMN subject VARCHAR(128) DEFAULT ''"))
+        print("[migration] projects.subject 列已补充")
+    # 项目商务负责人（可选，默认空，前端显示 "-"）；幂等补列
+    if "businessOwner" not in proj_cols:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE projects ADD COLUMN businessOwner VARCHAR(64) DEFAULT ''"))
+        print("[migration] projects.businessOwner 列已补充")
+    # 流水操作账号（存量流水保持空，前端显示 "-"）；幂等补列
+    flow_cols = [c["name"] for c in insp.get_columns("flows")]
+    if "operator" not in flow_cols:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE flows ADD COLUMN operator VARCHAR(64) DEFAULT ''"))
+        print("[migration] flows.operator 列已补充")
+    # 操作日志字段级变更描述（仅 update_asset 有实际变更时写入）；幂等补列
+    if "changes" not in log_cols:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE logs ADD COLUMN changes VARCHAR(512) DEFAULT ''"))
+        print("[migration] logs.changes 列已补充")
     # 项目明细「下单时刻是否真实加锁」标记（repeatSale 资产下单不加锁）；存量数据视为 False
     item_cols = [c["name"] for c in insp.get_columns("project_items")]
     if "locked" not in item_cols:
         with engine.begin() as conn:
             conn.execute(text("ALTER TABLE project_items ADD COLUMN locked BOOLEAN DEFAULT 0"))
         print("[migration] project_items.locked 列已补充")
+    # ADR-007 合同层级（幂等补列 + 补索引）：
+    # 1) project_items.contractId：明细挂合同（新数据必填；存量项为 NULL，清理脚本执行后消失）
+    if "contractId" not in item_cols:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE project_items ADD COLUMN contractId INTEGER"))
+            conn.execute(text("CREATE INDEX ix_project_items_contractId ON project_items (contractId)"))
+        print("[migration] project_items.contractId 列已补充")
+    # 2) outbounds.contractId：出库记录精确关联合同（projectId 保留）
+    ob_cols = [c["name"] for c in insp.get_columns("outbounds")]
+    if "contractId" not in ob_cols:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE outbounds ADD COLUMN contractId INTEGER"))
+            conn.execute(text("CREATE INDEX ix_outbounds_contractId ON outbounds (contractId)"))
+        print("[migration] outbounds.contractId 列已补充")
+    # 3) flows.contractId：合同级交付/终止产生的流水关联合同
+    if "contractId" not in flow_cols:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE flows ADD COLUMN contractId INTEGER"))
+            conn.execute(text("CREATE INDEX ix_flows_contractId ON flows (contractId)"))
+        print("[migration] flows.contractId 列已补充")
+    # 4) logs.contractId：合同级状态变更日志关联合同
+    if "contractId" not in log_cols:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE logs ADD COLUMN contractId INTEGER"))
+        print("[migration] logs.contractId 列已补充")
+    # 5) cart_items.customer：购物车行级客户（跨主体加购 + 按客户分组结算）
+    cart_cols = [c["name"] for c in insp.get_columns("cart_items")]
+    if "customer" not in cart_cols:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE cart_items ADD COLUMN customer VARCHAR(128) DEFAULT ''"))
+        print("[migration] cart_items.customer 列已补充")
+    # 6) ADR-008 包量定价：assets.pricingMode（'unit' 默认 / 'amount' 包量金额权威）；幂等补列
+    if "pricingMode" not in cols:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE assets ADD COLUMN pricingMode VARCHAR(16) NOT NULL DEFAULT 'unit'"))
+        print("[migration] assets.pricingMode 列已补充")
+    # 7) ADR-008：cart_items.amount 包量计价合同金额（元，整数；unit 模式恒 NULL）；幂等补列
+    if "amount" not in cart_cols:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE cart_items ADD COLUMN amount FLOAT"))
+        print("[migration] cart_items.amount 列已补充")
+    # 8) ADR-010 遥感数据：assets 省/市/精度/影像日期 4 个可空维度列；幂等补列
+    #（⚠️ ADR-011 起已废弃：列保留不删，服务层不再读写；遥感售卖粒度改由 rs_items 承载）
+    if "province" not in cols:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE assets ADD COLUMN province VARCHAR(64) DEFAULT ''"))
+            conn.execute(text("ALTER TABLE assets ADD COLUMN city VARCHAR(64) DEFAULT ''"))
+            conn.execute(text("ALTER TABLE assets ADD COLUMN resolution FLOAT"))
+            conn.execute(text("ALTER TABLE assets ADD COLUMN imageDate VARCHAR(10) DEFAULT ''"))
+        print("[migration] assets 遥感数据 4 列（province/city/resolution/imageDate）已补充")
+    # 11) ADR-011 遥感数据两层模型：cart_items.itemId / project_items.itemId（挂 rs_items 明细）；幂等补列
+    if "itemId" not in cart_cols:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE cart_items ADD COLUMN itemId INTEGER"))
+            conn.execute(text("CREATE INDEX ix_cart_items_itemId ON cart_items (itemId)"))
+        print("[migration] cart_items.itemId 列已补充")
+    if "itemId" not in item_cols:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE project_items ADD COLUMN itemId INTEGER"))
+            conn.execute(text("CREATE INDEX ix_project_items_itemId ON project_items (itemId)"))
+        print("[migration] project_items.itemId 列已补充")
+    # 12) ADR-011 数据清理（幂等一次性）：删除 ADR-010 演示遥感数据资产
+    #（type='遥感数据' 且带三维字段值的存量行；ADR-011 新建的父资产容器 4 列恒空，不会被误删）。
+    # 删前 assert 无合同/购物车/项目明细引用（当前库应无；有引用则启动失败暴露问题，
+    # 与 delete_asset 的 400 逻辑等价，迁移场景直接 assert）。
+    with engine.begin() as conn:
+        demo = conn.execute(text(
+            "SELECT id, name FROM assets WHERE type='遥感数据' "
+            "AND (province <> '' OR city <> '' OR imageDate <> '' OR resolution IS NOT NULL)"
+        )).fetchall()
+        for aid, aname in demo:
+            refs = conn.execute(text(
+                "SELECT COUNT(*) FROM project_items WHERE assetId=:aid OR itemId IN "
+                "(SELECT id FROM rs_items WHERE assetId=:aid)"
+            ), {"aid": aid}).scalar() + conn.execute(
+                text("SELECT COUNT(*) FROM cart_items WHERE assetId=:aid"), {"aid": aid}
+            ).scalar()
+            assert refs == 0, f"ADR-011 迁移：演示资产 {aname}(id={aid}) 存在 {refs} 条销售/购物车引用，禁止自动删除"
+            conn.execute(text("DELETE FROM rs_items WHERE assetId=:aid"), {"aid": aid})
+            conn.execute(text("DELETE FROM asset_deliverables WHERE asset_id=:aid"), {"aid": aid})
+            conn.execute(text("DELETE FROM flows WHERE assetId=:aid"), {"aid": aid})
+            conn.execute(text("DELETE FROM assets WHERE id=:aid"), {"aid": aid})
+            print(f"[migration] ADR-011 已删除演示遥感数据资产 {aname} (id={aid})")
+    # 9) ADR-008 存量回填：卫星 Token 资产 pricingMode → 'amount'（幂等，salePrice 原值保留为参考值）
+    with engine.begin() as conn:
+        r = conn.execute(text(
+            "UPDATE assets SET pricingMode='amount' WHERE type='卫星Token' AND pricingMode='unit'"
+        ))
+        if r.rowcount:
+            print(f"[migration] 卫星Token 资产 pricingMode 回填 {r.rowcount} 条 → amount")
+    # 10) ADR-009 购物车按登录用户隔离：存量 userId='admin' 行回填为 admin 账号的 users.id
+    #（隔离后 admin 仍可见自己的存量行；幂等——第二次启动无 userId='admin' 行，命中 0 条）
+    with engine.begin() as conn:
+        admin_id = conn.execute(text("SELECT id FROM users WHERE username='admin' LIMIT 1")).scalar()
+        if admin_id is not None:
+            r = conn.execute(
+                text("UPDATE cart_items SET userId=:uid WHERE userId='admin'"),
+                {"uid": str(admin_id)},
+            )
+            if r.rowcount:
+                print(f"[migration] 购物车存量行 userId='admin' 回填 {r.rowcount} 条 → {admin_id}")
     # 销售项目状态：存量旧 8 态 → 3 态（进行中 active / 已完成 delivered / 已终止 terminated）
     with engine.begin() as conn:
         r = conn.execute(text(
@@ -68,7 +196,94 @@ def _ensure_migration() -> None:
         db.close()
 
 
+def _ensure_unique_indexes() -> None:
+    """轻量迁移：为存量表补唯一约束（create_all 不会修改已存在的表）。
+
+    - rs_items：(assetId, province, city, resolution, saleMonth) 维度唯一（ADR-011 判重 DB 兜底）；
+    - cart_items：(userId, assetId, COALESCE(itemId, 0), customer) 判重键唯一
+      （SQLite 唯一索引不认 NULL 相等，itemId 用 COALESCE 归一——0 为不可能的主键值，与 NULL 互不冲突）。
+    幂等：CREATE UNIQUE INDEX IF NOT EXISTS；若存量数据已含重复行则建索引失败，
+    打印告警并跳过（服务层 Python 判重仍为主防线，不阻断启动）。
+    """
+    from sqlalchemy import text
+    from sqlalchemy.exc import IntegrityError
+
+    indexes = [
+        ("uq_rs_items_dim",
+         "CREATE UNIQUE INDEX IF NOT EXISTS uq_rs_items_dim "
+         "ON rs_items (assetId, province, city, resolution, saleMonth)"),
+        ("uq_cart_items_key",
+         "CREATE UNIQUE INDEX IF NOT EXISTS uq_cart_items_key "
+         "ON cart_items (userId, assetId, COALESCE(itemId, 0), customer)"),
+    ]
+    for name, ddl in indexes:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(ddl))
+        except IntegrityError:
+            print(f"[migration] 跳过唯一索引 {name}：存量数据存在重复行（服务层判重仍生效）")
+
+
+def _backfill_file_meta() -> None:
+    """存量 uploads 文件回填 file_meta（幂等：file_meta 为空才执行）。
+
+    纯数据库操作，**不移动/重命名/删除 uploads 里任何文件**。
+    对每个无 file_meta 记录的文件：散列名文件若存在内容相同的非散列文件，
+    以其为原始名；否则 name=文件名本身。
+    """
+    import hashlib
+    import os
+
+    from sqlalchemy import text
+    from src.routers.api import UPLOAD_DIR
+
+    db = SessionLocal()
+    try:
+        cnt = db.execute(text("SELECT COUNT(*) FROM file_meta")).scalar()
+        if cnt:
+            return  # 已有记录则跳过（幂等）
+        if not os.path.isdir(UPLOAD_DIR):
+            return
+
+        def _is_hashed(fn: str) -> bool:
+            """散列名判定：主名（去扩展名）为纯小写十六进制（uuid4().hex 为 32 位，放宽到 ≥4 以兼容短散列）。"""
+            stem = fn.rsplit(".", 1)[0]
+            return len(stem) >= 4 and all(c in "0123456789abcdef" for c in stem)
+
+        # 预扫描：文件名 → (内容 md5, 大小)
+        entries = []
+        for fn in sorted(os.listdir(UPLOAD_DIR)):
+            fp = os.path.join(UPLOAD_DIR, fn)
+            if not os.path.isfile(fp):
+                continue
+            with open(fp, "rb") as fh:
+                digest = hashlib.md5(fh.read()).hexdigest()
+            entries.append((fn, digest, os.path.getsize(fp)))
+
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        added = 0
+        for fn, digest, size in entries:
+            name = fn
+            # 找内容相同的非散列（可读原始名）文件作为原始名；无则用自身名
+            for other, other_digest, _ in entries:
+                if other != fn and other_digest == digest and not _is_hashed(other):
+                    name = other
+                    break
+            db.execute(
+                text("INSERT OR IGNORE INTO file_meta (storedName, name, size, uploadedBy, createdAt) "
+                     "VALUES (:s, :n, :sz, :u, :c)"),
+                {"s": fn, "n": name, "sz": size, "u": "", "c": now},
+            )
+            added += 1
+        db.commit()
+        print(f"[migration] file_meta 存量回填 {added} 条")
+    finally:
+        db.close()
+
+
 _ensure_migration()
+_ensure_unique_indexes()
+_backfill_file_meta()
 
 app = FastAPI(title="Core Holdings API", version="1.0.0")
 
@@ -103,7 +318,7 @@ def seed_if_empty() -> None:
             db.add(AssetFlow(
                 assetId=asset.id, type="purchase_in", qty=raw["quantity"],
                 unit=raw["unit"], amount=0, date=raw["inboundDate"],
-                ref="-", note="历史入库（初始化）",
+                ref="-", note="历史入库（初始化）", operator="system",
             ))
             db.add(OpLog(
                 target="asset", targetName=raw["name"], action="入库",

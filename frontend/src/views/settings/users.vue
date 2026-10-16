@@ -24,9 +24,9 @@ import { currentUser, type Role } from '@/auth'
 // 角色 / 操作类型 中文映射
 // ============================================================
 const ROLE_OPTIONS: { value: Role; label: string }[] = [
-  { value: 'admin', label: '管理' },
-  { value: 'editor', label: '可编辑' },
-  { value: 'viewer', label: '只读' },
+  { value: 'admin', label: '管理员' },
+  { value: 'editor', label: '商务人员' },
+  { value: 'viewer', label: '生态人员' },
 ]
 
 function roleLabel(role: string): string {
@@ -237,7 +237,7 @@ onMounted(() => {
       <div>
         <div class="crumb">基础设置 / 账号与审计</div>
         <h1>账号与审计</h1>
-        <div class="desc">管理平台账号（角色：管理 / 可编辑 / 只读），并查询全部业务写操作与登录认证审计记录。</div>
+        <div class="desc">管理平台账号（角色：管理员 / 商务人员 / 生态人员），并查询全部业务写操作与登录认证审计记录。</div>
       </div>
       <div class="head-actions">
         <el-button type="primary" :icon="Plus" @click="openCreate">新增账号</el-button>
@@ -276,7 +276,7 @@ onMounted(() => {
     <div class="info-bar">
       <el-icon aria-hidden="true"><InfoFilled /></el-icon>
       <span>
-        管理：全部权限（含账号与审计）；可编辑：业务写操作（资产 / 销售 / 出库 / 基础资料）；只读：仅查看，全部写入口禁用。
+        管理员：全部权限（含账号与审计）；商务人员：业务写操作（资产 / 销售 / 出库 / 基础资料）；生态人员：仅资产管理浏览与购物车（加购 / 改数量 / 改客户 / 删行 / 结算 / 直接下单），资产编辑类操作禁用。
       </span>
     </div>
 
@@ -407,10 +407,10 @@ onMounted(() => {
     <el-dialog
       v-model="dialog.visible"
       :title="dialog.editing ? `编辑账号 · ${dialog.editing.username}` : '新增账号'"
-      width="520px"
+      class="dlg-form"
       :close-on-click-modal="false"
     >
-      <el-form label-width="90px">
+      <el-form label-width="96px">
         <el-form-item v-if="!dialog.editing" label="用户名" required>
           <el-input v-model="dialog.form.username" placeholder="登录用户名（唯一）" />
         </el-form-item>
