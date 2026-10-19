@@ -2,9 +2,9 @@
 /**
  * 销售管理 - 销售项目详情（ADR-007 合同清单）
  *
- * 从「销售项目列表」行点击 / 「资产详情-关联销售项目」进入。
+ * 从「销售项目列表」行点击 / 「产品详情-关联销售项目」进入。
  * 只读展示项目信息 + 「合同清单」区块（每份合同一张卡片，明细并入卡片展示）；
- * 合同级操作：交付 / 终止（PATCH /contracts/{id}/status，库存联动最小单位）；
+ * 合同级操作：交付 / 终止（PATCH /contracts/{id}/status，数量联动最小单位）；
  * 项目状态由合同状态自动派生，本页不提供项目级状态变更入口。
  * 「编辑」跳转编辑页（仅基本信息）。
  */
@@ -24,8 +24,58 @@ import {
   tagInfo,
   type Contract,
 } from '@/types'
-import { changeContractStatus, db, getAsset, refresh } from '@/api'
-import { canWrite, READONLY_TIP } from '@/auth'
+import { allUserOptions, changeContractStatus, claimProject, db, getAsset, refresh, type UserOption } from '@/api'
+import TransferDialog from '@/components/TransferDialog.vue'
+import { canWrite, isViewer, isAdmin, currentUser, READONLY_TIP } from '@/auth'
+
+// 生态人员（viewer）：数据已按「自己下单」在后端过滤，能进入本页即自己项目——
+// 允许编辑基本信息 + 终止合同（含撤销 delivered 交付）；交付仍仅商务/管理员。
+// 越权 URL 访问他人项目时 bootstrap 无该项目 → 上方 el-empty「未找到该销售项目」
+const canOwn = computed(() => canWrite.value || isViewer.value)
+
+/** 人员展示：账号/姓名 → 姓名（2026-10-20：只显示姓名不带账号；存量自由文本原样）
+ *  显示映射用全量名册（含生态）——原商务专属列表查不到生态 rep → 裸账号外露 */
+const ownerOptions = ref<UserOption[]>([])
+allUserOptions().then((u) => { ownerOptions.value = u }).catch(() => {})
+function userName(v?: string): string {
+  if (!v) return ''
+  const u = ownerOptions.value.find((x) => x.username === v) || ownerOptions.value.find((x) => x.name === v)
+  return u?.name || v
+}
+/** ADR-012 §5.1：「审核订单」入口仅对接手人（或 admin 越过）展示；未接手/他人接手 → 隐藏（后端守卫兜底） */
+const canReview = computed(() => canWrite.value && !!project.value?.businessOwner
+  && (isAdmin.value || project.value!.businessOwner === currentUser.value?.username))
+
+/** ADR-012 §5.1 纯移交制：详情页无主单「接手」（转交走 TransferDialog 下拉选人） */
+async function handleClaim() {
+  const p = project.value
+  if (!p || p.businessOwner) return
+  try {
+    await ElMessageBox.confirm(
+      `确认接手「${p.name}」？接手后你将负责该订单的定价审核（确认下单/驳回）。`,
+      '接手订单',
+      { type: 'warning', confirmButtonText: '确认接手', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  try {
+    await claimProject(p.id)
+    await refresh()
+    ElMessage.success('接手成功，现在可以审核该订单了')
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : '操作失败')
+  }
+}
+
+const transferVisible = ref(false)
+const transferTarget = ref<{ id: number; name: string; businessOwner?: string } | null>(null)
+function openTransfer() {
+  const p = project.value
+  if (!p) return
+  transferTarget.value = p
+  transferVisible.value = true
+}
 
 const route = useRoute()
 const router = useRouter()
@@ -58,26 +108,31 @@ function goBack() {
 }
 
 function goEdit() {
-  if (project.value) router.push(`/sales/projects/${project.value.id}/edit`)
+  const p = project.value
+  if (!p) return
+  // 2026-10-19：订单审核独立页——商务/管理员的 pending 单 → /review（仅订单审核+备注）；
+  // viewer 自己单始终 → /edit（可改基本信息 + 取消订单）；其余状态 → /edit
+  const toReview = !isViewer.value && p.status === 'pending'
+  router.push(`/sales/projects/${p.id}/${toReview ? 'review' : 'edit'}`)
 }
 
-/** 明细关联资产：名称（编号），可点击跳资产详情 */
+/** 明细关联产品：名称（编号），可点击跳产品详情 */
 function itemAssetName(assetId: number | null): string {
   const a = assetId ? getAsset(assetId) : undefined
-  return a ? `${a.name}（${a.code}）` : '未关联资产'
+  return a ? `${a.name}（${a.code}）` : '未关联产品'
 }
 
 function goAssetDetail(assetId: number | null) {
   if (assetId) router.push(`/assets/${assetId}/detail`)
 }
 
-/** ADR-008：明细行资产是否包量定价（单价列改派生参考展示，带「约」） */
+/** ADR-008：明细行产品是否包量定价（单价列改派生参考展示，带「约」） */
 function isAmountItem(assetId: number | null): boolean {
   const a = assetId ? getAsset(assetId) : undefined
   return !!a && isAmountMode(a)
 }
 
-/** ADR-008：明细数量展示——包量定价（Token）资产用 formatTokens，其余原数 */
+/** ADR-008：明细数量展示——包量定价（Token）产品用 formatTokens，其余原数 */
 function itemQtyText(assetId: number | null, qty: number): string {
   return isAmountItem(assetId) ? formatTokens(qty) : String(qty)
 }
@@ -90,16 +145,16 @@ function itemRsName(itemId: number | null | undefined): string {
 }
 
 // ============================================================
-// 合同状态操作（ADR-007：交付 / 终止，库存联动最小单位）
+// 合同状态操作（ADR-007：交付 / 终止，数量联动最小单位）
 // ============================================================
 const actingContractId = ref<number | null>(null)
 
-/** 交付（active → delivered）：扣减库存并生成出库记录 */
+/** 交付（active → delivered）：扣减数量并生成交付记录 */
 async function deliverContract(c: Contract) {
   try {
     await ElMessageBox.confirm(
-      `确认交付合同 ${c.code}？将扣减库存并生成出库记录。`,
-      '交付合同确认',
+      `确认交付 ${c.code}？将扣减数量并生成交付记录。`,
+      '交付确认',
       { type: 'warning', confirmButtonText: '确认交付', cancelButtonText: '取消' },
     )
   } catch {
@@ -108,14 +163,14 @@ async function deliverContract(c: Contract) {
   await changeContract(c, 'delivered')
 }
 
-/** 终止（active → terminated 释放锁定；delivered → terminated 撤销出库并回退） */
+/** 终止（active → terminated 释放锁定；delivered → terminated 撤销交付并回退） */
 async function terminateContract(c: Contract) {
   const msg =
     c.status === 'delivered'
-      ? '已交付合同终止将撤销出库并回退售出数量与金额，确认终止？'
-      : '确认终止？将释放该合同锁定库存。'
+      ? '已交付终止将撤销交付并回退售出数量与金额，确认终止？'
+      : '确认终止？将释放该销售记录锁定数量。'
   try {
-    await ElMessageBox.confirm(msg, '终止合同确认', {
+    await ElMessageBox.confirm(msg, '终止销售记录确认', {
       type: 'warning',
       confirmButtonText: '确认终止',
       cancelButtonText: '取消',
@@ -132,11 +187,11 @@ async function changeContract(c: Contract, status: 'delivered' | 'terminated') {
     await changeContractStatus(c.id, status)
     ElMessage.success(
       status === 'delivered'
-        ? `合同 ${c.code} 已交付，资产库存与出库记录已自动更新`
-        : `合同 ${c.code} 已终止`,
+        ? `销售记录 ${c.code} 已交付，产品数量与交付记录已自动更新`
+        : `销售记录 ${c.code} 已终止`,
     )
   } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : '合同状态变更失败')
+    ElMessage.error(e instanceof Error ? e.message : '销售记录状态变更失败')
   } finally {
     actingContractId.value = null
   }
@@ -166,25 +221,56 @@ async function changeContract(c: Contract, status: 'delivered' | 'terminated') {
           </div>
           <div class="desc" v-if="project">
             编号 {{ project.code }} · 客户 {{ customerText }}
-            <template v-if="contracts.length"> · {{ contracts.length }} 份合同</template>
+            <template v-if="contracts.length"> · {{ contracts.length }} 份销售记录</template>
           </div>
         </div>
         <div class="head-actions" v-if="project">
           <el-tooltip
-            :content="!canWrite ? READONLY_TIP : project.status === 'active' ? '' : '已完成 / 已终止项目不可编辑'"
-            :disabled="canWrite && project.status === 'active'"
+            :content="project.status === 'active' || project.status === 'pending' ? '' : '已完成 / 已终止项目不可编辑'"
+            :disabled="project.status === 'active' || project.status === 'pending'"
             placement="top"
           >
             <span>
+              <!-- ADR-012 §5.1 纯移交制：无主→「接手」；有主→仅负责人「转交」（下拉选人）或 admin 越过；
+                   他人负责的单据对普通商务不显示（审核订单按钮仅接手人可见） -->
               <el-button
-                v-if="project.status === 'active'"
+                v-if="canWrite && (project.status === 'pending' || project.status === 'active')
+                     && (!project.businessOwner
+                         || project.businessOwner === currentUser?.username
+                         || isAdmin)"
+                :type="project.businessOwner ? 'info' : 'success'"
+                @click="project.businessOwner ? openTransfer() : handleClaim()"
+              >
+                {{ project.businessOwner ? '转交' : '接手' }}
+              </el-button>
+              <!-- ADR-012 §5.1：pending 项目仅负责人/admin 可审核；2026-10-19：viewer 自己单可进编辑页
+                   （可改基本信息 + 取消订单），商务/管理员进独立审核页；无权限者显示禁用（禁止态）按钮 -->
+              <el-button
+                v-if="project.status === 'active' || (project.status === 'pending' && (canReview || isViewer))"
                 :icon="EditPen"
-                :disabled="!canWrite"
+                :type="project.status === 'pending' && !isViewer ? 'warning' : 'primary'"
+                :disabled="!canOwn"
                 @click="goEdit"
               >
-                编辑
+                {{ project.status === 'pending' && !isViewer ? '审核订单' : '编辑' }}
               </el-button>
-              <el-button v-else :icon="EditPen" disabled>编辑</el-button>
+              <el-tooltip v-else-if="project.status !== 'pending'" content="含已交付或已终止的项目不可编辑" placement="top">
+                <el-button :icon="EditPen" disabled>编辑</el-button>
+              </el-tooltip>
+              <!-- 2026-10-20：重新提交——已终止（驳回/取消）项目由下单账号（或商务/管理员）
+                   预填原单明细（可改）重新下单，旧单保留终止历史（驳回原因可查） -->
+              <el-button
+                v-if="project.status === 'terminated' && (canWrite || isViewer)"
+                type="warning"
+                plain
+                @click="router.push(`/sales/projects/create?copy=${project.id}`)"
+              >
+                重新提交
+              </el-button>
+              <!-- 2026-10-19 排查修复：viewer 不能接手（claim 需 editor），换用不误导的文案 -->
+              <el-tooltip v-else :content="'待审核项目仅商务负责人（或管理员）可进入，请先接手'" placement="top">
+                <el-button :icon="EditPen" type="warning" disabled>审核订单</el-button>
+              </el-tooltip>
             </span>
           </el-tooltip>
         </div>
@@ -219,23 +305,19 @@ async function changeContract(c: Contract, status: 'delivered' | 'terminated') {
             </div>
             <div class="info-item">
               <span class="il">生态人员</span>
-              <span class="iv">{{ project.rep || '-' }}</span>
+              <span class="iv">{{ userName(project.rep) || '-' }}</span>
             </div>
             <div class="info-item">
               <span class="il">商务负责人</span>
-              <span class="iv">{{ project.businessOwner || '-' }}</span>
+              <span class="iv">{{ userName(project.businessOwner) || '-' }}</span>
             </div>
             <div class="info-item">
               <span class="il">预计销售</span>
               <span class="iv">{{ project.expectedAmount ? formatMoney(project.expectedAmount) : '-' }}</span>
             </div>
             <div class="info-item">
-              <span class="il">合同金额</span>
+              <span class="il">销售金额</span>
               <span class="iv">{{ project.contractAmount ? formatMoney(project.contractAmount) : '-' }}</span>
-            </div>
-            <div class="info-item">
-              <span class="il">已回款</span>
-              <span class="iv">{{ project.paidAmount ? formatMoney(project.paidAmount) : '-' }}</span>
             </div>
             <div class="info-item">
               <span class="il">预计签约</span>
@@ -252,14 +334,14 @@ async function changeContract(c: Contract, status: 'delivered' | 'terminated') {
           </div>
         </div>
 
-        <!-- ② 合同清单（ADR-007：库存联动最小单位；项目状态由合同状态自动派生） -->
+        <!-- ② 销售记录清单（ADR-007：数量联动最小单位；项目状态由销售记录状态自动派生） -->
         <div class="form-card">
           <div class="block-head">
             <span class="bh-icon" aria-hidden="true"><el-icon><Tickets /></el-icon></span>
             <div>
-              <div class="bh-title">合同清单</div>
+              <div class="bh-title">销售记录清单</div>
               <div class="bh-sub">
-                共 {{ contracts.length }} 份合同；项目状态由合同状态自动派生（有进行中→进行中；全部完成→已完成；全部终止→已终止）。
+                共 {{ contracts.length }} 份销售记录；项目状态由销售记录状态自动派生（待审核→待审核；有进行中→进行中；全部完成→已完成；全部终止→已终止）。
               </div>
             </div>
           </div>
@@ -278,8 +360,22 @@ async function changeContract(c: Contract, status: 'delivered' | 'terminated') {
                   </el-tag>
                 </div>
                 <div class="op-actions">
-                  <template v-if="c.status === 'active'">
-                    <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="top">
+                  <!-- ADR-012：待审核销售记录无 交付/终止 快捷（后端对 pending 一律 400），唯一出口是编辑页审核面板 -->
+                  <template v-if="c.status === 'pending'">
+                    <!-- ADR-012 §5.1：仅接手人（或 admin）可见；未接手/他人接手 → 提示等待 -->
+                    <el-button
+                      v-if="canReview"
+                      type="warning"
+                      size="small"
+                      @click="goEdit"
+                    >
+                      审核订单
+                    </el-button>
+                    <span v-else class="muted contract-ended">待审核（等商务确认）</span>
+                  </template>
+                  <template v-else-if="c.status === 'active'">
+                    <!-- 交付仅商务/管理员（后端同样拦截 viewer） -->
+                    <el-tooltip :content="!canWrite ? '交付需商务人员/管理员操作' : ''" :disabled="canWrite" placement="top">
                       <span>
                         <el-button
                           type="primary"
@@ -292,14 +388,15 @@ async function changeContract(c: Contract, status: 'delivered' | 'terminated') {
                         </el-button>
                       </span>
                     </el-tooltip>
-                    <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="top">
+                    <!-- 终止：自己项目可操作（含生态人员，后端校验归属） -->
+                    <el-tooltip :content="READONLY_TIP" :disabled="canOwn" placement="top">
                       <span>
                         <el-button
                           type="danger"
                           plain
                           size="small"
                           :loading="actingContractId === c.id"
-                          :disabled="!canWrite"
+                          :disabled="!canOwn"
                           @click="terminateContract(c)"
                         >
                           终止
@@ -307,14 +404,14 @@ async function changeContract(c: Contract, status: 'delivered' | 'terminated') {
                       </span>
                     </el-tooltip>
                   </template>
-                  <el-tooltip v-else-if="c.status === 'delivered'" :content="READONLY_TIP" :disabled="canWrite" placement="top">
+                  <el-tooltip v-else-if="c.status === 'delivered'" :content="READONLY_TIP" :disabled="canOwn" placement="top">
                     <span>
                       <el-button
                         type="danger"
                         plain
                         size="small"
                         :loading="actingContractId === c.id"
-                        :disabled="!canWrite"
+                        :disabled="!canOwn"
                         @click="terminateContract(c)"
                       >
                         终止
@@ -327,7 +424,7 @@ async function changeContract(c: Contract, status: 'delivered' | 'terminated') {
 
               <div class="contract-info">
                 <span class="ci-item">
-                  <span class="muted">合同金额</span>
+                  <span class="muted">销售金额</span>
                   <b class="ci-amount">{{ formatMoney(c.contractAmount) }}</b>
                 </span>
                 <span class="ci-item" v-if="c.items.some((it) => it.lockedDate)">
@@ -345,7 +442,7 @@ async function changeContract(c: Contract, status: 'delivered' | 'terminated') {
               </div>
 
               <el-table v-if="c.items.length" :data="c.items" border size="small" class="contract-items">
-                <el-table-column label="资产" min-width="220">
+                <el-table-column label="产品" min-width="220">
                   <template #default="{ row }">
                     <a class="link" @click="goAssetDetail(row.assetId)">{{ itemAssetName(row.assetId) }}</a>
                   </template>
@@ -360,7 +457,7 @@ async function changeContract(c: Contract, status: 'delivered' | 'terminated') {
                   <template #default="{ row }">{{ itemQtyText(row.assetId, row.qty) }} {{ row.unit }}</template>
                 </el-table-column>
                 <el-table-column label="单价" width="170" align="right">
-                  <!-- ADR-008：包量定价行单价为派生参考展示（带「约」），金额以合同金额为准 -->
+                  <!-- ADR-008：包量定价行单价为派生参考展示（带「约」），金额以销售金额为准 -->
                   <template #default="{ row }">
                     <span v-if="isAmountItem(row.assetId)" class="muted">{{ derivedUnitPrice(row.amount, row.qty) }}</span>
                     <span v-else>{{ formatMoney(row.price) }}</span>
@@ -376,10 +473,10 @@ async function changeContract(c: Contract, status: 'delivered' | 'terminated') {
             </div>
           </template>
 
-          <!-- 存量无合同项目：保留原销售明细展示（明细 contractId 为 null） -->
+          <!-- 存量无销售记录项目：保留原销售明细展示（明细 contractId 为 null） -->
           <template v-else>
             <el-table v-if="project.items.length" :data="project.items" border>
-              <el-table-column label="关联资产" min-width="240">
+              <el-table-column label="关联产品" min-width="240">
                 <template #default="{ row }">
                   <a class="link" @click="goAssetDetail(row.assetId)">{{ itemAssetName(row.assetId) }}</a>
                 </template>
@@ -411,6 +508,9 @@ async function changeContract(c: Contract, status: 'delivered' | 'terminated') {
           </template>
         </div>
       </template>
+
+      <!-- ADR-012 §5.1 纯移交制：转交对话框（负责人/admin，下拉选新负责人） -->
+      <TransferDialog v-model="transferVisible" :project="transferTarget" />
     </div>
   </div>
 </template>

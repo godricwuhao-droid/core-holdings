@@ -1,19 +1,19 @@
 <script setup lang="ts">
 /**
- * 销售下单对话框（购物车下单 / 资产抽屉直接销售 共用）
+ * 销售下单对话框（购物车下单 / 产品抽屉直接销售 共用）
  *
  * 表单字段：项目名称、客户名称、生态人员、商务负责人、预计签约日期、合同金额（¥ 元）、备注。
- * 所属主体由资产自动带出，只读展示；无客户行业字段。
- * allowQtyEdit=true（资产抽屉单资产）时可编辑数量。
+ * 所属主体由产品自动带出，只读展示；无客户行业字段。
+ * allowQtyEdit=true（产品抽屉单产品）时可编辑数量。
  *
  * ADR-007 单合同语义：
- *  - 资产直接下单（/sales/order，默认模式）：payload 携带 customer + items + contractAmount，
+ *  - 产品直接下单（/sales/order，默认模式）：payload 携带 customer + items + contractAmount，
  *    后端自动包装为单合同（SaleOrderInput 无 contracts 字段，已实测 200 且 contractCount=1）；
  *  - 购物车结算（/cart/checkout，cartMode=true）：客户已在购物车行级填写，对话框不再展示
  *    「客户名称」字段（payload 不带 customer，后端按行级客户分组拆合同）；合同金额改为
  *    只读汇总展示「合同合计（元）」= Σ各行小计（payload 不带 contractAmount，后端按分组小计派生）；
  *    项目名称默认「采购订单」可修改；previewGroups 传入时顶部展示「将生成 1 个项目 · N 份合同」分组预览。
- * 提交后由父组件调用对应下单接口，生成「进行中」销售项目并锁定库存（不自动出库）。
+ * 提交后由父组件调用对应下单接口，生成「进行中」销售项目并锁定数量（不自动交付）。
  */
 import { computed, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
@@ -30,7 +30,8 @@ import {
   rsItemName,
   type Asset,
 } from '@/types'
-import { db, rsItemById, type OrderFields } from '@/api'
+import { rsItemById, type OrderFields } from '@/api'
+import { currentUser } from '@/auth'
 
 export interface OrderItem {
   asset: Asset
@@ -67,13 +68,13 @@ const emit = defineEmits<{
   (e: 'submit', payload: { fields: OrderFields; items: { assetId: number; qty: number; amount?: number; itemId?: number }[] }): void
 }>()
 
-/** 行计价单价（ADR-011）：遥感明细行取明细 price（后端权威重算，前端仅展示/传值）；其余取资产单价 */
+/** 行计价单价（ADR-011）：遥感明细行取明细 price（后端权威重算，前端仅展示/传值）；其余取产品单价 */
 function priceOf(i: OrderItem): number {
   if (i.itemId != null) return rsItemById(i.itemId)?.price ?? 0
   return i.asset.salePrice || 0
 }
 
-/** 单资产摘要行名称：遥感明细行显示「父资产名 · 明细名」 */
+/** 单产品摘要行名称：遥感明细行显示「父产品名 · 明细名」 */
 const singleName = computed(() => {
   const i = props.items[0]
   if (!i) return ''
@@ -84,16 +85,14 @@ const singleName = computed(() => {
   return i.asset.name
 })
 
-const reps = computed(() => Array.from(new Set(db.reps.map((r) => r.name))).filter(Boolean))
-
-/** 主体：全部下单资产同主体时带出展示；跨主体混装（购物车场景）显示「多主体」 */
+/** 主体：全部下单产品同主体时带出展示；跨主体混装（购物车场景）显示「多主体」 */
 const subject = computed(() => {
   const subjects = Array.from(new Set(props.items.map((i) => i.asset.subject).filter(Boolean)))
   if (subjects.length <= 1) return subjects[0] ?? ''
   return '__multi__'
 })
 const totalQty = computed(() => props.items.reduce((s, i) => s + i.qty, 0))
-/** 是否单资产可编辑数量（资产抽屉场景） */
+/** 是否单产品可编辑数量（产品抽屉场景） */
 const editableQty = computed(() => props.allowQtyEdit && props.items.length === 1)
 const maxQty = computed(() => {
   const first = props.items[0]
@@ -152,7 +151,10 @@ function reset() {
   // 购物车模式：客户已行级填写，项目名称默认「采购订单」（可修改）；直接下单仍默认跟随客户名称
   form.projectName = props.cartMode ? '采购订单' : ''
   form.customer = ''
-  form.rep = ''
+  // 2026-10-19 UI 优化：rep 不再提供填写项，静默取当前登录账号（原 viewer 行为推广到全角色；
+  // 保证「自己下单」的 rep 归属口径，仅供展示与可见性兜底）
+  form.rep = currentUser.value?.name ?? ''
+  // 商务负责人：下单入口不再指定（纯移交制，接手时绑定），恒空提交
   form.businessOwner = ''
   form.expectedSignDate = ''
   form.remark = ''
@@ -199,7 +201,7 @@ function validate(): boolean {
   if (editableQty.value && isAmountMode(props.items[0].asset)) {
     const amt = parseYuan(contractText.value)
     if (!Number.isInteger(amt) || amt <= 0) {
-      ElMessage.warning('合同金额须为整数元')
+      ElMessage.warning('销售金额须为整数元')
       return false
     }
   }
@@ -252,15 +254,16 @@ function close() {
     :close-on-click-modal="false"
     @update:model-value="(v: boolean) => emit('update:modelValue', v)"
   >
-    <!-- 结算预览（购物车场景）：按客户分组展示将生成的合同 -->
+    <!-- 结算预览（购物车场景）：按客户分组展示将生成的销售记录 -->
     <div v-if="previewGroups.length" class="sod-preview">
       <div class="sod-preview-title">
-        将生成 1 个项目 · <b>{{ previewGroups.length }}</b> 份合同
+        将生成 1 个项目 · <b>{{ previewGroups.length }}</b> 份销售记录
       </div>
+      <!-- 2026-10-19 UI 优化：三列固定对齐（客户名弹性+超长省略 / 数量右对齐 / 金额右对齐等宽数字） -->
       <div v-for="g in previewGroups" :key="g.customer" class="sod-preview-row">
-        <span class="sod-preview-customer">{{ g.customer }}</span>
-        <span class="muted">{{ g.qty }} 件</span>
-        <span class="sod-amount">{{ formatMoney(g.amount) }}</span>
+        <span class="sod-preview-customer" :title="g.customer">{{ g.customer }}</span>
+        <span class="muted sod-preview-qty">{{ g.qty }} 件</span>
+        <span class="sod-amount sod-preview-amount">{{ formatMoney(g.amount) }}</span>
       </div>
     </div>
 
@@ -276,10 +279,10 @@ function close() {
             <template v-else>{{ items[0].asset.unit }}</template>
           </span>
         </div>
-        <!-- ADR-008：包量定价——合同金额（整数元）为权威输入，单价为派生参考 -->
+        <!-- ADR-008：包量定价——销售金额（整数元）为权威输入，单价为派生参考 -->
         <div v-if="isAmountMode(items[0].asset)" class="sod-total muted">
           派生单价 <b class="sod-amount">{{ derivedPriceText || '-' }}</b>
-          <span>（合同金额在下方「合同金额」字段填写，须为整数元）</span>
+          <span>（销售金额在下方「销售金额」字段填写，须为整数元）</span>
         </div>
         <div v-else class="sod-total muted">
           小计 <b class="sod-amount">{{ formatMoney(priceOf(items[0]) * qty) }}</b>
@@ -288,22 +291,22 @@ function close() {
       <template v-else>
         <div class="sod-total">
           待下单 <b>{{ totalQty }}</b> 件 ·
-          <template v-if="hasAmountItem">合同合计 <b class="sod-amount">{{ formatMoney(totalYuan) }}</b></template>
+          <template v-if="hasAmountItem">销售金额合计 <b class="sod-amount">{{ formatMoney(totalYuan) }}</b></template>
           <template v-else>预计金额 <b class="sod-amount">{{ formatMoney(totalYuan) }}</b></template>
         </div>
       </template>
     </div>
 
-    <!-- 所属主体（只读，由资产带出；跨主体混装时提示按客户分组） -->
+    <!-- 所属主体（只读，由产品带出；跨主体混装时提示按客户分组） -->
     <div v-if="subject" class="sod-subject">
       <el-icon><InfoFilled /></el-icon>
       <template v-if="subject === '__multi__'">
         <span>所属主体：<b>多主体</b></span>
-        <span class="muted">（购物车允许跨主体混装，结算时按客户分组生成合同）</span>
+        <span class="muted">（购物车允许跨主体混装，结算时每个产品生成一条销售记录）</span>
       </template>
       <template v-else>
         <span>所属主体：<b>{{ entityShort(subject) }}</b></span>
-        <span class="muted">（由资产自动带出）</span>
+        <span class="muted">（由产品自动带出）</span>
       </template>
     </div>
 
@@ -315,38 +318,31 @@ function close() {
           @input="projectNameTouched = true"
         />
       </el-form-item>
-      <!-- 客户名称：仅直接下单模式；购物车模式客户已在行级填写（按行级分组生成合同） -->
+      <!-- 客户名称：仅直接下单模式；购物车模式客户已在行级填写（按行级分组生成销售记录） -->
       <el-form-item v-if="!cartMode" label="客户名称" required>
         <el-input v-model="form.customer" placeholder="客户 / 单位名称" />
       </el-form-item>
-      <div class="sod-row">
-        <el-form-item label="生态人员">
-          <el-select v-model="form.rep" placeholder="选择" clearable style="width: 100%;">
-            <el-option v-for="r in reps" :key="r" :label="r" :value="r" />
-          </el-select>
-        </el-form-item>
-        <el-form-item label="商务负责人">
-          <el-input v-model="form.businessOwner" placeholder="商务负责人姓名" />
-        </el-form-item>
-      </div>
+      <!-- 2026-10-19 UI 优化：删除「生态人员」「商务负责人」填写项——
+           rep 静默取当前登录账号（保证「自己下单」归属口径）；
+           商务负责人统一由下单后「接手」流程绑定（ADR-012 §5.1 纯移交制），下单入口不再指定 -->
       <div class="sod-row">
         <el-form-item label="预计签约日期">
           <el-date-picker v-model="form.expectedSignDate" type="date" value-format="YYYY-MM-DD" placeholder="选填" style="width: 100%;" />
         </el-form-item>
       </div>
-      <!-- 购物车模式：多合同下单，单值金额语义模糊 → 只读汇总展示（Σ各行小计），金额由后端按分组小计派生 -->
-      <el-form-item v-if="cartMode" label="合同合计（元）">
+      <!-- 购物车模式：多销售记录下单，单值金额语义模糊 → 只读汇总展示（Σ各行小计），金额由后端按分组小计派生 -->
+      <el-form-item v-if="cartMode" label="销售金额合计（元）">
         <div class="sod-readonly-amount">¥ {{ formatYuan(Math.round(totalYuan)) }}</div>
       </el-form-item>
-      <el-form-item v-else :label="hasAmountItem ? '合同金额（整数元）' : '合同金额（元）'">
-        <!-- 修复：unit 模式合同金额由后端按 单价×数量 权威重算（入参不采信），
+      <el-form-item v-else :label="hasAmountItem ? '销售金额（整数元）' : '销售金额（元）'">
+        <!-- 修复：unit 模式销售金额由后端按 单价×数量 权威重算（入参不采信），
              可编辑时用户改写的值会被静默丢弃且无提示——改为只读展示派生值，所见即所得 -->
         <el-input v-model="contractText" :readonly="!hasAmountItem" :placeholder="hasAmountItem ? '整数元，如 8000000' : '按 单价×数量 自动计算'" @input="contractTouched = true" @blur="onContractBlur">
           <template #prefix>¥</template>
         </el-input>
         <!-- ADR-008 包量定价说明（浅蓝提示） -->
         <div v-if="hasAmountItem" class="sod-amount-hint">
-          Token 资产按包量售卖，下单以合同金额（整数元）为准，参考单价不参与计价
+          Token 产品按包量售卖，下单以销售金额（整数元）为准，参考单价不参与计价
         </div>
       </el-form-item>
       <el-form-item label="备注">
@@ -377,14 +373,27 @@ function close() {
   font-weight: 500;
 }
 .sod-preview-row {
-  display: flex;
+  /* 2026-10-19 UI 优化：三列固定对齐（原 flex gap 流式排列，客户名长短不一导致列错位） */
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 64px 150px;
   align-items: center;
-  gap: 10px;
+  column-gap: 12px;
   padding: 2px 0;
 }
 .sod-preview-customer {
   font-weight: 500;
   color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sod-preview-qty {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.sod-preview-amount {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
 }
 .sod-summary {
   padding: 10px 14px;

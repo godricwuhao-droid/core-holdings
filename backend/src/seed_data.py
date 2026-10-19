@@ -1,4 +1,4 @@
-"""种子数据（首次启动入库，来源：前端 seed.ts / 《资产情况.md》）
+"""种子数据（首次启动登记，来源：前端 seed.ts / 《产品情况.md》）
 
 金额单位：元（ADR-006，2026-10-16 起库内金额一律存元；本文件数值已按元值给出，
 即原万元口径数值 ×10000）。
@@ -102,7 +102,7 @@ ASSETS = [
      "subject": "蜂云时代科技有限公司", "unit": "台", "quantity": 266, "lockedQty": 0, "shippedQty": 0, "repeatSale": False,
      "salePrice": 0, "soldAmount": 460000000, "soldCount": 0, "status": "in_stock",
      "inboundDate": "2025-06-01", "expiryDate": "2028-12-31", "perpetual": False,
-     "spec": "算力服务器 266 台", "remark": "已售 4.6 亿服务，26 年算力运载及总资产已超负荷销售", "updatedAt": "2026-09-01"},
+     "spec": "算力服务器 266 台", "remark": "已售 4.6 亿服务，26 年算力运载及总盘已超负荷销售", "updatedAt": "2026-09-01"},
     {"code": "CH-CMP-002", "name": "广西贺州算力服务器", "board": "compute", "type": "算力服务器",
      "subject": "蜂云纪元科技(贺州)有限公司", "unit": "台", "quantity": 171, "lockedQty": 0, "shippedQty": 0, "repeatSale": False,
      "salePrice": 0, "soldAmount": 70000000, "soldCount": 0, "status": "in_stock",
@@ -114,7 +114,7 @@ ASSETS = [
      "inboundDate": "2025-07-01", "expiryDate": "2028-07-31", "perpetual": False,
      "spec": "算力服务器 174 台", "remark": "已售 1.8 亿服务，差额部分抵减贸易利润，26 年已超负荷销售", "updatedAt": "2026-09-01"},
 
-    # ================= 软件库存 =================
+    # ================= 软件产品 =================
     {"code": "CH-SW-001", "name": "区县级优质资源共建共享平台", "board": "software", "type": "软件",
      "subject": "蜂云时代科技有限公司", "unit": "套", "quantity": 1, "lockedQty": 0, "shippedQty": 0, "repeatSale": False,
      "salePrice": 102200, "soldAmount": 0, "soldCount": 0, "status": "in_stock",
@@ -144,12 +144,12 @@ ASSETS = [
      "salePrice": 7580000, "soldAmount": 0, "soldCount": 0, "status": "in_stock",
      "inboundDate": "2025-12-01", "expiryDate": "", "perpetual": True, "spec": "", "remark": "", "updatedAt": "2026-09-01"},
 
-    # ================= 硬件库存 =================
+    # ================= 硬件产品 =================
     {"code": "CH-HW-001", "name": "星河AI算力集群", "board": "hardware", "type": "硬件集群",
      "subject": "安徽天枢智算人工智能科技有限公司", "unit": "集群", "quantity": 1, "lockedQty": 0, "shippedQty": 0, "repeatSale": False,
      "salePrice": 32560000, "soldAmount": 0, "soldCount": 0, "status": "in_stock",
      "inboundDate": "2025-11-10", "expiryDate": "", "perpetual": True,
-     "spec": "AI 算力集群（整机柜交付）", "remark": "集群库存", "updatedAt": "2026-09-01"},
+     "spec": "AI 算力集群（整机柜交付）", "remark": "集群可售", "updatedAt": "2026-09-01"},
 ]
 
 SUPPLIERS = [
@@ -164,11 +164,11 @@ SUPPLIERS = [
 ]
 
 CATEGORY_UNITS = [
-    {"board": "embodied", "type": "机器人", "unit": "套 / 台", "note": "整机交付，可选序列号出库"},
+    {"board": "embodied", "type": "机器人", "unit": "套 / 台", "note": "整机交付，可选序列号交付"},
     {"board": "embodied", "type": "数采设备", "unit": "套", "note": "数采软件及设备接入"},
     {"board": "embodied", "type": "平台软件", "unit": "套", "note": "管理平台类"},
     {"board": "satellite", "type": "卫星Token", "unit": "颗（Token 额度）", "note": "按 Token 额度与有效期售卖（包量计价，合同金额整数元权威，ADR-008）"},
-    {"board": "satellite", "type": "卫星数据", "unit": "轨 / 期 / 条", "note": "默认可重复售卖，不扣减库存"},
+    {"board": "satellite", "type": "卫星数据", "unit": "轨 / 期 / 条", "note": "默认可重复售卖，不扣减数量"},
     {"board": "satellite", "type": "遥感数据", "unit": "份（区域·精度·日期）", "note": "按 省/精度/日期 三维唯一售卖（ADR-010）"},
     {"board": "software", "type": "软件", "unit": "套", "note": "永久 / 年限 / 并发 / 账号授权"},
     {"board": "hardware", "type": "硬件集群", "unit": "集群 / 台", "note": "整机柜或单台交付"},
@@ -184,7 +184,7 @@ DELIVERABLE_TEMPLATES: dict[str, list[dict]] = {
     "机器人": [
         _t("硬件整机安装包", "install", True, "含本体与标准附件"),
         _t("安装与调试手册", "install", True, "含调试、点检与初始上电流程"),
-        _t("产品授权证书", "license", True, "序列号证书，出库后签发"),
+        _t("产品授权证书", "license", True, "序列号证书，交付后签发"),
         _t("用户培训资料", "feature", False, "操作培训与交接资料"),
         _t("验收检验报告模板", "accept", False, "验收前由项目经理补充"),
     ],

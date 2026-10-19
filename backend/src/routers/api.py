@@ -78,6 +78,31 @@ def list_users(db: Session = Depends(get_db), _: models.User = Depends(security.
     return db.query(models.User).order_by(models.User.id.asc()).all()
 
 
+@router.get("/users/options", response_model=list[schemas.UserOut])
+def user_options(db: Session = Depends(get_db), _: models.User = Depends(security.get_current_user)):
+    """商务账号选项（ADR-012 §5.1）：editor + admin 有效账号，
+    供「商务负责人」筛选/接手转交下拉与商务 username→姓名 展示映射（商务负责人与角色账号的关联查询）"""
+    return (
+        db.query(models.User)
+        .where(models.User.role.in_(("editor", "admin")), models.User.enabled == True)  # noqa: E712
+        .order_by(models.User.id.asc())
+        .all()
+    )
+
+
+@router.get("/users/options/all", response_model=list[schemas.UserOut])
+def user_options_all(db: Session = Depends(get_db), _: models.User = Depends(security.get_current_user)):
+    """全部启用账号（2026-10-20：含生态 viewer）——供项目页「账号 → 姓名」显示映射
+    （生态人员列 rep 存生态账号，/users/options 只有商务查不到 → 裸账号外露）。
+    仅展示用途；商务接手/转交下拉仍用 /users/options（不得转给生态）。"""
+    return (
+        db.query(models.User)
+        .where(models.User.enabled == True)  # noqa: E712
+        .order_by(models.User.id.asc())
+        .all()
+    )
+
+
 @router.post("/users", response_model=schemas.UserOut)
 def create_user(data: schemas.UserCreate, db: Session = Depends(get_db),
                 user: models.User = Depends(security.require_admin)):
@@ -172,18 +197,18 @@ def list_audit_logs(
 # ============================================================
 @router.get("/bootstrap")
 def bootstrap(db: Session = Depends(get_db), user: models.User = Depends(security.get_current_user)):
-    # ADR-009：cart 仅返回当前登录用户的行
-    return services.bootstrap(db, str(user.id))
+    # ADR-009：cart 仅返回当前登录用户的行；viewer（生态人员）projects/contracts 按「自己下单」过滤
+    return services.bootstrap(db, str(user.id), user)
 
 
 # ============================================================
-# 资产（写：admin+editor）
+# 产品（写：admin+editor）
 # ============================================================
 @router.post("/assets", response_model=schemas.AssetOut)
 def create_asset(data: schemas.AssetInput, db: Session = Depends(get_db),
                  user: models.User = Depends(security.require_editor)):
     asset = services.create_asset(db, data, operator=user.username)
-    security.record_audit(db, user, "asset_change", "新增资产", "asset", asset.name, asset.code)
+    security.record_audit(db, user, "asset_change", "新增产品", "asset", asset.name, asset.code)
     return asset
 
 
@@ -194,11 +219,11 @@ def update_asset(asset_id: int, data: schemas.AssetUpdate, db: Session = Depends
     # exclude_unset——仅采信客户端实际传了的字段（未传字段不覆盖）
     services.update_asset(db, asset_id, data.model_dump(exclude_unset=True), operator=user.username)
     a = db.get(models.Asset, asset_id)
-    security.record_audit(db, user, "asset_change", "编辑资产", "asset", a.name if a else str(asset_id))
+    security.record_audit(db, user, "asset_change", "编辑产品", "asset", a.name if a else str(asset_id))
     return {"ok": True}
 
 
-# 注：已移除 PATCH /assets/{asset_id}/status（M6）——资产状态改为纯 2 态自动判定，
+# 注：已移除 PATCH /assets/{asset_id}/status（M6）——产品状态改为纯 2 态自动判定，
 # 前端从不调用该端点（已确认），保留会与自动判定逻辑冲突。
 
 
@@ -208,12 +233,12 @@ def delete_asset(asset_id: int, db: Session = Depends(get_db),
     a = db.get(models.Asset, asset_id)
     name = a.name if a else str(asset_id)
     services.delete_asset(db, asset_id, operator=user.username)
-    security.record_audit(db, user, "asset_change", "删除资产", "asset", name)
+    security.record_audit(db, user, "asset_change", "删除产品", "asset", name)
     return {"ok": True}
 
 
 # ============================================================
-# 遥感数据可售明细（ADR-011：父资产 + 明细两层模型；写 admin+editor，读随 bootstrap 放行）
+# 遥感数据可售明细（ADR-011：父产品 + 明细两层模型；写 admin+editor，读随 bootstrap 放行）
 # ============================================================
 @router.post("/assets/{asset_id}/rs-items", response_model=schemas.RsItemOut)
 def create_rs_item(asset_id: int, data: schemas.RsItemInput, db: Session = Depends(get_db),
@@ -253,6 +278,11 @@ def delete_rs_item(item_id: int, db: Session = Depends(get_db),
 @router.post("/projects", response_model=schemas.ProjectOut)
 def create_project(data: schemas.ProjectInput, db: Session = Depends(get_db),
                    user: models.User = Depends(security.require_editor)):
+    """手动建单/保存草稿。
+    【核心业务规则 ADR-012 修订 2026-10-19】所有角色（生态/商务/管理员）× 所有建单入口
+    （手动建单/直接下单/购物车结算）统一建 **pending（待审核）**：
+    商务「接手」绑定负责人 → 审核（改价确认/驳回）→ 生效 active。
+    pending 期间：仅负责人（或 admin 越过）可编辑/审核，锁定照常。"""
     project = services.create_project(db, data, operator=user.username)
     security.record_audit(db, user, "sale", "新建销售项目", "project", project.name, project.code)
     return project
@@ -260,8 +290,9 @@ def create_project(data: schemas.ProjectInput, db: Session = Depends(get_db),
 
 @router.put("/projects/{project_id}")
 def update_project(project_id: int, data: schemas.ProjectInput, db: Session = Depends(get_db),
-                   user: models.User = Depends(security.require_editor)):
-    services.update_project(db, project_id, data, operator=user.username)
+                   user: models.User = Depends(security.require_order)):
+    # viewer（生态人员）可编辑自己下单的项目——归属/rep 不可改约束在 services.update_project 内
+    services.update_project(db, project_id, data, operator=user.username, user=user)
     p = db.get(models.Project, project_id)
     security.record_audit(db, user, "sale", "编辑销售项目", "project", p.name if p else str(project_id))
     return {"ok": True}
@@ -269,12 +300,54 @@ def update_project(project_id: int, data: schemas.ProjectInput, db: Session = De
 
 @router.patch("/projects/{project_id}/status")
 def change_project_status(project_id: int, data: schemas.StatusInput, db: Session = Depends(get_db),
-                          user: models.User = Depends(security.require_editor)):
-    services.change_project_status(db, project_id, data, operator=user.username)
+                          user: models.User = Depends(security.require_order)):
+    # viewer（生态人员）仅可终止自己下单的项目——归属/动作约束在 services.change_project_status 内
+    services.change_project_status(db, project_id, data, operator=user.username, user=user)
     p = db.get(models.Project, project_id)
     security.record_audit(db, user, "sale", "变更项目状态", "project",
                           p.name if p else str(project_id), f"status={data.status}")
     return {"ok": True}
+
+
+@router.post("/projects/{project_id}/review")
+def review_project(project_id: int, data: schemas.ReviewInput, db: Session = Depends(get_db),
+                   user: models.User = Depends(security.require_editor)):
+    """订单审核（ADR-012，仅商务/管理员）：确认下单（可带行级改价，实际价同步写回平台挂牌价）
+    / 驳回（释放锁定 + 项目终止 + 原因留痕）。生态人员 403（require_editor 拦截）。
+    【核心业务规则 ADR-012 修订 2026-10-19】全部建单入口统一 pending 后，本接口是唯一
+    pending→active 出口；仅**商务负责人**（businessOwner 绑定账号）可操作，admin 越过，
+    非负责人 400（未接手 → 「该订单尚未被商务接手，请先接手后再操作」）。"""
+    # ADR-012 §5.1：接手人守卫在 services.review_project 内（未接手/非接手人 400，admin 可越过）
+    services.review_project(db, project_id, data, operator=user.username, user=user)
+    p = db.get(models.Project, project_id)
+    security.record_audit(db, user, "sale",
+                          "确认下单" if data.action == "confirm" else "驳回订单",
+                          "project", p.name if p else str(project_id))
+    return {"ok": True}
+
+
+@router.post("/projects/{project_id}/claim")
+def claim_project(project_id: int, data: schemas.ClaimInput = schemas.ClaimInput(),
+                  db: Session = Depends(get_db),
+                  user: models.User = Depends(security.require_editor)):
+    """商务接手/转交（ADR-012 §5.1 纯移交制）：无负责人→接手（绑定自己）；
+    已有负责人→仅负责人可转交（body 传 newOwner=目标商务账号）或 admin 越过（接手/转交任意账号）。
+    接手后 businessOwner 成为改价/确认/驳回的权限依据（admin 可越过）。"""
+    action = services.claim_project(db, project_id, user=user, new_owner=data.newOwner)
+    p = db.get(models.Project, project_id)
+    security.record_audit(db, user, "sale", action, "project",
+                          p.name if p else str(project_id))
+    return {"ok": True}
+
+
+@router.post("/projects/{project_id}/resubmit", response_model=schemas.ProjectOut)
+def resubmit_project(project_id: int, data: schemas.ProjectInput, db: Session = Depends(get_db),
+                     user: models.User = Depends(security.require_order)):
+    """重新提交（2026-10-20）：已终止项目（驳回/取消/终止）按（可修改的）明细新建 pending 订单，
+    旧项目保留终止历史。viewer 仅自己下单的项目（后端 creator 守卫兜底）。"""
+    p = services.resubmit_project(db, project_id, data, operator=user.username, user=user)
+    security.record_audit(db, user, "sale", "重新提交销售项目", "project", p.name)
+    return p
 
 
 @router.delete("/projects/{project_id}")
@@ -288,29 +361,30 @@ def delete_project(project_id: int, db: Session = Depends(get_db),
 
 
 # ============================================================
-# 合同（ADR-007）：库存联动的最小单位
+# 合同（ADR-007）：数量联动的最小单位
 # 生命周期：POST /projects（contracts 入参）或 POST /cart/checkout 生成；
 # 状态流转 PATCH /contracts/{id}/status；删除随项目删除级联（无独立删除端点）。
 # ============================================================
 @router.patch("/contracts/{contract_id}/status")
 def change_contract_status(contract_id: int, data: schemas.StatusInput, db: Session = Depends(get_db),
-                           user: models.User = Depends(security.require_editor)):
+                           user: models.User = Depends(security.require_order)):
+    # viewer（生态人员）仅可终止自己下单项目的合同（不可交付）——约束在 services.change_contract_status 内
     c = db.get(models.Contract, contract_id)
     code = c.code if c else str(contract_id)
     services.change_contract_status(db, contract_id, data.status, reason=data.reason,
-                                    operator=user.username)
-    security.record_audit(db, user, "sale", "变更合同状态", "contract", code, f"status={data.status}")
+                                    operator=user.username, user=user)
+    security.record_audit(db, user, "sale", "变更销售记录状态", "contract", code, f"status={data.status}")
     return {"ok": True}
 
 
 # ============================================================
-# 出库（写：admin+editor）
+# 交付（写：admin+editor）
 # ============================================================
 @router.post("/outbounds", response_model=schemas.OutboundOut)
 def create_outbound(data: schemas.OutboundInput, db: Session = Depends(get_db),
                     user: models.User = Depends(security.require_editor)):
     ob = services.create_outbound(db, data, operator=user.username)
-    security.record_audit(db, user, "outbound", "新出库", "outbound", ob.assetName, ob.code)
+    security.record_audit(db, user, "outbound", "新交付", "outbound", ob.assetName, ob.code)
     return ob
 
 
@@ -320,7 +394,7 @@ def revert_outbound(outbound_id: int, request: dict, db: Session = Depends(get_d
     ob = db.get(models.Outbound, outbound_id)
     name = ob.assetName if ob else str(outbound_id)
     services.revert_outbound(db, outbound_id, request.get("reason", ""), operator=user.username)
-    security.record_audit(db, user, "outbound", "撤销出库", "outbound", name)
+    security.record_audit(db, user, "outbound", "撤销交付", "outbound", name)
     return {"ok": True}
 
 
@@ -372,14 +446,25 @@ def clear_cart(db: Session = Depends(get_db), user: models.User = Depends(securi
 @router.post("/cart/checkout", response_model=schemas.ProjectOut)
 def checkout(data: schemas.CheckoutInput, db: Session = Depends(get_db),
              user: models.User = Depends(security.require_order)):
-    project = services.checkout(db, data, user_id=str(user.id), operator=user.username)
-    security.record_audit(db, user, "sale", "购物车结算", "project", project.name, project.code)
+    """购物车结算：按产品分组 → 每个产品一条销售记录（ADR-013）。
+    【核心业务规则 ADR-012 修订 2026-10-19】所有角色结算统一建 **pending（待审核）**
+    （数量锁定照常）→ 商务接手审核（改价确认/驳回）后生效；原「仅生态人员进 pending」的角色分叉已废除。
+    is_viewer 现仅用于金额免填（生态人员 amount 模式行可留空回退挂牌价×数量）。"""
+    is_viewer = user.role == "viewer"
+    project = services.checkout(db, data, user_id=str(user.id), operator=user.username,
+                                viewer=is_viewer)
+    security.record_audit(db, user, "sale",
+                          "购物车下单（待商务审核）" if is_viewer else "购物车结算",
+                          "project", project.name, project.code)
     return project
 
 
 @router.post("/sales/order", response_model=schemas.ProjectOut)
 def create_sale_order(data: schemas.SaleOrderInput, db: Session = Depends(get_db),
                       user: models.User = Depends(security.require_order)):
+    """产品直接下单（任意角色）。
+    【核心业务规则 ADR-012 修订 2026-10-19】统一建 **pending（待审核）**（锁定照常），
+    商务接手审核（改价确认/驳回）后生效 active——与手动建单/购物车结算同口径。"""
     project = services.create_sale_order(db, data, operator=user.username)
     security.record_audit(db, user, "sale", "下单", "project", project.name, project.code)
     return project
@@ -421,7 +506,7 @@ def delete_base(kind: str, rec_id: int, db: Session = Depends(get_db),
 
 
 # ============================================================
-# 交付物模板（type 为中文资产类型，走 query 避免 path 编码问题）
+# 交付物模板（type 为中文产品类型，走 query 避免 path 编码问题）
 # ============================================================
 @router.post("/deliverable-templates")
 def add_template_item(atype: str = Query(..., alias="type"),
@@ -452,7 +537,7 @@ def delete_template_item(item_id: int, atype: str = Query(..., alias="type"), db
 
 
 # ============================================================
-# 资产交付物
+# 产品交付物
 # ============================================================
 @router.post("/assets/{asset_id}/deliverables")
 def add_asset_deliverable(asset_id: int, data: schemas.AssetDeliverableInput, db: Session = Depends(get_db),
@@ -500,7 +585,7 @@ async def upload_file(file: UploadFile = File(...), db: Session = Depends(get_db
     fname = f"{uuid.uuid4().hex}.{ext}"
     with open(os.path.join(UPLOAD_DIR, fname), "wb") as f:
         f.write(content)
-    # 落盘成功后写原名映射（上传不是资产操作，不写 OpLog）
+    # 落盘成功后写原名映射（上传不是产品操作，不写 OpLog）
     services.add_file_meta(db, fname, orig, len(content), user.username)
     return {"filename": fname, "name": orig, "size": len(content), "storedName": fname}
 
@@ -556,12 +641,12 @@ def get_file(filename: str, inline: bool = Query(False, description="true 时内
 @router.delete("/upload/{filename}")
 def delete_file(filename: str, db: Session = Depends(get_db),
                 user: models.User = Depends(security.require_editor)):
-    # 引用完整性：仍被资产「产品清单/功能清单」引用的文件禁止删除（删后详情页预览/下载 404）
+    # 引用完整性：仍被产品「产品清单/功能清单」引用的文件禁止删除（删后详情页预览/下载 404）
     ref = db.query(models.Asset).filter(
         (models.Asset.contractFile == filename) | (models.Asset.featureDoc == filename)
     ).first()
     if ref is not None:
-        raise HTTPException(400, f"该文件仍被资产「{ref.name}」引用（产品清单/功能清单），请先修改资产附件后再删除")
+        raise HTTPException(400, f"该文件仍被产品「{ref.name}」引用（产品清单/功能清单），请先修改产品附件后再删除")
     path = _resolve_upload(filename)
     os.remove(path)
     # 同步清理 file_meta 原名映射（无行则忽略，幂等）

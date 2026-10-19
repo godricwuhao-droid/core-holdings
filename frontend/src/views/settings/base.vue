@@ -24,7 +24,7 @@ const kindLabel = computed(() =>
 
 const kindDesc = computed(() =>
   kind.value === 'suppliers'
-    ? '维护供应商主数据，供资产入库登记时选择供应商。'
+    ? '维护供应商主数据，供产品登记时选择供应商。'
     : kind.value === 'customers'
       ? '维护客户主数据，供销售项目建档时选择客户。'
       : '维护公司生态人员名单，供销售项目指派负责人。',

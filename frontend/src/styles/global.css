@@ -538,13 +538,16 @@ body {
 
 /* 表头对齐跟随各列 align（不强制居中）：.cell 继承 th 上 is-left/right/center */
 
-/* 按钮 */
-.el-button--primary {
+/* 按钮：实心主按钮覆盖为主题蓝。
+   2026-10-19 修复：必须排除 is-plain/is-text/is-link——原规则把 plain 主按钮也刷成
+   实心蓝底，而 plain 的文字色仍是主题蓝（蓝底蓝字），按钮文字不可见
+   （典型现场：销售项目抽屉「查看详情」按钮渲染成空白蓝块）。 */
+.el-button--primary:not(.is-plain):not(.is-text):not(.is-link) {
   background: var(--primary-color);
   border-color: var(--primary-color);
 }
 
-.el-button--primary:hover {
+.el-button--primary:not(.is-plain):not(.is-text):not(.is-link):hover {
   background: var(--primary-hover);
   border-color: var(--primary-hover);
 }
@@ -642,7 +645,7 @@ body {
   --el-tag-text-color: #c2505f;
   --el-tag-border-color: #f5d3d9;
 }
-/* 资产类型专用色板（叠加在 .el-tag 上，用于列表类型列区分类型） */
+/* 产品类型专用色板（叠加在 .el-tag 上，用于列表类型列区分类型） */
 .el-tag.tag-blue {
   --el-tag-bg-color: #eaf3ff;
   --el-tag-text-color: #1769d4;

@@ -48,7 +48,7 @@ export const currentUser = computed<CurrentUser | null>(() => state.user)
 /** 是否管理员（账号与审计等 admin 专用能力） */
 export const isAdmin = computed(() => state.user?.role === 'admin')
 
-/** 是否可执行业务写操作（admin / editor 可写；viewer 仅下单链路，资产编辑类禁用） */
+/** 是否可执行业务写操作（admin / editor 可写；viewer 仅下单链路，产品编辑类禁用） */
 export const canWrite = computed(() => state.user !== null && state.user.role !== 'viewer')
 
 /** 是否生态人员（viewer）：菜单/路由收窄 + 下单链路放权 */
@@ -57,7 +57,7 @@ export const isViewer = computed(() => state.user?.role === 'viewer')
 /**
  * 是否已登录（ADR-009）：下单链路（购物车加购/改量/删行/清空/结算、直接下单）
  * 后端已全部改为 require_order（认证即放行），前端对应入口以本判据解禁，
- * 不再受 canWrite（admin/editor）限制；资产编辑类入口仍用 canWrite。
+ * 不再受 canWrite（admin/editor）限制；产品编辑类入口仍用 canWrite。
  */
 export const isLoggedIn = computed(() => state.user !== null)
 

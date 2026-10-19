@@ -1,11 +1,11 @@
 <script setup lang="ts">
 /**
- * 资产管理 - 详情页
+ * 产品及服务 - 详情页
  *
- * 按《资产详情页 UI 开发提示词》实现：
- * ← 返回 → 大标题 + 元信息行 + [编辑资产] [登记销售] [更多▾]（删除收入菜单）
- * → 五页签：基本信息(左基础资料 1 列 + 右库存与归属含可售数量) / 交付物
- *   / 销售关联(空状态) / 出入库流水(时间线) / 操作记录
+ * 按《产品详情页 UI 开发提示词》实现：
+ * ← 返回 → 大标题 + 元信息行 + [编辑产品] [登记销售] [更多▾]（删除收入菜单）
+ * → 五页签：基本信息(左基础资料 1 列 + 右数量与归属含可售数量) / 交付物
+ *   / 销售关联(空状态) / 数量流水(时间线) / 操作记录
  */
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
@@ -70,7 +70,7 @@ import SalesOrderDialog from '@/components/SalesOrderDialog.vue'
 import RsItemPicker from '@/components/RsItemPicker.vue'
 import type { OrderItem } from '@/components/SalesOrderDialog.vue'
 import { PROVINCES } from '@/constants'
-import { canWrite, isViewer, READONLY_TIP } from '@/auth'
+import { canWrite, READONLY_TIP } from '@/auth'
 
 const route = useRoute()
 const router = useRouter()
@@ -88,7 +88,7 @@ const opLogs = computed(() =>
     : [],
 )
 
-/** 状态点胶囊：库存可售绿 / 暂无库存红（可重复售卖归入库存可售） */
+/** 状态点胶囊：可售绿 / 已售罄红（可重复售卖归入可售） */
 function statusPill(): { cls: 'ok' | 'off'; dot: string } {
   const s = assetStockState(asset.value!)
   return s === 'in_stock' ? { cls: 'ok', dot: '●' } : { cls: 'off', dot: '◌' }
@@ -102,7 +102,7 @@ function isWipBoard() {
 // 顶部动作
 // ============================================================
 // ---- 登记销售：admin/editor 走销售模块创建页（原行为）；viewer（生态人员）无销售模块入口，
-//      直接打开下单对话框（与资产列表抽屉「销售」同一表单，单资产 + 数量） ----
+//      直接打开下单对话框（与产品列表抽屉「销售」同一表单，单产品 + 数量） ----
 const saleItem = ref<OrderItem | null>(null)
 const saleVisible = ref(false)
 const saleLoading = ref(false)
@@ -112,7 +112,7 @@ const saleItems = computed<OrderItem[]>(() =>
   rsSaleItems.value.length ? rsSaleItems.value : saleItem.value ? [saleItem.value] : [],
 )
 
-// ---- ADR-011：遥感数据明细选择弹窗（登记销售入口；加购统一走资产列表）----
+// ---- ADR-011：遥感数据明细选择弹窗（登记销售入口；加购统一走产品列表）----
 const rsPickerVisible = ref(false)
 
 function onRsPickerConfirm(items: RsItem[]) {
@@ -125,22 +125,20 @@ function onRsPickerConfirm(items: RsItem[]) {
 
 function goRegisterSale() {
   if (!asset.value) return
-  // ADR-011：遥感数据父资产 → 明细选择弹窗（父资产本身不可直接下单，库存校验不适用）
+  // ADR-011：遥感数据父产品 → 明细选择弹窗（父产品本身不可直接下单，数量校验不适用）
   if (asset.value.type === '遥感数据') {
     rsPickerVisible.value = true
     return
   }
   if (noSellableStock(asset.value)) {
-    ElMessage.warning('该资产当前无可售库存（可售数量为 0），无法登记销售。请待库存释放（取消锁定或补充入库）后再操作。')
+    ElMessage.warning('该产品当前无可用数量（可售数量为 0），无法登记销售。请待数量释放（取消锁定或补充登记）后再操作。')
     return
   }
-  if (isViewer.value) {
-    rsSaleItems.value = []
-    saleItem.value = { asset: asset.value, qty: 1 }
-    saleVisible.value = true
-    return
-  }
-  router.push({ path: '/sales/projects/create', query: { assetId: String(asset.value.id) } })
+  // 2026-10-19：原商务/管理员走「跳手动建单页（带 assetId 预填）」——手动建单入口已移除，
+  // 统一改为直接打开下单对话框（与产品列表直接下单、viewer 行为一致）
+  rsSaleItems.value = []
+  saleItem.value = { asset: asset.value, qty: 1 }
+  saleVisible.value = true
 }
 
 async function onSaleSubmit(payload: { fields: OrderFields; items: { assetId: number; qty: number; amount?: number }[] }) {
@@ -148,7 +146,8 @@ async function onSaleSubmit(payload: { fields: OrderFields; items: { assetId: nu
   try {
     const p = await createSaleOrder({ ...payload.fields, items: payload.items })
     saleVisible.value = false
-    ElMessage.success(`下单成功，已生成销售项目 ${p.code}（进行中）`)
+    // ADR-012 修订（2026-10-19）：所有角色下单统一进「待审核」，商务接手审核后生效
+    ElMessage.success(`下单成功，销售项目 ${p.code} 待审核，商务接手确认后生效`)
     await refresh(true)
   } catch (e) {
     ElMessage.error(e instanceof Error ? e.message : '下单失败')
@@ -158,11 +157,11 @@ async function onSaleSubmit(payload: { fields: OrderFields; items: { assetId: nu
   }
 }
 
-/** 编辑资产：无可售库存时提示（不阻止，允许补入库） */
+/** 编辑产品：无可用数量时提示（不阻止，允许补登记） */
 function goEditAsset() {
   if (!asset.value) return
   if (noSellableStock(asset.value)) {
-    ElMessage.warning('该资产当前无可售库存（可售数量为 0）。可继续编辑补入库或核对锁定 / 售出情况。')
+    ElMessage.warning('该产品当前无可用数量（可售数量为 0）。可继续编辑补登记或核对锁定 / 售出情况。')
   }
   router.push(`/assets/${asset.value.id}/edit`)
 }
@@ -171,9 +170,9 @@ async function copyCode() {
   if (!asset.value) return
   try {
     await navigator.clipboard.writeText(asset.value.code)
-    ElMessage.success('资产编号已复制')
+    ElMessage.success('产品编号已复制')
   } catch {
-    ElMessage.info(`资产编号：${asset.value.code}`)
+    ElMessage.info(`产品编号：${asset.value.code}`)
   }
 }
 
@@ -184,7 +183,7 @@ async function handleDelete() {
   if (!asset.value) return
   try {
     await ElMessageBox.confirm(
-      `确定删除资产「${asset.value.name}」（${asset.value.code}）吗？`,
+      `确定删除产品「${asset.value.name}」（${asset.value.code}）吗？`,
       '删除确认',
       { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
     )
@@ -210,7 +209,7 @@ onMounted(() => {
 })
 
 // ============================================================
-// 出入库流水：筛选 + 时间线
+// 数量流水：筛选 + 时间线
 // ============================================================
 type FlowGroup = 'all' | 'purchase_in' | 'project_lock' | 'sale_out' | 'adjust'
 const flowFilter = ref<FlowGroup>('all')
@@ -269,7 +268,7 @@ const defaultScope = computed(() =>
 
 /** 交付三步（右侧说明栏时间线） */
 const DELIVERY_STEPS = [
-  { t: '项目关联', d: '生态人员在销售项目中选择资产及数量。' },
+  { t: '项目关联', d: '生态人员在销售项目中选择产品及数量。' },
   { t: '选择交付包', d: '交付人员确认本次需使用的交付物版本。' },
   { t: '完成交付', d: '记录序列号、客户、日期和经办人，生成交付凭证。' },
 ]
@@ -424,8 +423,8 @@ async function removeRsItem(it: RsItem) {
 /**
  * 签约主体（ADR-007，三级兜底）：
  * 1. 项目自身 subject（派生：单合同=该合同值，多合同=空）；
- * 2. 为空时取**本行明细所属合同**的 subject（合同内强制同一资产主体，最贴近本行）；
- * 3. 仍无（存量明细 contractId=null）→ 兜底明细资产自身主体；仍无 → '-'。
+ * 2. 为空时取**本行明细所属合同**的 subject（合同内强制同一产品主体，最贴近本行）；
+ * 3. 仍无（存量明细 contractId=null）→ 兜底明细产品自身主体；仍无 → '-'。
  */
 function projectSubject(p: Project, item: ProjectItem): string {
   if (p.subject) return p.subject
@@ -440,7 +439,7 @@ function projectSubject(p: Project, item: ProjectItem): string {
 
 /** 合同数（ADR-007）：contractCount 缺失/0 的存量项目按单合同口径显示「1 份合同」 */
 function contractCountText(p: Project): string {
-  return p.contractCount ? `${p.contractCount} 份合同` : '1 份合同'
+  return p.contractCount ? `${p.contractCount} 份销售记录` : '1 份销售记录'
 }
 
 /** 流水操作人：空 → -；system → 系统 */
@@ -482,7 +481,7 @@ function operatorText(f: AssetFlow): string {
             <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="bottom">
               <span>
                 <el-button type="primary" :icon="Edit" :disabled="!canWrite" @click="goEditAsset">
-                  编辑资产
+                  编辑产品
                 </el-button>
               </span>
             </el-tooltip>
@@ -495,11 +494,11 @@ function operatorText(f: AssetFlow): string {
               </span>
               <template #dropdown>
                 <el-dropdown-menu>
-                  <el-dropdown-item @click="copyCode">复制资产编号</el-dropdown-item>
+                  <el-dropdown-item @click="copyCode">复制产品编号</el-dropdown-item>
                   <el-dropdown-item @click="activeTab = 'logs'">查看操作记录</el-dropdown-item>
                   <el-dropdown-item divided :disabled="!canWrite" @click="handleDelete" class="danger-item">
                     <el-icon><Delete /></el-icon>
-                    删除资产
+                    删除产品
                   </el-dropdown-item>
                 </el-dropdown-menu>
               </template>
@@ -514,7 +513,7 @@ function operatorText(f: AssetFlow): string {
 
         <!-- 六页签 -->
         <el-tabs v-model="activeTab" class="asset-tabs">
-          <!-- 1 基本信息：左 2/3 基础资料(1列) + 右 1/3 库存与归属(含可售数量) -->
+          <!-- 1 基本信息：左 2/3 基础资料(1列) + 右 1/3 数量与归属(含可售数量) -->
           <el-tab-pane label="基本信息" name="info">
             <div class="basic-layout">
               <div class="detail-card">
@@ -523,11 +522,11 @@ function operatorText(f: AssetFlow): string {
                 </div>
                 <div class="info-grid info-grid-1">
                   <div class="info-item">
-                    <span class="il">资产名称</span>
+                    <span class="il">产品名称</span>
                     <span class="iv">{{ asset.name }}</span>
                   </div>
                   <div class="info-item">
-                    <span class="il">资产编号</span>
+                    <span class="il">产品编号</span>
                     <span class="iv">{{ asset.code }}</span>
                   </div>
                   <div class="info-item">
@@ -535,7 +534,7 @@ function operatorText(f: AssetFlow): string {
                     <span class="iv">{{ boardLabel(asset.board) }}</span>
                   </div>
                   <div class="info-item">
-                    <span class="il">资产类型</span>
+                    <span class="il">产品类型</span>
                     <span class="iv">{{ asset.type }}</span>
                   </div>
                   <div class="info-item">
@@ -555,11 +554,11 @@ function operatorText(f: AssetFlow): string {
 
               <div class="detail-card">
                 <div class="card-head">
-                  <div class="card-title">库存与归属</div>
+                  <div class="card-title">数量与归属</div>
                 </div>
                 <div class="info-grid info-grid-1">
                   <div class="info-item">
-                    <span class="il">资产总数</span>
+                    <span class="il">产品总数</span>
                     <span class="iv">{{ formatAssetQty(asset, asset.quantity) }} {{ asset.unit }}</span>
                   </div>
                   <div class="info-item">
@@ -568,14 +567,14 @@ function operatorText(f: AssetFlow): string {
                   </div>
                   <div class="info-item">
                     <span class="il">销售单价</span>
-                    <!-- ADR-008：包量定价资产单价为参考口径（元/万Token），不参与计价 -->
+                    <!-- ADR-008：包量定价产品单价为参考口径（元/万Token），不参与计价 -->
                     <span v-if="isAmountMode(asset)" class="iv">
-                      {{ asset.salePrice ? `约 ¥${asset.salePrice}/万Token（参考）` : '-' }}
+                      {{ asset.salePrice ? `¥${asset.salePrice}/万Token（参考）` : '-' }}
                     </span>
                     <span v-else class="iv">{{ asset.salePrice ? formatMoney(asset.salePrice) : '-' }}<template v-if="asset.repeatSale"> / {{ asset.unit }}</template></span>
                   </div>
                   <div class="info-item">
-                    <span class="il">入库时间</span>
+                    <span class="il">登记时间</span>
                     <span class="iv">{{ asset.inboundDate || '-' }}</span>
                   </div>
                   <div class="info-item">
@@ -589,13 +588,13 @@ function operatorText(f: AssetFlow): string {
                 </div>
                 <div class="info-bar soft" style="margin-top: 12px;">
                   <el-icon aria-hidden="true"><InfoFilled /></el-icon>
-                  <span>资产基础信息登记入库后生成；修改关键字段将记录操作日志。</span>
+                  <span>产品基础信息登记后生成；修改关键字段将记录操作日志。</span>
                 </div>
               </div>
             </div>
           </el-tab-pane>
 
-          <!-- 1.5 可售明细（ADR-011：仅遥感数据父资产显示；CRUD 明细） -->
+          <!-- 1.5 可售明细（ADR-011：仅遥感数据父产品显示；CRUD 明细） -->
           <el-tab-pane v-if="asset.type === '遥感数据'" :label="`可售明细（${rsItems.length}）`" name="rsItems">
             <div class="detail-card">
               <div class="card-head">
@@ -671,7 +670,7 @@ function operatorText(f: AssetFlow): string {
                 <div>
                   <div class="s-label">标准交付物</div>
                   <div class="s-value">{{ delStats.total }}</div>
-                  <div class="s-sub">面向每套资产默认交付</div>
+                  <div class="s-sub">面向每套产品默认交付</div>
                 </div>
                 <el-icon class="s-icon" aria-hidden="true"><Tickets /></el-icon>
               </div>
@@ -698,7 +697,7 @@ function operatorText(f: AssetFlow): string {
                 <div class="card-head">
                   <div>
                     <div class="card-title">交付物清单</div>
-                    <div class="card-desc">交付包是资产的标准材料集合；项目交付时选择版本并生成交付记录。</div>
+                    <div class="card-desc">交付包是产品的标准材料集合；项目交付时选择版本并生成交付记录。</div>
                   </div>
                   <div class="dl-head-actions">
                     <el-select v-model="catFilter" placeholder="全部类型" clearable style="width: 130px;">
@@ -783,7 +782,7 @@ function operatorText(f: AssetFlow): string {
               <div class="card-head">
                 <div>
                   <div class="card-title">关联销售项目</div>
-                  <div class="card-desc">登记销售时按明细锁定库存或记录售卖；项目「交付完成」后自动扣减并生成出库记录。</div>
+                  <div class="card-desc">登记销售时按明细锁定数量或记录售卖；项目「交付完成」后自动扣减并生成交付记录。</div>
                 </div>
                 <span class="muted" style="font-size: 12px;">共 {{ salesLinks.length }} 条</span>
               </div>
@@ -821,7 +820,7 @@ function operatorText(f: AssetFlow): string {
               <div v-else class="empty-compact">
                 <el-icon class="empty-icon" aria-hidden="true"><Link /></el-icon>
                 <div class="empty-title">暂无销售关联</div>
-                <div class="empty-desc muted">登记销售项目后，关联资产会在这里显示，并自动更新锁定数量和销售金额。</div>
+                <div class="empty-desc muted">登记销售项目后，关联产品会在这里显示，并自动更新锁定数量和销售金额。</div>
                 <el-button v-if="!isWipBoard()" type="primary" size="small" @click="goRegisterSale">
                   登记销售
                 </el-button>
@@ -829,19 +828,19 @@ function operatorText(f: AssetFlow): string {
             </div>
           </el-tab-pane>
 
-          <!-- 4 出入库流水 -->
-          <el-tab-pane :label="`出入库流水（${flows.length}）`" name="flows">
+          <!-- 4 数量流水 -->
+          <el-tab-pane :label="`数量流水（${flows.length}）`" name="flows">
             <div class="detail-card">
               <div class="card-head">
                 <div>
-                  <div class="card-title">出入库流水</div>
-                  <div class="card-desc">入库、锁定、出库、调整与撤销均留痕，审计记录不可删除。</div>
+                  <div class="card-title">数量流水</div>
+                  <div class="card-desc">登记、锁定、交付、调整与撤销均留痕，审计记录不可删除。</div>
                 </div>
                 <el-radio-group v-model="flowFilter" size="small">
                   <el-radio-button value="all">全部流水</el-radio-button>
-                  <el-radio-button value="purchase_in">入库</el-radio-button>
+                  <el-radio-button value="purchase_in">登记</el-radio-button>
                   <el-radio-button value="project_lock">项目锁定</el-radio-button>
-                  <el-radio-button value="sale_out">销售出库</el-radio-button>
+                  <el-radio-button value="sale_out">销售交付</el-radio-button>
                   <el-radio-button value="adjust">调整记录</el-radio-button>
                 </el-radio-group>
               </div>
@@ -877,7 +876,7 @@ function operatorText(f: AssetFlow): string {
               <div class="card-head">
                 <div>
                   <div class="card-title">操作记录</div>
-                  <div class="card-desc">资产创建、状态变更、编辑与删除的审计留痕，不提供编辑或删除。</div>
+                  <div class="card-desc">产品创建、状态变更、编辑与删除的审计留痕，不提供编辑或删除。</div>
                 </div>
                 <span class="muted" style="font-size: 12px;">共 {{ opLogs.length }} 条</span>
               </div>
@@ -1062,9 +1061,9 @@ function operatorText(f: AssetFlow): string {
       </el-dialog>
     </template>
 
-    <!-- 未找到资产：空态 + 返回列表（避免直达无效 URL 时白屏） -->
-    <el-empty v-else description="未找到该资产" :image-size="80">
-      <el-button type="primary" @click="router.push('/assets/embodied')">返回资产台账</el-button>
+    <!-- 未找到产品：空态 + 返回列表（避免直达无效 URL 时白屏） -->
+    <el-empty v-else description="未找到该产品" :image-size="80">
+      <el-button type="primary" @click="router.push('/assets/embodied')">返回产品台账</el-button>
     </el-empty>
   </div>
 </template>
@@ -1504,7 +1503,7 @@ function operatorText(f: AssetFlow): string {
   text-decoration: underline;
 }
 
-/* ============ 出入库流水时间线 ============ */
+/* ============ 数量流水时间线 ============ */
 .flow-list {
   display: flex;
   flex-direction: column;

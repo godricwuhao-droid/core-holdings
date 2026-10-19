@@ -2,7 +2,7 @@
 /**
  * 算力服务 - 建设中
  *
- * 展示 3 项算力服务器资产（只读），不可操作；后续启用时按完整资产页实现。
+ * 展示 3 项算力服务器产品（只读），不可操作；后续启用时按完整产品页实现。
  */
 import { computed } from 'vue'
 import { InfoFilled } from '@element-plus/icons-vue'
@@ -17,12 +17,12 @@ const list = computed<Asset[]>(() => db.assets.filter((a) => a.board === 'comput
     <!-- 页面头部 -->
     <div class="page-head">
       <div>
-        <div class="crumb">资产管理 / 算力服务</div>
+        <div class="crumb">产品及服务 / 算力服务</div>
         <h1>
           算力服务
           <el-tag type="warning" size="small" effect="plain">建设中</el-tag>
         </h1>
-        <div class="desc">算力服务器资产台账，按服务期管理可售额度，支持资源池与交付开通记录。</div>
+        <div class="desc">算力服务器产品台账，按服务期管理可售额度，支持资源池与交付开通记录。</div>
       </div>
     </div>
 
@@ -30,20 +30,20 @@ const list = computed<Asset[]>(() => db.assets.filter((a) => a.board === 'comput
     <div class="info-bar">
       <el-icon aria-hidden="true"><InfoFilled /></el-icon>
       <span>
-        算力服务板块功能建设中，当前仅展示已入库的算力服务器资产（只读，不可操作）。后续启用时将支持资源池管理、可售算力、服务期额度、已售额度与交付开通记录。
+        算力服务板块功能建设中，当前仅展示已登记的算力服务器产品（只读，不可操作）。后续启用时将支持资源池管理、可售算力、服务期额度、已售额度与交付开通记录。
       </span>
     </div>
 
     <!-- 表格卡 -->
     <el-card shadow="never">
       <div class="table-head">
-        <span class="t">算力服务器资产</span>
+        <span class="t">算力服务器产品</span>
         <span class="c">共 {{ list.length }} 条</span>
       </div>
 
       <el-table :data="list" border stripe>
-        <el-table-column prop="code" label="资产编号" min-width="120" align="left" />
-        <el-table-column label="资产名称" min-width="220">
+        <el-table-column prop="code" label="产品编号" min-width="120" align="left" />
+        <el-table-column label="产品名称" min-width="220">
           <template #default="{ row }">
             <div class="asset-name">{{ row.name }}</div>
             <div class="asset-spec muted">{{ row.spec }}</div>

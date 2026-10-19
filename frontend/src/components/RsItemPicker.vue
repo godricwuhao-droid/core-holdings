@@ -4,8 +4,8 @@
  *
  * el-tree 三级：省 → 精度（1.5m）→ 月份（2026-09 · ¥330,000.00），叶子 = 可售明细，
  * checkbox 多选（勾选父级 = 全选其下明细），叶子 label 带单价。
- * 用于：① 资产列表遥感数据行「加入购物车」（勾选 N 份 = N 行购物车）
- *      ② 资产详情「登记销售」（勾选后进 SalesOrderDialog，订单级客户 + N 行明细）
+ * 用于：① 产品列表遥感数据行「加入购物车」（勾选 N 份 = N 行购物车）
+ *      ② 产品详情「登记销售」（勾选后进 SalesOrderDialog，订单级客户 + N 行明细）
  * 树数据从 db.rsItems 按 parentAsset.id 过滤分组；无明细时 el-empty 空态 + confirm 禁用。
  */
 import { computed, ref, watch } from 'vue'
@@ -108,12 +108,12 @@ function onConfirm() {
     :close-on-click-modal="false"
     @update:model-value="(v: boolean) => emit('update:modelValue', v)"
   >
-    <!-- 空态：该父资产暂无明细 -->
+    <!-- 空态：该父产品暂无明细 -->
     <template v-if="!hasItems">
-      <el-empty description="该资产暂无可售明细" :image-size="80" />
+      <el-empty description="该产品暂无可售明细" :image-size="80" />
       <div class="info-bar">
         <el-icon aria-hidden="true"><InfoFilled /></el-icon>
-        <span>请先在资产详情「可售明细」页签维护 省/精度/月份 明细后再加购或登记销售。</span>
+        <span>请先在产品详情「可售明细」页签维护 省/精度/月份 明细后再加购或登记销售。</span>
       </div>
     </template>
 

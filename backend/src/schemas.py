@@ -7,7 +7,7 @@ class _ORM(BaseModel):
 
 
 # ============================================================
-# 资产
+# 产品
 # ============================================================
 class AssetOut(_ORM):
     id: int
@@ -61,7 +61,7 @@ class AssetInput(BaseModel):
     remark: str = ""
     # 注意：不含 pricingMode——计价模式由后端按类型权威决定（卫星Token → 'amount'）。
     # ADR-010 的 province/city/resolution/imageDate 入参已移除（ADR-011）：
-    # 遥感数据按普通父资产登记，售卖粒度走 POST /assets/{id}/rs-items 明细。
+    # 遥感数据按普通父产品登记，售卖粒度走 POST /assets/{id}/rs-items 明细。
     # 前端若仍多传这 4 个字段，Pydantic 默认忽略未知字段，不报错。
 
 
@@ -69,7 +69,7 @@ class AssetUpdate(BaseModel):
     """PUT /assets/{id} 入参（编辑为部分更新，全字段可选）。
 
     修复裸 dict 无校验问题：quantity 必须为非负整数、salePrice 非负，
-    非法类型/负数 422（此前裸 dict + setattr，负数/字符串可落库破坏库存口径）。
+    非法类型/负数 422（此前裸 dict + setattr，负数/字符串可落库破坏数量口径）。
     status 保留兼容（前端会传），服务层落库前由 auto_status 覆盖（两态自动判定）。
     """
     name: str | None = None
@@ -97,7 +97,32 @@ class StatusInput(BaseModel):
 
 
 # ============================================================
-# 遥感数据可售明细（ADR-011：父资产 + 明细两层模型）
+# 订单审核（ADR-012：生态人员下单 → 待审核 → 商务改价确认/驳回）
+# ============================================================
+class ReviewItemInput(BaseModel):
+    """行级改价入参：itemId = project_items.id。
+    unit 模式传 price（实际单价）；amount 模式传 amount（实际合同金额，整数元）；
+    遥感明细行（含 itemId 的销售明细）不接受改价 → 400。"""
+    itemId: int
+    price: float | None = None
+    amount: float | None = None
+
+
+class ReviewInput(BaseModel):
+    """POST /projects/{id}/review：action=confirm 确认下单（可带 items 改价）/ reject 驳回（reason 必填）"""
+    action: str  # confirm | reject
+    reason: str = ""
+    items: list[ReviewItemInput] = []
+
+
+class ClaimInput(BaseModel):
+    """POST /projects/{id}/claim（ADR-012 §5.1 纯移交制）：newOwner 空=接手给自己；
+    非空=转交给该账号（仅当前负责人或 admin 可传，目标须为启用的商务/管理员账号）。"""
+    newOwner: str = ""
+
+
+# ============================================================
+# 遥感数据可售明细（ADR-011：父产品 + 明细两层模型）
 # ============================================================
 class RsItemInput(BaseModel):
     """POST /assets/{assetId}/rs-items 与 PUT /rs-items/{id} 入参。
@@ -138,14 +163,14 @@ class ProjectItemInput(BaseModel):
     qty: int = Field(ge=0)
     price: float = Field(ge=0)  # 元
     # 计价分支（ADR-008）：
-    # - 资产 pricingMode='amount'：amount 为**权威输入**（整数元，>0，否则 400），
+    # - 产品 pricingMode='amount'：amount 为**权威输入**（整数元，>0，否则 400），
     #   后端跳过 price×qty 重算，price = round(amount/qty, 6) 仅作派生展示值；
     # - pricingMode='unit'：后端权威重算 amount = (Decimal(price) * qty).quantize(0.01)，不采信传入值。
     amount: float = Field(ge=0)
     deliveryReq: str = ""
     # 遥感数据明细（ADR-011，可选）：非空时本行售卖 rs_items 明细——
     # qty 强制 1（≠1 → 400），amount 后端权威 = 明细 price × 1（忽略前端传值），
-    # 明细 repeatSale=true → 不锁库存；false → 按父资产 lockedQty 逻辑（qty=1）
+    # 明细 repeatSale=true → 不锁数量；false → 按父产品 lockedQty 逻辑（qty=1）
     itemId: int | None = None
 
 
@@ -169,7 +194,7 @@ class ProjectItemOut(_ORM):
 class ContractInput(BaseModel):
     """合同入参（ADR-007）：POST /projects 的 contracts[] 元素。
 
-    合同内强制同一资产主体（后端校验，不一致 400）；contractAmount 可选，
+    合同内强制同一产品主体（后端校验，不一致 400）；contractAmount 可选，
     缺省由后端按明细 amount 合计重算（Decimal，元口径）。
     """
     customer: str  # 必填：合同客户
@@ -207,9 +232,9 @@ class ProjectInput(BaseModel):
     subject: str
     # 金额字段单位=元（ADR-006）；保持 float 接收，422 语义不变（ge=0）
     expectedAmount: float = Field(ge=0)
-    quoteAmount: float = Field(ge=0)
+    quoteAmount: float = Field(default=0, ge=0)  # 2026-10-19 废弃（不再填写/不写入），可选兼容存量调用
     contractAmount: float = Field(ge=0)
-    paidAmount: float = Field(ge=0)
+    paidAmount: float = Field(default=0, ge=0)  # 2026-10-19 废弃（不再填写/不写入），可选兼容存量调用
     expectedSignDate: str
     lastFollowDate: str
     remark: str
@@ -245,7 +270,7 @@ class ProjectOut(_ORM):
 
 
 # ============================================================
-# 出库
+# 交付
 # ============================================================
 class OutboundInput(BaseModel):
     projectId: int | None = None
@@ -264,7 +289,7 @@ class OutboundOut(_ORM):
     id: int
     code: str
     projectId: int | None = None
-    contractId: int | None = None  # 所属合同（ADR-007）；合同交付自动出库时非空
+    contractId: int | None = None  # 所属合同（ADR-007）；合同交付自动交付时非空
     projectName: str
     customer: str
     assetId: int
@@ -394,7 +419,7 @@ class CartItemOut(_ORM):
     assetId: int
     customer: str = ""  # 行级客户（ADR-007）；结算时按 customer 分组拆合同
     qty: int
-    # 包量计价合同金额（ADR-008，元，整数）：仅 amount 模式资产行非空；unit 模式恒 null
+    # 包量计价合同金额（ADR-008，元，整数）：仅 amount 模式产品行非空；unit 模式恒 null
     amount: float | None = None
     itemId: int | None = None  # 遥感数据明细（ADR-011）；含 itemId 行 qty 恒 1；存量/非遥感行为 null
     createdAt: str
@@ -405,7 +430,7 @@ class CartItemInput(BaseModel):
     assetId: int
     qty: int = Field(default=1, ge=0)
     customer: str = ""  # 行级客户（ADR-007）；(userId, assetId, customer) 相同才合并
-    # 包量计价合同金额（ADR-008，可选，元，整数）：amount 模式资产行结算前必填（缺失 400）；
+    # 包量计价合同金额（ADR-008，可选，元，整数）：amount 模式产品行结算前必填（缺失 400）；
     # unit 模式忽略（不采信、不落库）
     amount: float | None = None
     # 遥感数据明细（ADR-011，可选）：非空时校验明细存在且归属 assetId；qty 恒 1（≠1 → 400）；
@@ -454,7 +479,7 @@ class CheckoutInput(BaseModel):
 class SaleOrderItemInput(BaseModel):
     assetId: int
     qty: int = Field(default=1, ge=0)
-    # 包量计价合同金额（ADR-008，元，整数）：amount 模式资产必填（缺失/非整数 400）；unit 模式忽略
+    # 包量计价合同金额（ADR-008，元，整数）：amount 模式产品必填（缺失/非整数 400）；unit 模式忽略
     amount: float | None = None
     # 遥感数据明细（ADR-011，可选）：非空时 qty 强制 1（≠1 → 400），
     # amount 后端权威 = 明细 price × 1（忽略前端传值）
@@ -462,7 +487,7 @@ class SaleOrderItemInput(BaseModel):
 
 
 class SaleOrderInput(BaseModel):
-    """资产直接下单（单/多资产）：主体由资产带出，生成进行中销售项目（锁定库存）；交付由人工置"已完成"触发"""
+    """产品直接下单（单/多产品）：主体由产品带出，生成进行中销售项目（锁定数量）；交付由人工置"已完成"触发"""
     projectName: str
     customer: str
     rep: str = ""

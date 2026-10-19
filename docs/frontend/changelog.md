@@ -2,6 +2,418 @@
 
 > 记录 core-holdings 前端（Vue3 + TS + Element Plus + Vite）的页面/组件/接口封装变更。
 
+## 2026-10-20 ｜ 修复：列表「生态人员」列裸账号外露（显示名册缺生态账号）
+
+**根因**：账号→姓名映射用的 `/users/options` 只返回商务（editor/admin）账号（商务负责人下拉专用），生态 viewer 账号不在其中 → `repName` 查不到回退原值；且 10-19 起 rep 归一为 username，保存过的项目列值变账号后直接外露（老单存姓名所以看着"又变回账号了"）。
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 修改 | 4 个项目页显示映射（列表/编辑/审核/详情）数据源切到新接口 `allUserOptions`（全量启用账号，含生态）；连带修复**编辑页生态人员下拉选不到生态账号**（同源） | projects/index.vue, create.vue, review.vue, detail.vue, api/index.ts |
+| 2 | 修改 | 列表页「商务负责人筛选」下拉拆出 `ownerFilterOptions`（仍用商务专属接口，businessOwner 只可能是商务）；「生态人员筛选」下拉 label 改 `repName` 显示姓名（value 保持原值匹配） | projects/index.vue |
+| 3 | 保留 | TransferDialog（商务接手/转交选人）维持商务专属接口——订单不得转给生态 | components/TransferDialog.vue（未改） |
+
+### 验证
+
+- 接口实测：`/users/options/all` 含 3 个 viewer ✓；`/users/options` 仍仅商务 ✓；build 0 error、lint 0。
+
+## 2026-10-20 ｜ 新增：已终止项目「重新提交」（预填原单明细可改 → 新建 pending 订单）
+
+**关联任务**：用户要求被驳回的订单下单账号能再次编辑提交；审核中的订单可先撤销再编辑（撤销=已有的「取消订单」，本条打通撤销/驳回后的重提闭环）。拍板口径：**预填重新下单**（旧项目保留 terminated 历史，驳回原因可查）+ **明细可改**（产品/数量/客户）。
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 新增 | 入口：列表操作列 / 详情页头部对 terminated 项目显示「重新提交」（商务/管理员/下单生态本人）→ `create?copy=<id>` | projects/index.vue, detail.vue |
+| 2 | 新增 | 建单页「重新提交」模式（`?copy=`）：标题区分；预填原单全部合同（客户/产品/数量/金额/遥感明细行 itemId），均可修改；rep 生态静默本人、商务沿用原单；守卫（非 terminated/非本人单 → 拦截回详情） | projects/create.vue |
+| 3 | 修改 | 提交分支：copy 模式走 `resubmitProject`（新 API），成功提示新编号（待审核） | projects/create.vue, api/index.ts |
+| 4 | 修改 | 遥感明细行支持：payload/`ProjectItemInput` 携带 `itemId`；`onItemAssetChange` 对预填遥感行豁免「遥感不可手工加行」拦截 + 换产品时清空旧明细绑定；校验补「遥感行数量固定 1」 | projects/create.vue, api/index.ts |
+| 5 | 修改 | 路由守卫：viewer 仅 `create?copy=<id>` 放行（直连裸新建页仍拦截，新建入口移除策略不变）；页面内再校验归属/状态 | router/index.ts |
+| 6 | 修改 | 列表空态文案修正（原仍写「点击右上角新增销售项目」） | projects/index.vue |
+
+### 验证
+
+- `npm run build` 0 error；lint 0。
+- 冒烟（真实 API，已清理）：下单→驳回→生态重新提交（数量 2→3）→ 200 新单 pending、creator=下单人、双向备注留痕（新单「重新提交自 旧编号」、旧单「已重新提交为 新编号」）；生态重提他人单 403；pending 项目重提 400 ✓。
+
+## 2026-10-20 ｜ 修改：审核页遥感明细行放开金额编辑（仅本单生效）
+
+**关联任务**：用户要求资产容器（遥感明细）产品在审核时也可改金额。
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 修改 | 审核页 rs 行由只读 → 销售金额（整数元）可编辑，显示派生参考单价 + 「明细单价不回写」提示 | projects/review.vue |
+| 2 | 修改 | 确认下单校验/提交体纳入 rs 行（金额正整数元；改过的行一并提交 amount） | projects/review.vue |
+| 3 | 修改 | 面板/页头文案：「遥感明细行按明细单价计价不可改」→ 可改、仅本单生效 | projects/review.vue |
+
+后端配套：`review_project` confirm 对遥感明细行由 400 → 接受 `amount`（只改本行金额、price 派生反算，**不回写 rs_items 明细单价，不写平台挂牌价**）；changelog 见后端文档。
+
+### 验证
+
+- build 0 error；lint 0；py_compile 0。
+- 冒烟（真实 API，已清理）：遥感明细行审核改 330000→350000 → 200，本行生效、`rs_items.price` 不变、`assets.salePrice` 不变 ✓。
+
+## 2026-10-20 ｜ 修改：人员展示统一「只显示姓名」（用户更正：不要带账号）
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 修改 | 三处 `ownerLabel`（列表/编辑/审核页）由「姓名(账号)」改为**只显示姓名**（查不到/无姓名回退原值） | projects/index.vue, create.vue, review.vue |
+| 2 | 修改 | 列表「生态人员」列原显示裸账号 → 新增 `repName`（username→姓名，存量姓名格式兼容） | projects/index.vue |
+| 3 | 修改 | 详情页「生态人员/商务负责人」原显示裸账号 → 补 `userName` 映射显示姓名 | projects/detail.vue |
+| 4 | 保留 | 转交/接手**选人下拉**保留「姓名(账号)」——选择场景需区分同名，非展示字段 | components/TransferDialog.vue（未改） |
+
+### 验证
+
+- `npm run build` 0 error；lint 0。
+
+---
+
+## 2026-10-19 ｜ 修改：生态编辑/终止权限放开 + 订单审核独立页 + 编辑页布局优化（用户三项需求）
+
+**关联任务**：① 生态人员需可编辑自己项目 + 终止项目（非删除，记录留存，终止后不可编辑）；② 审核是独立页面（仅订单审核+备注两块），不是编辑页；③ 编辑页优化：生态人员显示姓名不显示账号、删金额信息卡、备注置底。
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 修改 | 生态（viewer）放开编辑自己下单的项目（pending/active 均可改基本信息；rep 锁本人、负责人只读）：`canEditForm` 按 creator 判定 | projects/create.vue |
+| 2 | 新增 | 编辑页底部「取消订单（终止）」/「终止项目」按钮（仅 viewer 自己单）→ `PATCH /projects/{id}/status terminated`（项目级批量终止，记录留存、不可再编辑） | projects/create.vue |
+| 3 | 新增 | **独立审核页** `/sales/projects/:id/review`（仅商务/管理员，viewer 路由守卫拦截）：仅「订单审核」（改价确认/驳回，自编辑页整体迁移）+「备注」（可编辑保存）两块；含无主单「接手此单」、非负责人只读提示、转交入口 | projects/review.vue（新文件）, router/index.ts |
+| 4 | 修改 | 编辑页删除内嵌订单审核面板与 确认下单/驳回/转交 按钮；删「金额信息（销售金额合计）」卡；备注卡移至销售记录清单之后（置底）；新增「审核订单」跳转按钮（商务/管理员+pending） | projects/create.vue |
+| 5 | 修改 | 生态人员下拉改为展示 **姓名(账号)**（原裸账号/姓名混杂），value=username 与下单口径一致；存量存姓名的 rep 自动归一为账号；商务负责人只读展示同步改 姓名(账号) | projects/create.vue |
+| 6 | 修改 | 入口调整：列表页/详情页 pending 项目「审核订单」→ 审核页；**viewer 自己 pending 单显示「编辑」（可点）**→ 编辑页（`canEditProject`/`goEdit` 加角色分支） | projects/index.vue, projects/detail.vue |
+| 7 | 修改 | `Project` 类型补 `creator?` 字段 | types.ts |
+
+### 验证
+
+- `npm run build` 0 error；lint 0。
+- 冒烟（真实 API，已清理）：viewer 下单→编辑自己 pending 200 → 终止自己 pending 200（项目/记录 terminated、**锁定释放**）；商务负责人项目级终止 pending → 400（必须走审核）✓。
+
+---
+
+## 2026-10-19 ｜ 修改：废弃「报价金额/已回款」字段 + 销售项目页 UI 重设计 demo（未改原页面）
+
+**关联任务**：用户确认编辑页「报价金额/已回款金额」无用，全部删除；并要求为详情页/编辑页出 UI 重设计单页 demo（先不动原页面）。
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 修改 | 删除「报价金额/已回款金额」输入（编辑模式金额区 + 新建模式金额区）、「未回款」派生卡与 `editUnpaid` computed、form 字段/提交体/预填；金额区仅保留「销售金额合计」派生卡 | projects/create.vue |
+| 2 | 修改 | 详情页删除「已回款」展示项 | projects/detail.vue |
+| 3 | 修改 | 类型定义两字段改可选（`quoteAmount?`/`paidAmount?`），兼容存量数据与旧调用 | api/index.ts, types.ts |
+| 4 | 新增 | **UI 重设计 demo**（单页 HTML，纯静态无依赖，顶部可切换详情页/编辑页视图）：现代 SaaS 风格（Linear/Stripe 式）——详情页 = 页头(名称+编号+状态+操作) → 4 统计卡 → 记录表主列 + 基本信息/备注侧栏；编辑页 = 双栏（左表单右金额+记录速览）+ 底部粘性操作条。mock 数据取自用户截图 | **public/sales-project-demo.html**（新文件，访问 `http://<host>:5173/sales-project-demo.html`，**原页面零改动**） |
+
+后端配套：`ProjectInput.quoteAmount/paidAmount` 改可选（default 0，兼容不传）；`update_project` 白名单移除两字段（不再写入，存量值保留）。
+
+### 验证
+
+- `npm run build` 0 error；py_compile 0；lint 0；views 下两字段零残留引用。
+- 冒烟：建单带旧字段 200（兼容）；PUT 不传两字段 → 存量值不被覆盖 ✓。
+- demo 经 vite dev server 200 可访问。
+
+---
+
+## 2026-10-19 ｜ 修改：移除「新增销售项目」入口 + 项目编号列对齐优化（用户指示）
+
+**关联任务**：用户标注销售项目列表截图：① 编号列折 3 行不美观、项目名称占宽过长；② 删除「新增销售项目」入口（要求先评估）。
+
+**评估结论（已采纳）**：可安全移除——下单统一走产品下单（购物车/直接下单）；手动建单页**保留路由与 API**（直连 URL 可进，供代录/数据修复等特殊场景），仅删 UI 按钮；存量数据与既有入口零影响。
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 修改 | 列表页移除「新增销售项目」按钮（含 head-actions 包裹与 `Plus` import 清理）；手动建单页路由保留 | projects/index.vue |
+| 2 | 修改 | **顺带发现的隐藏入口**：产品详情页「登记销售」原对商务/管理员跳手动建单页（带 assetId 预填）——改为直接打开下单对话框（与产品列表直接下单、viewer/遥感明细行为统一）；`isViewer` import 清理 | assets/detail.vue |
+| 3 | 修改 | 项目编号列：width 110 → 185 + mono 等宽 12px + 不换行 + overflow tooltip（原 20 字符编号折 3 行）；项目名称列 min-width 200 → 150（超长省略+tooltip 原有） | projects/index.vue |
+| 4 | 修改 | 列表提示条同步新规则（原「生态人员购物车下单后进入待审核」→「下单（购物车/直接下单）统一进入待审核…商务接手后确认或驳回」） | projects/index.vue |
+
+### 验证
+
+- `npm run build` 0 error；lint 0；无残留引用（Plus/isViewer import 已清）。
+
+---
+
+## 2026-10-19 ｜ 修改：下单对话框 UI 优化——删除「生态人员/商务负责人」填写项 + 结算预览三列对齐
+
+**关联任务**：用户标注购物车下单弹窗截图要求优化（① 预览行排列不齐 ② 删除两个人员填写字段）。
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 修改 | 下单对话框（购物车 + 直接下单共用）删除「生态人员」下拉与「商务负责人」输入框：rep 静默取**当前登录账号姓名**（原 viewer 自动本人行为推广到全角色，保证「自己下单」归属口径）；商务负责人**下单入口不再指定**——统一由下单后「接手」流程绑定（ADR-012 §5.1 纯移交制），恒空提交（后端 `_validate_business_owner` 校验保留兜底，空值跳过） | components/SalesOrderDialog.vue |
+| 2 | 修改 | 结算预览区改三列 grid 对齐（客户名弹性+超长省略+title 提示 / 数量右对齐 64px / 金额右对齐 150px 等宽数字）——原 flex 流式排列因客户名长短不一列错位 | components/SalesOrderDialog.vue |
+| 3 | 清理 | `reps` computed、`db`/`isViewer` import 无引用删除 | components/SalesOrderDialog.vue |
+
+**范围说明**：仅下单类入口（购物车结算、直接下单）删除；手动建单页（`sales/projects/create.vue` 新建）的「生态人员/商务负责人」保留——商务代录订单场景 rep 可能指向真实生态人员，语义不同。
+
+### 验证
+
+- `npm run build` 0 error；lint 0。
+- 冒烟（真实 API，测试数据已清理）：购物车/直接下单按新 payload（rep=本人姓名、businessOwner 空）→ 200，项目 rep 正确、owner 空、status pending ✓。
+
+---
+
+## 2026-10-19 ｜ 排查修复：viewer 编辑不可用 + admin 无主单无接手入口 + terminated 直连漏拦 + 死代码清理（子 Agent 前后端一致性排查）
+
+**关联任务**：配合后端排查（见后端 changelog 同日条目），前端对照规则基线逐按钮排查，修复 3 处确定问题 + 清理 2 处死代码 + 2 处文案小修。
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 修复 | **viewer 自己 active 单可编辑**：`canEditForm` 原 `!canWrite → false` 使 viewer 全字段禁用 + 「保存修改」恒禁用，但列表/详情入口与后端 PUT 守卫均允许 viewer 编辑自己单——三方口径不一致。改 `!canWrite && !isViewer → false`，「保存修改」按钮/tooltip 改用 `canEditForm`（viewer 的 pending 自己单仍只读） | projects/create.vue |
+| 2 | 修复 | **admin 无主单可接手**：TransferDialog「接手给我」选项原要求 `project.businessOwner` 非空——admin 在编辑页对无主单只能转给别人不能接手。去掉该条件；编辑页底部按钮文案改 `businessOwner ? '转交' : '接手'` | TransferDialog.vue, create.vue |
+| 3 | 修复 | **terminated 直连 URL 漏拦**：onMounted 守卫只拦 delivered 与无合同非 active——有合同且派生 terminated 的项目可绕过进表单（提交才 400）。补 `p.status === 'terminated'` 守卫，与列表 `canEditProject` 同口径 | create.vue |
+| 4 | 清理 | **死代码**：审核面板 alert 内「接手此单/转交给我」按钮与底部操作区同按钮均不可达（pending+非负责人已被 noEditAccess 提示页拦截）→ 删除；`claimLabel` computed 无引用删除；**noEditAccess 提示页新增接手按钮**（无主单商务「接手此单」/有主单 admin「接手给我（管理员）」，接手成功后 canReviewEdit 翻转、表单原地渲染） | create.vue |
+| 5 | 修复 | viewer 小修：pending 入口禁用 tooltip 对 viewer 改「待审核项目由商务人员接手确认后生效」（viewer 不能接手，原「请先接手」误导）；`canClaimRow` 对 viewer 直接不渲染接手/转交按钮（原无主单灰显/有主单不显示口径不一） | projects/index.vue, detail.vue |
+
+### 验证
+
+- `npm run build` 0 error；lint 0；后端冒烟（viewer PUT 自己 active 单 200 等）全通过。
+- 架构性限制记录在案：跨账号状态实时性（A 转交后 B 已打开页面不自动翻转，点击由后端 400 兜底）——如需实时需轮询/推送，属产品决策。
+
+---
+
+## 2026-10-19 ｜ 修改：所有角色建单统一进「待审核」的文案同步（配合后端 ADR-012 修订）
+
+**关联任务**：后端建单入口统一 pending（见后端 changelog 同日条目）。前端仅文案/提示调整，状态展示逻辑（tag/筛选/入口按钮）零改动。
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 修改 | 购物车结算成功提示去角色分叉：统一「销售项目 X 待审核（数量已锁定 · N 份销售记录），商务接手确认后生效」 | cart/index.vue |
+| 2 | 修改 | 直接下单成功提示（产品列表/产品详情两处）：「（进行中）」→「待审核，商务接手确认后生效」 | assets/list.vue, assets/detail.vue |
+| 3 | 修改 | 购物车说明区：「生成进行中销售项目」→「进入待审核…商务接手确认（可改价）后生效」；手动建单「保存草稿」成功提示与注释 →「待审核」 | cart/index.vue, sales/projects/create.vue |
+
+### 验证
+
+- `npm run build` 0 error；lint 0。冒烟见后端 changelog（全角色建单 → pending 全链路通过）。
+
+---
+
+## 2026-10-19 ｜ 修复：驳回按钮幽灵显示 bug + pending 编辑入口禁止态（ADR-012 §5.1 入口权限收敛）
+
+**关联任务**：用户实测「转交后 wuhao 仍能进编辑页做驳回操作；转交/未接手的单应只读，编辑按钮应是禁止符号不能进入」。
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 修复 | **「驳回」按钮 v-else 误绑定 bug**：原 `v-else` 挂在「接手/转交」按钮条件上 → 非负责人的普通商务也显示「驳回」（点击才被后端 400）。改为独立 `v-if="canReviewEdit"`，驳回/确认仅负责人（或 admin）可见 | projects/create.vue |
+| 2 | 修改 | **列表 pending 入口按钮禁止态**：`canEditProject` 加 pending 门槛（仅 owner/admin）；按钮文案 pending→「审核订单」（warning 橙），无权限者禁用 + tooltip「仅商务负责人（或管理员）可进入，请先接手」；删除旧的独立「审核订单」按钮（与新按钮重叠） | projects/index.vue |
+| 3 | 修改 | 详情页顶栏：pending 无权限者由「隐藏按钮」改为**禁用**「审核订单」（tooltip 说明） | projects/detail.vue |
+| 4 | 新增 | **编辑页直连 URL 拦截**：`noEditAccess`（isEdit && pending && canWrite && !canReviewEdit）→ 只读提示页（el-alert「该订单由商务 X 负责，你暂无编辑/审核权限」+ 返回列表），不渲染表单；viewer 自己单只读视图与 admin 越过不受影响 | projects/create.vue |
+
+### 验证
+
+- `npm run build` 0 error；lint 0。后端守卫（review 仅负责人/admin、PUT pending 守卫）不变，UI 与后端口径已完全对齐。
+
+---
+
+## 2026-10-19 ｜ 修复：编辑页 pending 项目非负责人可编辑 + 幽灵「转交」按钮（配合后端越权修复）
+
+**关联任务**：wuhao 转交给 wuhao2 后 wuhao 仍能看到转交按钮且表单可编辑。根因见后端 changelog 同日条目。
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 修复 | **`canEditForm`**（canWrite && !(pending 且非负责人)）：pending 项目对非负责人禁用基本信息全部输入（名称/生态人员/日期×2/报价/回款/备注）+「保存基本信息」按钮（tooltip「待审核项目仅商务负责人（或管理员）可编辑基本信息」）；active 项目商务均可编辑（原规则不变） | projects/create.vue |
+| 2 | 修复 | 「商务负责人」输入框 → **只读展示**（绑定 `editProject.businessOwner`，变更入口=接手/转交） | projects/create.vue |
+| 3 | 修复 | 底部操作区「接手此单/转交」按钮补条件 `(!businessOwner \|\| isAdmin)`：他人单据的普通商务不再显示（原显示、点击被后端 400） | projects/create.vue |
+
+### 验证
+
+- `npm run build` 0 error；lint 0；后端 4 场景冒烟通过（见后端 changelog）。
+
+---
+
+## 2026-10-19 ｜ 修改：转交语义修正为**纯移交制**前端（TransferDialog 下拉选人）
+
+**关联任务**：配合后端 claim 纯移交制（见后端 changelog 同日条目）。原「他人单据→转交给我（抢单）」按钮废除；改为「负责人→转交（下拉选新负责人）」。
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 新增 | **`TransferDialog` 组件**：下拉选新负责人（`GET /users/options` 现取，排除当前负责人）；admin 额外选项「接手给我」；确认 → `claimProject(id, newOwner)` | components/TransferDialog.vue |
+| 2 | 修改 | **按钮逻辑三处统一**（列表行/详情页顶栏/编辑页审核面板）：无主→「接手」（确认框直接接）；自己负责→「转交」（弹 TransferDialog）；他人负责→**仅 admin** 见「转交」（含「接手给我」），普通商务不显示按钮 | projects/index.vue, detail.vue, create.vue |
+| 3 | 修改 | 编辑页审核面板：负责人/admin 在「确认下单/驳回」旁新增「转交」按钮；非可审核者 alert 区——无主单「接手此单」、他人单仅 admin「转交」 | create.vue |
+| 4 | 修改 | `claimProject(id, newOwner='')` API 加参数（POST body `{newOwner}`） | api/index.ts |
+
+### 验证
+
+- `npm run build` 0 error；后端 9 场景冒烟通过（抢单拦截/负责人转交/admin 越过等，见后端 changelog）。
+
+---
+
+## 2026-10-19 ｜ 修改：「审核订单」按钮仅接手人可见（ADR-012 §5.1 增补）
+
+**关联任务**：用户反馈——pending 项目未接手前商务也能看到「审核订单」按钮（点进去被拦截），易困惑。改为：仅接手人（或 admin 越过）展示，未接手/他人接手时隐藏；详情页补「接手/转交」按钮作接单入口。
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 修改 | 「审核订单」按钮显隐条件 `canWrite` → **`canReviewRow/canReview`**（canWrite && businessOwner 非空 && (isAdmin \|\| businessOwner===当前账号)）：列表行、抽屉底部、详情页顶栏、详情页记录卡四处统一 | projects/index.vue, detail.vue |
+| 2 | 新增 | 详情页顶部「接手/转交」按钮（canWrite 且 pending/active 且非本人负责）+ `handleClaim`（确认弹框 → `claimProject` → refresh），补上「审核订单」隐藏后的接单入口 | detail.vue |
+| 3 | 不变 | 直接打开编辑 URL 的兜底：审核面板内「接手此单/转交给我」按钮与后端 400 守卫保留 | - |
+
+### 验证
+
+- `npm run build` 0 error（修 1 处 v-else-if 类型收窄 TS2367）；lint 0。
+
+---
+
+## 2026-10-19 ｜ 修改：ADR-013 销售记录前端（「合同」→「销售记录」全量文案 + 多主体提示更新）
+
+**关联任务**：配合后端一资产一记录/多主体改造（见后端 changelog 同日条目 + `docs/adr/ADR-013.md`）。代码标识（`Contract`/`contractAmount`/`/contracts/` API）全部不变。
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 修改 | **全量界面文案**（模板区 + 字符串字面量，代码注释保留）：「合同」→「销售记录」、「合同金额」→「销售金额」、「合同状态」→「销售记录状态」、「合同清单」→「销售记录清单」、「合同合计」→「销售金额合计」、「交付合同」→「交付」；列表列「关联合同」→「销售记录」、「合同金额」列→「销售金额」；抽屉/详情/审核面板/购物车/交付记录/直接下单对话框/产品页全部同步 | projects/index.vue, create.vue, detail.vue, cart/index.vue, outbound/index.vue, SalesOrderDialog.vue, assets/*.vue |
+| 2 | 修改 | **过时规则文案更新**（ADR-013 废除同主体限制）：购物车说明改「每个产品生成一条销售记录（不同主体的产品可同单混装）」；直接下单对话框「结算时每个产品生成一条销售记录」；手动建单说明改「可含不同主体的产品明细」 | cart/index.vue, SalesOrderDialog.vue, create.vue |
+| 3 | 不变 | 多主体展示沿用既有 `__multi__` 分支（直接下单对话框「所属主体：多主体」tag）；状态 tag/筛选/审核面板逻辑零改动（记录粒度变化对前端透明——contracts 数组只是更细了） | - |
+
+### 验证
+
+- `npm run build` 0 error；lint 0；替换后残留「合同」仅剩 script/style 注释（2 处，保留）。
+
+---
+
+## 2026-10-19 ｜ 新增：ADR-012 §5.1 商务接手机制前端（接手/转交 + 商务负责人列与筛选）
+
+**关联任务**：配合后端 claim 接口与 review 接手人守卫（见后端 changelog 同日条目 + `docs/adr/ADR-012.md` §5.1）。
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 新增 | **API 封装**：`claimProject(id)`（接手/转交）、`userOptions()`（商务账号选项）+ `UserOption` 类型 | `src/api/index.ts` |
+| 2 | 新增 | **项目列表**：① 「商务负责人」列（username→name(username) 映射，空显示「未指派」）；② 筛选下拉（商务账号 + 「未指派/历史数据」档，businessOwner 账号关联查询）；③ 行操作：pending/active 且非自己负责 → 「接手」（success 绿）/「转交」（info 灰），二次确认后调 claim 并刷新；生态人员按钮禁用（tooltip 提示）；④ 抽屉商务负责人展示同步映射 | `src/views/sales/projects/index.vue` |
+| 3 | 修改 | **编辑页审核面板**：按接手人控权——`canReviewEdit = canWrite && (isAdmin \|\| businessOwner === 当前 username)`；非接手人面板顶部橙色 alert + 「接手此单/转交给我」按钮，单价/金额输入禁用，底部「确认下单/驳回」隐藏改为接手按钮；接手成功后 db 镜像刷新，按钮自动翻转为可编辑态 | `src/views/sales/projects/create.vue` |
+
+### 验证
+
+- `npm run build` 0 error；lint 0；接手机制全链路冒烟见后端 changelog 同日条目。
+
+---
+
+## 2026-10-19 ｜ 新增：ADR-012 生态人员下单「待审核」前端配套（状态 tag / 审核面板 / 免填金额）
+
+**关联任务**：配合后端 pending 状态机与 `POST /projects/{id}/review`（见后端 changelog 同日条目 + `docs/adr/ADR-012.md`）。
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 新增 | **待审核状态**：`ProjectStatus` 联合类型 + `PROJECT_STATUS` 标签映射加 `pending = 待审核`（warning 橙）——列表 tag、筛选下拉（PROJECT_STATUS 遍历自动生成）、抽屉/详情合同 tag 全部自动生效 | `src/types.ts` |
+| 2 | 新增 | **订单审核 API 封装** `reviewProject(id, {action, reason?, items?})`（confirm 带行级改价 / reject 带原因） | `src/api/index.ts` |
+| 3 | 新增 | **项目列表审核入口**：操作列与快览抽屉底部对 pending 项目显示「审核订单」（仅商务/管理员，warning 色，跳编辑页）；生态人员仅见「待审核」tag；页头流程说明补充待审核环节 | `src/views/sales/projects/index.vue` |
+| 4 | 新增 | **编辑页审核面板**（编辑态 + `pending` + canWrite 时替代只读合同清单）：按合同分区，行级控件随计价模式切换——unit 行「实际单价」输入（金额实时派生）、amount 行「合同金额（整数元）」输入（参考单价≈反算展示）、遥感明细行只读带提示；合同合计/项目总金额实时重算；底部「确认下单」（校验+二次确认+仅传改过的行）/「驳回」（原因必填 prompt）/「保存基本信息」；成功后跳详情页。生态人员视角：只读合同清单 + 橙色 alert「已提交商务确认」 | `src/views/sales/projects/create.vue` |
+| 5 | 修改 | **项目详情页适配**：头部「编辑」按钮 pending 时变「审核订单」（warning 色）；合同卡 pending 分支——商务显示「审核订单」按钮、生态人员显示「待审核（等商务确认）」，不提供交付/终止快捷（后端对 pending 一律 400）；合同区说明补充待审核派生规则 | `src/views/sales/projects/detail.vue` |
+| 6 | 修改 | **购物车生态人员免填金额**：amount 模式行金额输入对 viewer 放开必填（占位符「整数元（可留空）」、tooltip「留空按 挂牌价×数量 计价，商务确认订单时可再调整」、空值不再标红）；小计/下单预览金额留空时按挂牌价×数量取整占位（与后端回退口径一致）；结算成功提示 viewer 专属「已提交商务确认（数量已锁定）」；商务金额必填规则不变 | `src/views/cart/index.vue` |
+
+### 验证
+
+- `npm run build` 0 error；lint 0；后端全链路冒烟见后端 changelog 同日条目。
+
+---
+
+## 2026-10-19 ｜ 修改：撤销交付提示体现合同联动（配合后端状态回滚修复）
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 修改 | 交付记录页「撤销交付」：确认弹窗关联合同的记录提示「并把关联合同回退到「进行中」（明细重新锁定，可再次交付）」；成功提示按 `contractId` 区分「已撤销：产品数量已回退，关联合同已回退「进行中」」/「已撤销并生成调整流水」。撤销后 bootstrap 刷新，销售项目详情状态同步恢复「进行中」 | `src/views/sales/outbound/index.vue` |
+
+### 验证
+
+- `npm run build` 0 error；lint 0（后端联动逻辑冒烟见后端 changelog 同日条目）。
+
+---
+
+## 2026-10-19 ｜ 修复：全局主按钮样式覆盖误伤 plain 按钮（文字不可见）
+
+**关联任务**：项目抽屉「查看详情」按钮渲染成空白蓝块的根因修复。
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 修复 | 全局 `.el-button--primary` 实心蓝覆盖**未排除 `is-plain`**，导致 `type="primary" plain` 按钮被刷成实心蓝底，而 plain 文字色仍是主题蓝（蓝底蓝字不可见，典型现场：销售项目抽屉「查看详情」按钮显示为空白蓝块）。两条规则（默认/hover）均补上 `:not(.is-plain):not(.is-text):not(.is-link)` 排除，plain/text/link 恢复 Element 默认渲染 | `src/styles/global.css` |
+
+### 验证
+
+- 全平台 `type="primary" plain` 按钮仅此 1 处（修复目标本身）；`npm run build` 0 error。
+
+---
+
+## 2026-10-19 ｜ 修改：销售项目四项优化（抽屉状态变更 / 编辑页重构 / 交付记录列调整）
+
+**关联任务**：销售项目页功能优化（用户指定 4 点）。编号时间戳方案见后端 changelog 同日条目。
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 新增 | **项目快览抽屉状态变更**：底部操作区新增「交付 / 终止」——商务/管理员双按钮（走项目级批量快捷 `PATCH /projects/{id}/status`，对全部进行中合同批量执行，确认弹窗说明影响范围）；生态人员仅「终止」（限自己项目，后端校验归属）。展示条件：名下有进行中合同且项目未终止 | `src/views/sales/projects/index.vue` |
+| 2 | 修改 | **抽屉不展示合同编号**：合同行首的 HT 编号移除，保留 客户 + 主体/状态 tag + 金额 | `src/views/sales/projects/index.vue` |
+| 3 | 修改 | **编辑页重构**（编辑/新建分流为两套模板）：编辑态进入即预填全部已有数据（基本信息/日期/金额/备注，onMounted 从 db 镜像）；布局 = ① 基本信息（名称/生态人员/商务负责人/两个日期，2 列网格）② **金额信息 4 卡**（报价金额/已回款可编辑 + 合同合计/未回款派生只读，统一浅底卡片、无步进按钮）③ 备注 ④ 合同清单（**只读概览**：客户+主体/状态 tag+合同金额，明细逐行 名称×数量 金额）；viewer 的 rep 仍只读 | `src/views/sales/projects/create.vue` |
+| 4 | 修改 | **交付记录页**：移除「交付单号」列（搜索/占位符同步去掉单号）；「关联合同」列改 **客户-产品主体** 命名（如「客户A-安徽天枢智算人工智能科技有限公司」，tooltip 完整展示，纯文本不跳转） | `src/views/sales/outbound/index.vue` |
+| 5 | 新增 | API 封装：`changeProjectStatus(id, status, reason)`（项目级批量状态快捷，抽屉用） | `src/api/index.ts` |
+
+### 验证
+
+- `npm run build` 0 error；lint 0；
+- 冒烟：新建 2 客户项目 → 同秒生成 `SP-2026101915432005` + `HT-...21`/`HT-...86`（随机位防碰撞生效）；测试数据已清理。
+
+---
+
+## 2026-10-19 ｜ 修改：板块名精简（去掉"产品及服务"后缀）+ 清除「入库/出库」字样（纯文案，无逻辑变更）
+
+**关联任务**：① 菜单及页面板块名按用户口径精简；② 平台不出现「入库/出库」仓储类字样（映射：入库→登记、出库→交付，与既有「登记产品」「交付」口径一致）。
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 修改 | **板块名精简**（types.ts BOARDS 标签为单一事实源，菜单/面包屑/页面标题/筛选下拉自动同步）：具身智能产品及服务→具身智能、卫星产品及服务→卫星服务、软件产品及服务→软件产品、算力产品及服务→算力服务（硬件产品不变）；菜单组标题「产品及服务」保留 | `src/types.ts`, `src/layouts/MainLayout.vue`, `src/views/assets/compute.vue` |
+| 2 | 修改 | **入库→登记**：概览列头「入库数量」→「总数量」；「入库合计」→「总数量」；「入库时间/日期/月份」→「登记时间/日期/月份」；「入库登记」→「登记」；「补入库/补充入库」→「补登记/补充登记」；「按原始个数入库」→「按原始个数登记」；「核入入库后登记」→「核入后登记」；「登记入库后生成」→「登记后生成」；流水类型 purchase_in 标签「入库」→「登记」；各板块 desc/rule 描述同步（embodied「登记、数量与销售追踪统一台账」「按套登记与销售」、hardware「核入后登记」） | `src/views/dashboard/index.vue`, `src/views/assets/*`, `src/views/cart/index.vue`, `src/views/settings/base.vue`, `src/types.ts` |
+| 3 | 修改 | **出库→交付**：菜单/面包屑/页头「出库记录/销售出库记录」→「交付记录/销售交付记录」；「已出库」→「已交付」（概览列头/详情抽屉）；「序列号出库管理」→「序列号交付管理」；「生成/撤销出库记录」→「生成/撤销交付记录」（销售项目列表/详情、产品详情说明、购物车说明「执行『交付』即生成交付记录」）；补录对话框「出库性质/类型/日期/明细/单号」→「交付…」；流水类型 sale_out 标签「销售出库」→「销售交付」；「出入库流水」页签 → 「数量流水」；「已完成出库」→「已完成交付」 | `src/layouts/MainLayout.vue`, `src/views/sales/outbound/index.vue`, `src/views/sales/projects/*`, `src/views/assets/detail.vue`, `src/views/cart/index.vue`, `src/views/settings/users.vue`（日志筛选「出库」→「交付」）, `src/types.ts`, `src/constants.ts` |
+| 4 | 不变 | 路由路径（/sales/outbound）、英文枚举（purchase_in/sale_out/shipped）、CK- 单号前缀、代码字段（shippedQty/inboundDate）均不变；仅用户可见文案 | - |
+
+### 验证
+
+- `grep -rn "入库\|出库\|具身智能产品及服务\|卫星产品及服务\|软件产品及服务\|算力产品及服务" frontend/src` 残留 **0**；
+- `npm run build` 0 error；lint 0；后端 `py_compile` 通过、`/api/health` ok。
+
+---
+
+## 2026-10-19 ｜ 修改：全平台「资产/库存」术语切换为对外视角「产品及服务」（纯文案，无逻辑变更）
+
+**关联任务**：对外产品平台视角调整——内部"资产"改为面向客户的"产品及服务"分类。
+执行依据：`docs/asset-inventory-rename-checklist-20261019.md`（2026-10-19 全盘检查清单）。
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 修改 | **板块（菜单/面包屑/下拉/标题）重命名**：具身智能→具身智能产品及服务、卫星服务→卫星产品及服务、软件库存→软件产品及服务、硬件库存→硬件产品、算力服务→算力产品及服务；菜单组「资产管理」→「产品及服务」 | `src/types.ts`, `src/layouts/MainLayout.vue` |
+| 2 | 修改 | **平台名**：「蜂云资产管理平台」→「蜂云产品及服务平台」（顶栏/登录页/index.html 标题） | `src/layouts/MainLayout.vue`, `src/views/login/index.vue`, `index.html` |
+| 3 | 修改 | **字段/列头/按钮/弹窗/提示全量替换**：资产→产品（产品名称/编号/类型/状态、资产台账→产品台账、登记/编辑/删除产品、关联产品、待关联产品、产品交付物设置、产品变更 等）；库存按语义映射：库存数量→可用数量、可售库存→可用数量、库存不足→可用数量不足、库存可售/暂无库存→可售/已售罄（状态 tag）、锁定库存→锁定数量、扣减库存→扣减数量、库存进度→数量进度、库存与归属→数量与归属、库存自动判定/限制→数量自动判定/限制 等；全量覆盖 登录/概览/产品列表/详情/创建/算力/购物车/销售项目（列表/创建/详情）/出库/基础设置（交付物/生态人员/账号与审计）/下单对话框/遥感明细选择器/常量 note（约 150 处用户可见文案） | `src/views/**`, `src/components/**`, `src/constants.ts`, `src/types.ts` |
+| 4 | 不变 | 仅文案替换：路由路径（`/assets/**`）、API 路径、字段名（assetId 等）、英文枚举值（in_stock/no_stock/asset_change）、代码注释口径同步（便于后续检索）均未改逻辑；「入库/出库」等动词语不属目标字样，保留 | - |
+
+### 验证
+
+- `grep -rn "资产\|库存" frontend/src index.html` 残留 **0**（含注释已同步）；
+- `npm run build`（vue-tsc + vite）0 error；lint 0。
+
+---
+
+## 2026-10-16 ｜ 修改：遥感数据「资产总数」改按「期」显示 + 卫星Token 单价去掉「约/≈」前缀
+
+**关联任务**：平台优化第三轮（纯展示文案微调，无逻辑变更）。
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 修改 | **资产列表「资产总数」列**：遥感数据（容器资产）行由「N 份明细」改为「N 期」（遥感明细按期售卖，quantity 对容器仍无意义） | `src/views/assets/list.vue` |
+| 2 | 修改 | **包量定价（amount 模式，卫星Token）单价展示去掉「约/≈」前缀**（数值与「元/万Token」单位保留）：a) 资产列表「销售单价」列 `≈¥x/万Token` → `¥x/万Token`；b) 资产列表快览抽屉「约 ¥x/万Token（参考）」→ `¥x/万Token（参考）`；c) 资产详情页同改；d) 购物车行单价同改；e) 派生参考单价 `derivedUnitPrice`（项目详情/编辑明细、下单对话框）`约 x.xxxx 元/万Token` → 直接数值 | `src/views/assets/list.vue`, `src/views/assets/detail.vue`, `src/views/cart/index.vue`, `src/types.ts` |
+
+### 验证
+
+- `npm run build`（vue-tsc + vite）0 error；
+- 全局检索 `约 ¥` / `≈` 无残留（`derivedUnitPrice` 内注释已同步更新）。
+
+---
+
+## 2026-10-16 ｜ 新增：资产列表「销售单价」列 + 销售项目对生态人员开放（可见性/权限收敛）
+
+**关联任务**：平台优化两项需求（1 资产列表加销售单价列；2 销售项目生态人员可见自己下单的）。可见性过滤在后端 bootstrap 完成，前端仅做路由/菜单/按钮权限收敛。
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 新增 | **资产列表「销售单价」列**（库存数量与状态之间）：定宽 120 + 居中 + `show-overflow-tooltip`（过长省略、hover 显示全文）。口径与抽屉一致：unit 模式 `formatMoney`（repeatSale 带 `/unit`）；amount 模式紧凑参考值「≈¥x/万Token」；遥感容器/无单价显示「-」 | `src/views/assets/list.vue` |
+| 2 | 修改 | **viewer 路由/菜单放开「销售项目」**：`viewerAllowedPath` 放行 `/sales/projects` + `/sales/projects/:id/(detail|edit)`（新建/出库仍禁）；侧边栏 viewer 区新增「销售项目」独立菜单项（销售管理整组仍不可见） | `src/router/index.ts`, `src/layouts/MainLayout.vue` |
+| 3 | 修改 | **项目列表页 viewer 收敛**：新增 `canEditRow = canWrite \|\| isViewer`（可见行均是自己项目）——「编辑」对 viewer 解禁（后端同校验归属+rep 保护）；「新增销售项目」「删除」仍禁用 + READONLY_TIP | `src/views/sales/projects/index.vue` |
+| 4 | 修改 | **项目详情页 viewer 收敛**：新增 `canOwn = canWrite \|\| isViewer`——「编辑」（active）与合同「终止」（active/delivered 撤销出库）对 viewer 解禁；「交付」保持仅商务/管理员（tooltip「交付需商务人员/管理员操作」）；越权 URL 访问 → 后端过滤后 el-empty「未找到该销售项目」 | `src/views/sales/projects/detail.vue` |
+| 5 | 修改 | **项目编辑页 viewer 收敛**：新建模式进入即拦截（warning + 回列表，「新建请通过下单入口」）；编辑模式项目不存在/非自己（镜像无此项目）→ warning + 回列表；「生态人员」选择器 viewer 只读（与后端 rep 忽略口径一致） | `src/views/sales/projects/create.vue` |
+| 6 | 修改 | **下单对话框 viewer rep 自动带自己 + 只读**：`reset()` 时 viewer 的 `form.rep` 锁定为当前用户姓名（选择器 disabled、不可清空，placeholder「本人」）；商务/管理员仍可代选。保证「自己下单」与 rep 口径一致 | `src/components/SalesOrderDialog.vue` |
+
+### 验证
+
+- `npm run build`（vue-tsc + vite）0 error；
+- 临时库冒烟（8020）：viewer 可见性/越权 403/rep 禁改/终止放行/交付拦截 全过（详见后端 changelog 同日条目「自测」）。
+
 ---
 
 ## 2026-10-16 ｜ 修复：业务逻辑 bug 2 项（金额口径 / 合同金额静默丢弃）+ cart/index.vue 存量类型错误

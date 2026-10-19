@@ -2,6 +2,323 @@
 
 > 记录 core-holdings 后端（FastAPI + SQLAlchemy + SQLite）的接口与行为变更。
 
+## 2026-10-20 ｜ 新增：GET /users/options/all 全量启用账号（含生态，仅供显示映射）
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 新增 | `GET /users/options/all`（`get_current_user`）：返回**全部启用账号**（admin/editor/viewer）——供项目页「账号 → 姓名」显示映射（生态 rep 列/编辑页生态人员下拉）；原 `/users/options`（仅商务）保持不动，继续供商务负责人筛选与接手/转交下拉（订单不得转给生态） | `src/routers/api.py` |
+
+**根因背景**：前端 4 个项目页的显示映射误用了商务专属 `/users/options`，生态账号查不到 → 列表「生态人员」列裸账号外露、编辑页生态人员下拉选不到人。
+
+### 验证
+
+- 实测：`/users/options/all` 返回 8 账号含 3 个 viewer（lshangkun 等）✓；`/users/options` 仍 5 个商务 ✓；`py_compile` 0。
+
+## 2026-10-20 ｜ 新增：POST /projects/{id}/resubmit 重新提交（旧单留痕 + 新建 pending 订单）
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 新增 | `POST /projects/{id}/resubmit`（`require_order`，生态/商务/管理员）：已终止项目（驳回/取消/终止）按**可修改的**明细（`ProjectInput` 原结构）复用 `_create_project_core` 新建 pending 项目（新编号、重新锁量、走完整接手审核流程），creator=当前账号；守卫：源项目须 `terminated`（400）、viewer 仅 `creator==自己`（403，`user_sees_project` 同口径） | `src/services.py`（`resubmit_project`）, `src/routers/api.py` |
+| 2 | 新增 | 双向留痕：新单 remark 前置「重新提交自 旧编号（旧名）」；旧单 remark 追加「已重新提交为 新编号（新名）」；写「重新提交」操作日志 | `src/services.py` |
+
+**设计口径（用户拍板）**：重提=预填重新下单，旧项目**不复活**（terminated 历史保留、驳回原因可查）；「已终止不可编辑」规则不变（编辑接口仍拒绝 terminated）。
+
+### 验证
+
+- 冒烟（真实 API，已清理）：下单→驳回→`resubmit`（改数量 2→3）→ 200 新单 pending、creator 正确、双向备注 ✓；viewer 重提他人单 403 ✓；pending 项目 resubmit 400 ✓；`py_compile` 0。
+
+## 2026-10-20 ｜ 修改：审核 confirm 放开遥感明细行改价（仅本行金额，不回写主数据）
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 修改 | `review_project` confirm：遥感明细行（`itemId` 非空）原一律 400 → 接受 `amount`（整数元）——只改**本行** `amount`，`price` 派生反算（元/份）展示；**不进 `price_changes_by_asset`**（不写 `assets.salePrice`）、不改 `rs_items.price`（明细单价属产品「可售明细」主数据，订单级改价不污染）；订单日志 diffs 带「产品名·省/市 精度 月份」描述 | `src/services.py` |
+
+### 验证
+
+- 冒烟（真实 API，已清理）：下单 2 遥感行 → 接手 → confirm 改 1 行 330000→350000 → 200；本行生效、`rs_items.price`/`assets.salePrice` 均不变、项目 active ✓；`py_compile` 0。
+
+---
+
+## 2026-10-19 ｜ 修改：生态可终止自己待审核订单（取消订单）+ 修复 pending 合同终止漏释放锁定
+
+**关联任务**：用户要求生态人员可终止项目（非删除、记录留存、终止后不可编辑）——其典型场景是取消自己刚下的待审核订单。
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 修改 | `change_project_status`：pending 守卫开例外——**下单生态人员（creator==自己）可终止自己的待审核订单**；商务/管理员对 pending 仍只能走订单审核接口（确认/驳回），不可绕过审核直接改状态 | `src/services.py` |
+| 2 | 修改 | 批量目标集合：pending 项目终止时 targets = pending 合同（原仅 active）；文案/日志同步 | `src/services.py` |
+| 3 | **修复** | `_change_contract_status_core` 终止分支原仅处理 active（释放锁定）/delivered（回退交付）——**pending 合同终止会漏释放锁定**（量永久占着）；改为 `from_status in ("active", "pending")` 均释放 | `src/services.py` |
+
+生态编辑自己项目（PUT）此前已放开（仅 rep 不可改），本轮前端 `canEditForm` 对齐。
+
+### 验证
+
+- 冒烟：viewer 编辑自己 pending 200；viewer 终止自己 pending → 项目/记录 terminated、**锁定释放（lockedQty=0）**；wuhao（负责人）项目级终止 pending → 400 ✓；`py_compile` 0。
+
+---
+
+## 2026-10-19 ｜ 修改：废弃「报价金额/已回款」字段（用户确认无用）
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 修改 | `ProjectInput.quoteAmount/paidAmount` 改**可选**（`Field(default=0, ge=0)`）——前端不再提交这两字段，旧调用方传值仍兼容（建单时照旧入库） | `src/schemas.py` |
+| 2 | 修改 | `update_project` 可写字段白名单移除 `quoteAmount`/`paidAmount`（不再写入；**存量值保留在库中不覆盖**，前端已无展示） | `src/services.py` |
+
+### 验证
+
+- 建单带旧字段 → 200（兼容）；PUT 不传两字段 → 存量值不变 ✓；`py_compile` 0。
+
+---
+
+## 2026-10-19 ｜ 排查修复：建单脏负责人漏洞 + 空草稿/悬挂明细可 confirm（子 Agent 全链路排查）
+
+**关联任务**：用户要求派子 Agent 排查业务逻辑错误。对照「2026-10-19 规则基线」全量排查 sales 链路（services/routers/schemas 全文件），发现 1 个确定漏洞 + 2 个确认缝隙，已修；另记录 4 个低概率边缘问题（见下）。
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 修复 | **建单入口 businessOwner 脏数据漏洞**：三个建单入口（checkout/sales/order/projects）原直接采信请求体 `businessOwner` 且零校验——viewer 可传不存在/已禁用/viewer 账号，导致单据**永久卡死 pending**（无人是「负责人」、无人可接手）。抽公共校验 `_validate_business_owner`（存在/启用/editor+admin，与 claim 转交同口径），`_create_project_core` 建单前调用；claim 内联校验改为复用 | `src/services.py` |
+| 2 | 修复 | **空草稿 confirm 守卫**：0 明细项目（保存草稿）原可被 confirm 成 0 元 active 项目且可批量「交付」。confirm 前校验 `all_items` 非空 → 400 `该订单没有销售明细，请补充明细后再确认（或删除该草稿订单）` | `src/services.py` |
+| 3 | 修复 | **悬挂明细 confirm 守卫**：`assetId=null`（pending_asset）明细行原可随 confirm 生效，之后交付恒 400 只能终止。confirm 前校验无 pending_asset 明细 → 400 `存在未关联产品的明细行，请先关联产品或删除该行再确认` | `src/services.py` |
+
+### 验证（真实 API 冒烟，测试数据已清理）
+
+- 建单传不存在/viewer 账号负责人 → 400 ✓；合法 editor → 200（owner=wuhao2）✓
+- 空草稿 confirm → 400 ✓；悬挂明细 confirm → 400 ✓
+- 回归：商务结算→pending→接手→改价确认→active ✓；viewer 自己 active 单 PUT ✓
+- `py_compile` / `npm run build` / lint 全通过。
+
+### 记录在案、暂不修复（低概率边缘场景，留待有需要时处理）
+
+- **S3 review 并发竞态**：confirm 与 reject 交叉提交可产生「合同 active 但锁定已释放」→ 交付时出幽灵释放流水（需同毫秒级并发，SQLite 低频下概率极低）；
+- **S4 claim 并发抢单**：两商务同时接手无主单均成功（最终态=后提交者，仅审计歧义）；
+- **S5 同合同同产品双明细**（手动建单可造）逐条撤销交付时 `limit(1)` 可能漏重锁；
+- **S6 repeatSale true→false 切换**后历史未锁明细交付可致可售为负（已知取舍的边界残留）。
+
+---
+
+## 2026-10-19 ｜ 修改：**所有角色建单统一进 pending 待审核流程**（ADR-012 决策点 2 修订，⚠️ 行为变更）
+
+**关联任务**：用户反馈「wuhao（商务）直接下单后立即 active，接手了也改不了金额」——改价入口只存在于 pending 审核流程，而商务自建单永不进 pending。用户拍板：**所有人员创建的订单状态都是 pending 流程**，统一改价入口。
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 修改 | **`_create_project_core` 默认 `initial_status="active"` → `"pending"`**：购物车结算（`checkout`）、直接下单（`POST /sales/order`）、手动建单/草稿（`POST /projects`）**全部角色**一律建 pending（锁定/清空购物车等不变） | `src/services.py` |
+| 2 | 修改 | `checkout` 移除角色分叉（原 `initial_status="pending" if viewer else "active"` → 恒 `pending`）；docstring/注释同步 | `src/services.py` |
+| 3 | 不变 | 金额规则不变（viewer amount 行可免填回退挂牌价；商务/管理员金额必填）；接手/转交/审核/驳回/守卫全部零改动（pending 机制原已支持任意来源） | - |
+
+### 验证（真实 API 冒烟，测试数据已清理、挂牌价已恢复）
+
+- 商务（wuhao）购物车结算 → **pending** ✓（原 active）→ 接手 → 按 itemId 改价 800000 确认 → **active**、挂牌价写回 ✓
+- 生态（viewer）结算 → pending ✓（不变）
+- 商务直接下单 → **pending** ✓（原 active）
+- admin 手动建单 → **pending** ✓（原 active）
+- 非负责人确认他人 pending 单 → 400 ✓；接手+驳回 → terminated ✓
+- `py_compile` / `npm run build` / lint 全通过。
+
+### 影响提示
+
+- 商务/管理员下单后需自己「接手 → 确认」（或转交他人）才生效；「保存草稿」建出的空单同样 pending，继续编辑前需先接手。
+- 存量数据零影响（已 active 的项目不受影响）。
+
+---
+
+## 2026-10-19 ｜ 修复：businessOwner 越权重设漏洞 + pending 项目编辑权限收紧（ADR-012 §5.1 补漏，⚠️ 安全修复）
+
+**关联任务**：用户实测发现「wuhao 转交给 wuhao2 后，wuhao 仍能编辑 + 编辑页还显示转交按钮」。排查发现三个问题：① **`PUT /projects/{id}` 会直接写入 `businessOwner` 入参**（任何商务改表单即可越权重设负责人，安全漏洞）；② pending 项目基本信息对全体商务开放编辑（后端无负责人守卫）；③ 编辑页底部「转交」按钮对他人单据的普通商务也显示（点击才被后端 400）。
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 修复 | **`update_project` 移除 `businessOwner` 写入**：唯一写入口收敛为 claim（接手/转交）接口，PUT 入参同名值一律忽略（与派生字段同口径） | `src/services.py` |
+| 2 | 新增 | **pending 编辑守卫**：`p.status == "pending"` 且非 viewer（viewer 已限定自己项目）且非 admin 且非负责人 → 400 `待审核项目仅商务负责人（或管理员）可编辑基本信息` | `src/services.py` |
+| 3 | 修复 | 前端编辑页：新增 `canEditForm`（pending 且非负责人 → 整体禁用表单：名称/生态人员/日期/报价/回款/备注 + 「保存基本信息」按钮 tooltip 说明）；「商务负责人」输入框改**只读展示**（`editProject.businessOwner`）；底部「转交」按钮补条件 `(!businessOwner \|\| isAdmin)`（与 alert 区同口径） | create.vue |
+
+### 验证（真实 API 冒烟 4 场景）
+
+- wuhao（非负责人）PUT 改 owner → 400，DB owner 保持 wuhao2 ✓
+- wuhao 仅改 remark → 400 ✓
+- wuhao2（负责人）编辑 → 200 ✓
+- admin PUT `businessOwner=zhaoyin` → 200 但 DB owner 不变（入参忽略）✓
+- `py_compile` / `npm run build` / lint 全通过。
+
+---
+
+## 2026-10-19 ｜ 修改：转交语义修正为**纯移交制**（ADR-012 §5.1 修订，⚠️ 行为变更）
+
+**关联任务**：用户指出原「转交=别人负责的单我抢过来归自己」（拉取式）语义反了——应为「我负责的单一转交给别人」（移交式）。决策确认：不能抢，仅负责人可转；admin 保留越过权。
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 修改 | **`claim_project` 纯移交制**：无主→任意商务/管理员接手（绑自己）；有主→**仅负责人**可转交（必传 `new_owner`，目标须启用商务/管理员账号、不能是自己）；admin 越过（接手/转交任意账号）；**非负责人普通商务 → 400** `该订单由商务负责人「X」负责，仅其本人可转交（如需介入请联系 admin 处理）`（原拉取式抢单废除） | `src/services.py` |
+| 2 | 新增 | **`ClaimInput` 入参**：`POST /projects/{id}/claim` 可选 body `{"newOwner":"账号"}`（缺省空=接手给自己） | `src/schemas.py`, `src/routers/api.py` |
+| 3 | 不变 | 审核守卫（review 仅负责人/admin）、终态 400、日志/审计格式（「转交订单 X → Y」）均不变 | - |
+
+### 验证（真实 API 冒烟 9 场景，测试数据已清理）
+
+- 无主单 editor 接手 ✓；wuhao 抢单（带/不带 newOwner）→ 400 ✓；负责人转给自己 → 400 ✓；转给 viewer（非商务角色）→ 400 ✓；负责人转给 wuhao ✓；admin 接手 ✓；admin 转给 editor ✓；admin 转给不存在账号 → 400 ✓。
+- 注：测试用 wuhao 账号密码已重置为 `123456`（原密码未知，无法登录冒烟）。
+
+---
+
+## 2026-10-19 ｜ 修改：ADR-013 销售记录——一资产一条记录 + 多主体 + 文案改名（⚠️ 行为变更）
+
+**关联任务**：同客户一次采购多家主体（供货公司）产品被「同主体」校验拦截（400 主体不一致）。业务澄清：单据非法律合同，称「销售记录」，每个资产的销售独立。2 个决策点与用户确认：① 一资产一条记录（遥感明细多行归父产品）；② 仅界面文案改名（代码/表名/HT 编号不变）。详见 `docs/adr/ADR-013.md`。
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 修改 | **`checkout` 分组键 customer → assetId**：每个产品一条销售记录（遥感明细行归父产品），customer=行级客户；**移除同主体校验**（同客户多主体=多条记录并列） | `src/services.py` |
+| 2 | 修改 | **`_order_core`（直接下单）按产品拆记录**：移除同主体校验；按 assetId 分组 → 多条 `ContractInput`（customer=项目客户）；`ProjectInput` 改传 `contracts=` | `src/services.py` |
+| 3 | 修改 | **`_create_project_core`**：移除「记录内同主体」校验（手动建单可混合主体）；记录 `subject` 派生 = 各行主体全一致→该值、混合→空（多主体记录） | `src/services.py` |
+| 4 | 修改 | **`_recompute_project` 派生优化**：多记录但客户/主体全一致时仍取该值（原一律置空会误显「N 位客户」） | `src/services.py` |
+| 5 | 修改 | **用户可见文案**：报错/操作日志/审计动作「合同」→「销售记录」、「合同金额」→「销售金额」（产品删除守卫、状态 API、审核、批量、交付/终止、撤销联动、新建日志共 20+ 处）；代码标识（`contracts` 表/`/contracts/` 路由/`contractAmount` 字段）全部不变 | `src/services.py`, `src/routers/api.py` |
+| 6 | 不变 | 锁定/交付/审核/驳回/接手/转交均为行级逻辑零改动；审核改价按 assetId 写回挂牌价天然兼容；存量数据（多行合同）原样展示为「销售记录」，零迁移 | - |
+
+### 验证（真实 API 全链路冒烟，测试数据已清理）
+
+- viewer 同客户「优」加购 2 个**不同主体**产品（资产4 安徽天枢智算 + 资产13 四川蜂云星座）→ 结算成功：1 项目 `pending`、**2 条销售记录**（各自主体）、项目客户保留「优」、金额 959100=957100+2000 ✓（旧版此场景 400）；
+- editor 接手 + 确认改价 900000 → active、挂牌价写回 900000、记录金额 900000/2000 ✓；
+- 直接下单 2 个不同主体产品 → 项目 `active`、**2 条记录**（各自主体）✓；
+- `py_compile` 通过、前端 build 0 error、lint 0。
+
+---
+
+## 2026-10-19 ｜ 新增：ADR-012 §5.1 商务接手机制（接手/转交 + 商务负责人账号关联查询）
+
+**关联任务**：生态人员下单后由商务「接手」认领——businessOwner 自动绑定接手账号，仅该账号可改价/确认/驳回。3 个边界与用户确认：admin 可越过兜底（日志留痕实际操作人）；支持转交（接手人不可自行取消）；接手仅 pending、进行中仅可转交。详见 `docs/adr/ADR-012.md` §5.1。
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 新增 | **`POST /api/projects/{id}/claim`**（`require_editor`，`services.claim_project`）：pending 无负责人→**接手**（businessOwner=当前 username）；他人负责→**转交**（改绑，日志「X → Y」）；active 单同规则（仅转交/无主单可接手）；delivered/terminated 终态 400；已是自己 400。操作日志「接手订单/转交订单」+ 审计 | `src/services.py`, `src/routers/api.py` |
+| 2 | 新增 | **`GET /api/users/options`**（任意登录用户）：返回 editor/admin 且 enabled 的账号（UserOut），供「商务负责人」筛选下拉与 username→姓名 展示映射（商务负责人与角色账号的关联查询）；存量自由文本值前端归「未指派/历史数据」档 | `src/routers/api.py` |
+| 3 | 修改 | **review 接手人守卫**（`services.review_project` 新增 `user` 参数）：businessOwner 为空 → 400「该订单尚未被商务接手，请先接手后再操作」；操作人 ≠ businessOwner 且非 admin → 400「仅接手的商务负责人（X）可调整该订单价格，如需处理请先转交」；admin 可越过任意单（审计留痕实际操作人） | `src/services.py`, `src/routers/api.py` |
+| 4 | 不变 | 接手不改变数量/锁定/合同状态，仅改 businessOwner + 日志；生态人员可见范围（creator 过滤）与订单上「商务负责人」展示不受影响 | - |
+
+### 验证（真实 API 全链路冒烟，测试数据已清理）
+
+- options 返回 4 个商务/admin 账号 ✓；viewer 下单 → pending；
+- 未接手 editor 审核 → 400「尚未被商务接手」✓；editor 接手 ✓；重复接手 → 400「你已是该订单的商务负责人」✓；
+- 非接手 editor 审核 → 400「仅接手的商务负责人（editor）…」✓；该 editor 转交 → 成功（日志「editor → u_test2」）✓；原接手人再审核 → 400 ✓；
+- **非接手 admin 越过确认**（改价 33333）→ 成功，项目 active、挂牌价写回 33333 ✓；
+- active 单再转交 → 成功（u_test2 → u_admin_x）✓；已确认单再审核 → 400 ✓；
+- `py_compile` 通过、前端 build 0 error。
+
+---
+
+## 2026-10-19 ｜ 新增：ADR-012 生态人员下单「待审核」流程（⚠️ 新增状态 + 新端点）
+
+**关联任务**：生态人员负责加购物车下单 → 商务修改单价/合同金额后确认生效；生态人员下单可不填金额；商务确认后实际价同步到平台单价展示。决策记录 `docs/adr/ADR-012.md`。
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 新增 | **`pending`（待审核）状态**：projects/contracts.status 新增值（VARCHAR 无迁移）。`_derive_project_status`：全合同 pending → 项目 pending（审核按项目整批迁移，无混合态） | `src/services.py` |
+| 2 | 修改 | **结算角色分叉**：`checkout` 新增 `viewer` 参数——viewer 结算 → `_create_project_core(initial_status="pending")`（锁定照常）；editor/admin 保持 active。viewer + amount 模式 + 金额留空 → 回退 `round(挂牌价×数量)` 取整元（ROUND_HALF_UP）；挂牌价未设 → 400「未登记参考单价，无法免填金额」 | `src/services.py`, `src/routers/api.py` |
+| 3 | 新增 | **订单审核接口 `POST /projects/{id}/review`**（`require_editor`）：confirm=行级改价（unit 传实际单价→amount 重算 / amount 传实际合同金额→price 派生反算；遥感明细行 400；数量不可改）+ **实际价写回 `assets.salePrice`**（同产品多行最后遍历生效，写「挂牌价更新」日志）+ 合同/项目 → active + 改价 diff 日志；reject=原因必填 + 逐明细释放锁定 + 合同/项目 terminated（`contract.remark="驳回：{原因}"` 留痕）。确认守卫：存在 amount≤0 行 → 400 | `src/services.py`, `src/schemas.py`（ReviewItemInput/ReviewInput）, `src/routers/api.py` |
+| 4 | 修改 | **pending 守卫穿透**：合同/项目状态 API 对 pending → 400（唯一出口=审核接口）；项目删除回滚 pending 视同 active（释放锁定）；产品删除引用拦截扩为 `status IN (active, pending)` | `src/services.py` |
+| 5 | 不变 | 商务/管理员手动建单、直接下单、购物车结算一律立即 active；viewer 直接下单（非购物车）不进 pending、金额必填；`update_project` 对 pending 项目允许改基本信息（沿用既有守卫）；驳回/确认均复用 `_apply_item_release`/`_recompute_project`，单事务（H8） | - |
+
+### 验证（真实 API 全链路冒烟，测试数据已清理）
+
+- viewer 结算 Token 产品（amount 模式免填）→ 项目 pending、金额 round(33333.33×2)=**66667** ✓；
+- 守卫：pending 合同 PATCH status → 400 ✓；viewer 调 review → 403 ✓；
+- 商务 confirm 改价（66667→50000）→ 项目/合同 active、行 price 派生 25000、**挂牌价 33333.33→25000 写回** ✓；
+- 混合双客户单 confirm 改 unit 单价 888888 → 合同合计 1811109（1777776+33333）✓、未改价行挂牌价不动 ✓；
+- reject 带原因 → 项目/合同 terminated、`remark="驳回：单价需重新询价"`、lockedQty 释放归 0、viewer bootstrap 仍可见驳回原因 ✓；
+- `py_compile` 通过、`/api/health` ok。
+
+---
+
+## 2026-10-19 ｜ 修复：撤销交付联动回滚合同/项目状态（⚠️ 行为变更）
+
+**关联任务**：交付记录页点「撤销」后，销售项目详情状态不变化——撤销只回退产品数量，合同仍停留 `delivered`。
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 修复 | `services._revert_outbound_inner` 新增**合同联动**（`restore_contract=True` 为默认，单条撤销生效）：撤销合同交付生成的记录且明细仍 `shipped` 时——明细 `shipped→locked` + 清 `shippedDate`，下单真加锁过（`locked=True`）的明细重新加锁（`lockedQty += qty`，project_lock 流水）；合同 `delivered→active`；项目状态 `_recompute_project` 重算（详情页同步恢复「进行中」）；操作日志追加「关联合同已回退「进行中」并重新锁定明细」 | `src/services.py` |
+| 2 | 修复 | 批量级联例外：合同终止 / 项目终止 / 项目删除 4 处级联撤销均传 `restore_contract=False`——否则逐条回滚会先回滚合同再释放，把本应释放的数量**错误重新加锁**（幽灵锁） | `src/services.py` |
+| 3 | 不变 | 手动交付（contractId=null）/ 历史补录无合同联动，行为同旧版；再交付安全性由既有机制保证——合同交付分支只处理 locked/confirmed 明细（跳过 shipped），撤销后再交付仅补交被撤销明细，不重复扣量 | - |
+
+### 验证（全链路冒烟，测试数据已清理）
+
+- 交付 → 项目/合同 `delivered`、明细 shipped、shippedQty 2、lockedQty 0；
+- 撤销 → 项目/合同 **active**、明细 **locked**（locked=True）、shippedQty 0、lockedQty 2 ✓；
+- 再交付 → 仅 1 条 done 交付记录、shippedQty 2（**无重复扣量**）✓；
+- 终止已交付合同 → 明细 released、shippedQty/lockedQty 均 0（**无幽灵锁**）✓；
+- `py_compile` 通过、`/api/health` ok。
+
+---
+
+## 2026-10-19 ｜ 修改：项目/合同编号改时间戳方式（⚠️ 编号格式变更，存量旧编号保留）
+
+**关联任务**：项目编号与合同编号不再用自增序号，改为时间戳方案（位数由实现定：16 位）。
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 修改 | **编号格式**：`SP-{3位序号}` → **`SP-{16位}`**、`HT-{4位序号}` → **`HT-{16位}`**；16 位 = 14 位本地时间戳（`yyyyMMddHHmmss`）+ 2 位随机数。例：`SP-2026101915432005` / `HT-2026101915432021`。设计理由（已写入代码注释 `services._ts_code`）：时间戳可读且按创建时间天然排序；尾部 2 位随机数防**同秒碰撞**（购物车结算一次请求为多客户生成多份合同必然同秒）；随机碰撞时换随机重试最多 10 次，兜底 16 位 uuid 后缀保证 UNIQUE 不破坏 | `src/services.py` |
+| 2 | 不变 | 生成点仍为 `_create_project_core`（手动建单 / 直接下单 / 购物车结算共用）；`code` 列 VARCHAR(32) UNIQUE 容量足够（19 字符）；**存量旧编号（SP-001 / HT-0001）保留不动**，前端展示/跳转均按接口返回值，无格式假设；`CK-` 交付单号与 `CH-` 编号本次不变 | - |
+
+### 验证
+
+- 冒烟：手动建 2 客户项目 → `SP-2026101915432005` + 同秒双合同 `HT-...21` / `HT-...86`（随机位生效，无 UNIQUE 冲突）；
+- `py_compile` 通过、`/api/health` ok；测试项目已删除（锁定已回滚）。
+
+---
+
+## 2026-10-19 ｜ 修改：清除「入库/出库」字样（入库→登记、出库→交付，纯文案，无逻辑变更）
+
+**关联任务**：平台为对外产品平台，不出现仓储类「入库/出库」字样；与既有「登记产品」「交付」动作口径对齐。
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 修改 | **接口报错消息**：「出库数量超出可用数量/本次出库」→「交付数量超出可用数量/本次交付」；「明细已全部出库/释放」→「全部交付/释放」 | `src/services.py` |
+| 2 | 修改 | **操作日志（新记录）**：动作「销售出库/出库补录/历史出库补录（不扣减数量）/出库撤销」→「销售交付/交付补录/历史交付补录（不扣减数量）/交付撤销」；「撤销出库 N 条」「（已回滚锁定与出库）」→「撤销交付 N 条」「（已回滚锁定与交付）」；新建产品动作「入库」→「登记」；字段级 diff 映射 inboundDate「入库日期」→「登记日期」 | `src/services.py` |
+| 3 | 修改 | **审计日志（新记录）**：动作「新出库/撤销出库」→「新交付/撤销交付」（英文 action code `outbound` 不变） | `src/routers/api.py` |
+| 4 | 不变 | 表/字段名（shippedQty/inboundDate）、flow_type 枚举（purchase_in/sale_out）、CK- 单号前缀、API 路径（/outbound）均不变；**存量 logs/audit_logs/flows 不回溯**（历史留痕保持原样，仅新记录用新口径）；一次性脚本 cleanup_sales_data.py 不动 | - |
+
+### 验证
+
+- `grep -rn "入库\|出库" backend`（除 cleanup_sales_data.py）残留 **0**；`py_compile` 全过；`--reload` 热加载后 `/api/health` ok。
+
+---
+
+## 2026-10-19 ｜ 修改：全平台「资产/库存」术语切换为对外视角「产品及服务」（纯文案，无逻辑变更）
+
+**关联任务**：对外产品平台视角调整。执行依据：`docs/asset-inventory-rename-checklist-20261019.md`。
+仅替换**用户可见文案**（接口报错、操作/审计日志动作与明细、字段级 diff 映射、种子数据），代码标识符（表名/字段名/英文枚举）与 API 路径不变。
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 修改 | **接口报错消息**：资产不存在→产品不存在、库存不足→可用数量不足、可售库存→可用数量、资产主体不一致→产品主体不一致、父资产→父产品、下单资产→下单产品 等约 30 条 | `src/services.py`, `src/routers/api.py` |
+| 2 | 修改 | **操作日志（logs 表新增记录）**：动作「新增资产/删除资产/更新资产信息」→「新增产品/删除产品/更新产品信息」；字段级 diff 映射（ASSET_FIELD_LABELS）资产名称/类型/总数/状态→产品名称/类型/总数/状态；「（不扣减库存）（不调整库存）」→「（不扣减数量）（不调整数量）」 | `src/services.py` |
+| 3 | 修改 | **审计日志（audit_logs 新增记录）**：动作「新增/编辑/删除资产」→「新增/编辑/删除产品」（英文 action code `asset_change` 不变） | `src/routers/api.py` |
+| 4 | 修改 | **种子数据**：category_units note「不扣减库存」→「不扣减数量」；assets 备注「集群库存」→「集群可售」、「演示父资产」→「演示父产品」、「总资产」→「总盘」 | `src/seed_data.py` |
+| 5 | 数据 | **生产库存量数据**：同步 UPDATE assets 备注（id 18/28/29）与 category_units note（id 5）；**历史 logs/audit_logs 记录不回溯**（操作/审计留痕保持原样，仅新记录用新口径） | `core_holdings.db` |
+| 6 | 不变 | 英文枚举/键（asset_change、in_stock、target='asset'）、表名/字段名、API 路径、状态机与权限逻辑均未改；一次性脚本 cleanup_sales_data.py 不动 | - |
+
+### 验证
+
+- `grep -rn "资产\|库存" backend --include='*.py'`（除 cleanup_sales_data.py）残留 **0**；
+- `py_compile` 全过；`--reload` 服务热加载后 `/api/health` ok、bootstrap 正常；
+- 冒烟：报错文案已按新口径返回（如「产品不存在」「合同不存在」）。
+
+---
+
+## 2026-10-16 ｜ 新增：销售项目对生态人员（viewer）开放「仅自己下单」可见 + 有限编辑/终止
+
+**关联任务**：平台优化需求 2（销售项目生态人员可见范围）。口径（用户确认）：按**实际下单账号**判定（`Project.creator`）；存量项目 creator 为空时回退 `rep == 自己姓名`；可见范围全过滤（列表/详情/合同）；viewer 可编辑自己项目基本信息 + 可终止（不可交付、不可删除、不可新建空项目）。
+
+| # | 类型 | 变更内容 | 影响文件 |
+|---|------|----------|----------|
+| 1 | 新增 ⚠️ | **`projects` 加列 `creator`**（VARCHAR(64) 默认 `''` + 索引，幂等迁移）：实际登录下单的 username。`_create_project_core` 建项目时写入 `creator=operator`（三入口 POST /projects、POST /sales/order、POST /cart/checkout 均传登录账号）；存量项目为空 | `src/models.py`, `main.py`, `src/services.py` |
+| 2 | 新增 ⚠️ | **可见性判定 `user_sees_project`**：admin/editor 全见；viewer 仅 `creator==自己 username`，creator 为空（存量）回退 `rep in (自己姓名, 自己 username)`。`bootstrap` 按该口径过滤 `projects` 与 `contracts`（合同跟随项目可见性）——前端项目列表/详情/资产「销售关联」页签均消费此镜像，天然全过滤；越权 URL 访问他人项目 → 镜像无此项目 → 前端 el-empty「未找到该销售项目」 | `src/services.py`, `src/routers/api.py` |
+| 3 | 修改 ⚠️ | **三个写端点依赖 `require_editor` → `require_order`**（约束下沉服务层）：a) `PUT /projects/{id}`——viewer 可编辑**自己项目**基本信息，`rep` 字段对 viewer 恒忽略（防把项目转给他人造成越权转移）；b) `PATCH /projects/{id}/status`——viewer 仅可 `terminated`（自己项目），`delivered` 400「生态人员仅可终止项目（交付需商务人员/管理员操作）」；c) `PATCH /contracts/{id}/status`——viewer 仅可 `terminated`（自己项目合同，含 delivered 撤销出库），`delivered` 400。越权（非自己项目）一律 403「生态人员仅可操作自己下单的项目」 | `src/services.py`, `src/routers/api.py` |
+| 4 | 不变 | `POST /projects`（新建空项目）、`DELETE /projects/{id}` 保持 `require_editor`——viewer 建项目只走下单链路（require_order）；删除仍仅商务/管理员 | - |
+
+### 自测（临时库 8020 冒烟，curl 走查）
+
+- 张三（viewer）/李四（editor）均 rep=张三 各自下单 → 张三 bootstrap 仅见自己单（creator 口径优先）；admin 手建 rep=张三 的项目张三不可见 ✓
+- 存量模拟（李四代单 creator 置空）→ 张三可见（rep 回退口径）✓
+- 张三编辑自己项目 200（name/remark 生效），`rep` 传「李四」不生效（仍=张三）✓
+- 张三 PUT/终止他人项目合同 → 403；交付自己合同 → 400；终止自己合同 → 200 且项目派生 terminated ✓
+
 ---
 
 ## 2026-10-16 ｜ 修复：业务逻辑 bug 批量修复 17 项（docs/business-logic-bugs-20261016.md，子 Agent 独立评估 18 条全成立）

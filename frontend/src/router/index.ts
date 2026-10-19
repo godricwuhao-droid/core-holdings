@@ -24,7 +24,7 @@ const routes: RouteRecordRaw[] = [
         component: () => import('@/views/dashboard/index.vue'),
       },
 
-      // ---------- 资产管理 ----------
+      // ---------- 产品及服务 ----------
       {
         path: 'assets/:board(embodied|satellite|software|hardware)',
         name: 'AssetList',
@@ -71,6 +71,12 @@ const routes: RouteRecordRaw[] = [
         path: 'sales/projects/:id/edit',
         name: 'ProjectEdit',
         component: () => import('@/views/sales/projects/create.vue'),
+      },
+      // 2026-10-19：订单审核独立页（仅订单审核 + 备注；商务/管理员，viewer 路由守卫拦截）
+      {
+        path: 'sales/projects/:id/review',
+        name: 'ProjectReview',
+        component: () => import('@/views/sales/projects/review.vue'),
       },
       {
         path: 'sales/outbound',
@@ -119,10 +125,16 @@ const router = createRouter({
   routes,
 })
 
-/** viewer（生态人员）可访问路由：/assets/**（排除创建/编辑等写页面）+ /cart；默认落地 /assets/embodied */
+/** viewer（生态人员）可访问路由：/assets/**（排除创建/编辑等写页面）+ /sales/projects（仅自己下单，后端过滤）+ /cart；默认落地 /assets/embodied */
 const VIEWER_HOME = '/assets/embodied'
-function viewerAllowedPath(path: string): boolean {
+function viewerAllowedPath(path: string, query: Record<string, unknown> = {}): boolean {
   if (path === '/cart') return true
+  // 销售项目：列表 + 详情 + 编辑（仅限自己下单的项目；新建/交付记录不放行）
+  if (path === '/sales/projects') return true
+  if (/^\/sales\/projects\/\d+\/(detail|edit)$/.test(path)) return true
+  // 2026-10-20：重新提交（resubmit）——仅带 ?copy=<已终止项目id> 时放行（页面内再校验归属/状态）；
+  // 不带参数直连新建页仍拦截（生态新建入口维持移除策略）
+  if (path === '/sales/projects/create' && Number(query.copy)) return true
   if (!path.startsWith('/assets/')) return false
   if (path === '/assets/create') return false
   if (/^\/assets\/\d+\/edit$/.test(path)) return false
@@ -136,7 +148,7 @@ function viewerAllowedPath(path: string): boolean {
 //  - token 在但 currentUser 缺失（新标签页刷新）：fetchMe 校验，
 //    401 由响应拦截器清态跳登录
 //  - viewer（生态人员）：仅 /assets/**（排除创建/编辑页）与 /cart，
-//    其余路由（看板/销售/出库/基础设置/资产创建编辑）→ 静默重定向 /assets/embodied
+//    其余路由（看板/销售/交付/基础设置/产品创建编辑）→ 静默重定向 /assets/embodied
 //  - /settings/*（users/deliverables/reps）仅 admin，非 admin 直接访问 → 提示并回 /
 // ============================================================
 router.beforeEach(async (to) => {
@@ -154,8 +166,8 @@ router.beforeEach(async (to) => {
       return false
     }
   }
-  // viewer（生态人员）：菜单/路由收窄——仅资产浏览 + 购物车，其余静默回资产首页
-  if (currentUser.value?.role === 'viewer' && !viewerAllowedPath(to.path)) {
+  // viewer（生态人员）：菜单/路由收窄——仅产品浏览 + 购物车，其余静默回产品首页
+  if (currentUser.value?.role === 'viewer' && !viewerAllowedPath(to.path, to.query)) {
     return VIEWER_HOME
   }
   if (to.path === '/settings/users' && currentUser.value?.role !== 'admin') {

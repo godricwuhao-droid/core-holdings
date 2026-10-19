@@ -1,9 +1,9 @@
 <script setup lang="ts">
 /**
- * 资产管理 - 板块列表页（具身智能 / 卫星服务 / 软件库存 / 硬件库存）
+ * 产品及服务 - 板块列表页（具身智能 / 卫星服务 / 软件产品 / 硬件产品）
  *
  * 卫星服务板块顶部增加二级切换：卫星 Token / 卫星数据
- * 筛选：名称搜索 / 状态 / 主体 / 入库日期
+ * 筛选：名称搜索 / 状态 / 主体 / 登记日期
  */
 import { computed, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
@@ -59,13 +59,13 @@ const boardName = computed(() => boardLabel(board.value))
 // 卫星二级切换（ADR-010：新增「遥感数据」页签）
 const satelliteTab = ref<'all' | 'token' | 'data' | 'remote'>('all')
 
-// 筛选（状态默认「库存可售」：只展示库存可售资产；清空 = 全部）
+// 筛选（状态默认「可售」：只展示可售产品；清空 = 全部）
 const searchText = ref('')
 const statusFilter = ref<AssetStockState | ''>('in_stock')
 const subjectFilter = ref('')
 const inboundMonth = ref('')
 
-// 切换板块时重置二级切换与筛选条件（状态回到默认「库存可售」），避免残留上一板块的筛选值
+// 切换板块时重置二级切换与筛选条件（状态回到默认「可售」），避免残留上一板块的筛选值
 watch(board, () => {
   satelliteTab.value = 'all'
   statusFilter.value = 'in_stock'
@@ -105,19 +105,19 @@ function remoteSummary(a: Asset): string {
   return `覆盖 ${pText} · ${items.length} 份明细`
 }
 
-/** ADR-011：遥感数据父资产的明细数（「资产总数」列显示「N 份明细」） */
+/** ADR-011：遥感数据父产品的明细数（「产品总数」列显示「N 期」——遥感明细按期售卖） */
 function rsCount(a: Asset): number {
   return db.rsItems.filter((r) => r.assetId === a.id).length
 }
 
 function goEdit(a: Asset) {
   if (noSellableStock(a)) {
-    ElMessage.warning('该资产当前无可售库存（可售数量为 0）。可继续编辑补入库或核对锁定 / 售出情况。')
+    ElMessage.warning('该产品当前无可用数量（可售数量为 0）。可继续编辑补登记或核对锁定 / 售出情况。')
   }
   router.push(`/assets/${a.id}/edit`)
 }
 
-/** 从资产快览打开下单对话框（与购物车下单同一表单，单资产 + 数量） */
+/** 从产品快览打开下单对话框（与购物车下单同一表单，单产品 + 数量） */
 const saleItem = ref<OrderItem | null>(null)
 const saleVisible = ref(false)
 const saleLoading = ref(false)
@@ -164,13 +164,13 @@ async function onRsPickerConfirm(items: RsItem[]) {
 }
 
 function goRegisterSale(a: Asset) {
-  // ADR-011：遥感数据父资产走明细选择弹窗（父资产本身不可直接下单，库存校验不适用）
+  // ADR-011：遥感数据父产品走明细选择弹窗（父产品本身不可直接下单，数量校验不适用）
   if (a.type === '遥感数据') {
     openRsPicker(a, 'sale')
     return
   }
   if (noSellableStock(a)) {
-    ElMessage.warning('该资产当前无可售库存（可售数量为 0），无法登记销售。请待库存释放（取消锁定或补充入库）后再操作。')
+    ElMessage.warning('该产品当前无可用数量（可售数量为 0），无法登记销售。请待数量释放（取消锁定或补充登记）后再操作。')
     return
   }
   rsSaleItems.value = []
@@ -184,7 +184,8 @@ async function onSaleSubmit(payload: { fields: OrderFields; items: { assetId: nu
     const p = await createSaleOrder({ ...payload.fields, items: payload.items })
     saleVisible.value = false
     drawerVisible.value = false
-    ElMessage.success(`下单成功，已生成销售项目 ${p.code}（进行中）`)
+    // ADR-012 修订（2026-10-19）：所有角色下单统一进「待审核」，商务接手审核后生效
+    ElMessage.success(`下单成功，销售项目 ${p.code} 待审核，商务接手确认后生效`)
     await refresh(true)
     router.push(`/sales/projects/${p.id}/detail`)
   } catch (e) {
@@ -228,19 +229,19 @@ function clearSelection() {
   tableRef.value?.clearSelection()
 }
 
-/** 点击「资产名称」列（除名称文字外的次级行 / 空白处）= 切换该行勾选，不打开抽屉、不跳详情 */
+/** 点击「产品名称」列（除名称文字外的次级行 / 空白处）= 切换该行勾选，不打开抽屉、不跳详情 */
 function toggleRow(row: Asset) {
   tableRef.value?.toggleRowSelection(row)
 }
 
 async function singleAddToCart(a: Asset) {
-  // ADR-011：遥感数据父资产 → 打开明细选择弹窗（勾选 N 份 = N 行购物车）
+  // ADR-011：遥感数据父产品 → 打开明细选择弹窗（勾选 N 份 = N 行购物车）
   if (a.type === '遥感数据') {
     openRsPicker(a, 'cart')
     return
   }
   if (noSellableStock(a)) {
-    ElMessage.warning(`「${a.name}」暂无可售库存，无法加入购物车`)
+    ElMessage.warning(`「${a.name}」暂无可用数量，无法加入购物车`)
     return
   }
   try {
@@ -252,7 +253,7 @@ async function singleAddToCart(a: Asset) {
 }
 
 /** ADR-009：批量加购对三角色统一走 POST /cart/batch（后端已改 require_order，认证即放行）
- * ADR-011：遥感数据父资产不可直接加购（后端不拦，前端拦死）——勾选中遥感行分流：
+ * ADR-011：遥感数据父产品不可直接加购（后端不拦，前端拦死）——勾选中遥感行分流：
  * 不加入、不发 batch 请求、勾选状态保留（clearSelection 后按 id 重新 toggle 回来），info 提示逐份选明细 */
 async function batchAddToCart() {
   const rsRows = selectedAssets.value.filter((a) => a.type === '遥感数据')
@@ -267,9 +268,9 @@ async function batchAddToCart() {
     const res = await addCartBatch(items)
     if (res.skipped.length) {
       const names = res.skipped.map((s) => `${s.name}（${s.reason}）`).join('、')
-      ElMessage.warning(`已加入 ${res.addedCount} 项，${res.skipped.length} 项因库存不足未加入：${names}`)
+      ElMessage.warning(`已加入 ${res.addedCount} 项，${res.skipped.length} 项因可用数量不足未加入：${names}`)
     } else {
-      ElMessage.success(`已将 ${res.addedCount} 项资产加入购物车`)
+      ElMessage.success(`已将 ${res.addedCount} 项产品加入购物车`)
     }
     // 清勾选后把遥感行重新勾回（afterWrite 已刷新，行对象被替换，需按 id 从新 list 取行）
     const rsIds = new Set(rsRows.map((a) => a.id))
@@ -301,10 +302,19 @@ const dProjects = computed(() =>
   drawerAsset.value ? projectItemsOfAsset(drawerAsset.value.id) : [],
 )
 
-// ---- ADR-011：遥感数据（容器资产）抽屉五段式结构 ----
+/** 列表「销售单价」列（口径与抽屉「销售单价」一致）：
+ *  遥感容器按明细定价显示「-」；amount 模式为参考值（元/万Token）紧凑显示；
+ *  unit 模式金额直显（repeatSale 带 /unit）。定宽 120 + 居中 + 溢出省略 hover 显示全文。 */
+function salePriceText(a: Asset): string {
+  if (a.type === '遥感数据' || !a.salePrice) return '-'
+  if (isAmountMode(a)) return `¥${a.salePrice}/万Token`
+  return a.repeatSale ? `${formatMoney(a.salePrice)}/${a.unit || '份'}` : formatMoney(a.salePrice)
+}
+
+// ---- ADR-011：遥感数据（容器产品）抽屉五段式结构 ----
 const isRemote = computed(() => drawerAsset.value?.type === '遥感数据')
 
-/** 可售明细（遥感数据父资产） */
+/** 可售明细（遥感数据父产品） */
 const dRsItems = computed<RsItem[]>(() =>
   drawerAsset.value ? db.rsItems.filter((r) => r.assetId === drawerAsset.value!.id) : [],
 )
@@ -321,12 +331,12 @@ const dSoldMap = computed(() => {
   return m
 })
 
-/** 遥感容器「已售次数」：该资产明细的 dSoldMap 值求和（与「可售明细」表列同口径） */
+/** 遥感容器「已售次数」：该产品明细的 dSoldMap 值求和（与「可售明细」表列同口径） */
 const dRsSoldTotal = computed(() =>
   dRsItems.value.reduce((s, r) => s + (dSoldMap.value.get(r.id) ?? 0), 0),
 )
 
-/** 最近动态：操作日志（db.logs）与出入库流水（db.flows）合并，按时间倒序取前 8 条 */
+/** 最近动态：操作日志（db.logs）与数量流水（db.flows）合并，按时间倒序取前 8 条 */
 interface DrawerActivity {
   key: string
   time: string
@@ -356,7 +366,7 @@ const dActivities = computed<DrawerActivity[]>(() => {
   return [...flows, ...logs].sort((x, y) => y.time.localeCompare(x.time)).slice(0, 8)
 })
 
-/** 库存进度分段（不可重复售卖时展示） */
+/** 数量进度分段（不可重复售卖时展示） */
 const dProgress = computed(() => {
   const a = drawerAsset.value
   if (!a || a.repeatSale || a.quantity <= 0) return null
@@ -374,23 +384,23 @@ const boardMeta = computed(() => {
   switch (board.value) {
     case 'embodied':
       return {
-        desc: '机器人、数采设备与平台软件资产的入库登记、库存与销售追踪统一台账。',
-        rule: '机器人资产默认整机交付，可选序列号出库管理；数采设备按套入库与销售。',
+        desc: '机器人、数采设备与平台软件产品的登记、数量与销售追踪统一台账。',
+        rule: '机器人产品默认整机交付，可选序列号交付管理；数采设备按套登记与销售。',
       }
     case 'satellite':
       return {
-        desc: '卫星 Token、卫星数据与遥感数据资产的销售台账，按额度、批次与区域精度追踪销售进度。',
-        rule: '卫星数据默认支持重复售卖，不随销售出库扣减原始数据量；卫星 Token 按包量售卖（合同金额整数元为准）；遥感数据为容器资产，按 省/精度/月份 维护可售明细售卖（可重复售卖，只计次不扣量）。',
+        desc: '卫星 Token、卫星数据与遥感数据产品的销售台账，按额度、批次与区域精度追踪销售进度。',
+        rule: '卫星数据默认支持重复售卖，不随销售交付扣减原始数据量；卫星 Token 按包量售卖（销售金额整数元为准）；遥感数据为容器产品，按 省/精度/月份 维护可售明细售卖（可重复售卖，只计次不扣量）。',
       }
     case 'software':
       return {
-        desc: '软件资产台账，支持永久、年限或账号等许可方式追踪。',
-        rule: '软件按套销售，许可方式可选永久、年限或账号；可重复售卖类资产支持多次出售。',
+        desc: '软件产品台账，支持永久、年限或账号等许可方式追踪。',
+        rule: '软件按套销售，许可方式可选永久、年限或账号；可重复售卖类产品支持多次出售。',
       }
     case 'hardware':
       return {
-        desc: '硬件集群资产台账，核入入库后登记，支持整机柜或单台交付。',
-        rule: '硬件集群支持整机柜或单台交付，整机序列号出库管理。',
+        desc: '硬件集群产品台账，核入后登记，支持整机柜或单台交付。',
+        rule: '硬件集群支持整机柜或单台交付，整机序列号交付管理。',
       }
     default:
       return { desc: '', rule: '' }
@@ -404,15 +414,15 @@ const boardMeta = computed(() => {
     <!-- 页面头部：面包屑 + 标题 + 说明 + 主操作 -->
     <div class="page-head">
       <div>
-        <div class="crumb">资产管理 / {{ boardName }}</div>
-        <h1>{{ boardName }} · 资产台账</h1>
+        <div class="crumb">产品及服务 / {{ boardName }}</div>
+        <h1>{{ boardName }} · 产品台账</h1>
         <div class="desc">{{ boardMeta.desc }}</div>
       </div>
       <div class="head-actions">
         <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="bottom">
           <span>
             <el-button type="primary" :icon="Plus" :disabled="!canWrite" @click="goCreate">
-              登记资产
+              登记产品
             </el-button>
           </span>
         </el-tooltip>
@@ -428,7 +438,7 @@ const boardMeta = computed(() => {
     <!-- 表格卡 -->
     <el-card shadow="never">
       <div class="table-head">
-        <span class="t">资产台账</span>
+        <span class="t">产品台账</span>
         <span class="c">共 {{ list.length }} 条</span>
       </div>
 
@@ -468,7 +478,7 @@ const boardMeta = computed(() => {
           v-model="inboundMonth"
           type="month"
           value-format="YYYY-MM"
-          placeholder="入库月份"
+          placeholder="登记月份"
           style="width: 150px;"
         />
       </div>
@@ -476,7 +486,7 @@ const boardMeta = computed(() => {
       <!-- 表格 -->
       <el-table ref="tableRef" :data="list" border stripe @row-click="onRowClick" @selection-change="onSelectionChange" class="clickable">
         <el-table-column type="selection" width="44" align="center" />
-        <el-table-column label="资产名称" min-width="220" align="left" class-name="asset-name-col">
+        <el-table-column label="产品名称" min-width="220" align="left" class-name="asset-name-col">
           <template #default="{ row }">
             <!-- 整列分工：名称文字 = 跳详情页；列内其余区域（次级行/空白）= 切换该行勾选；全部 stop 阻断 row-click，本列绝不打开抽屉 -->
             <div class="asset-cell" @click.stop="toggleRow(row)">
@@ -499,10 +509,10 @@ const boardMeta = computed(() => {
         <el-table-column label="所在主体" width="110" align="left" show-overflow-tooltip>
           <template #default="{ row }">{{ entityShort(row.subject) }}</template>
         </el-table-column>
-        <el-table-column label="资产总数" width="110" align="center">
+        <el-table-column label="产品总数" width="110" align="center">
           <template #default="{ row }">
-            <!-- ADR-011：遥感数据父资产显示明细数（quantity 对容器无意义） -->
-            <template v-if="row.type === '遥感数据'">{{ rsCount(row) }} 份明细</template>
+            <!-- ADR-011：遥感数据父产品显示明细数（quantity 对容器无意义；明细按期售卖 → 「N 期」） -->
+            <template v-if="row.type === '遥感数据'">{{ rsCount(row) }} 期</template>
             <template v-else>{{ formatAssetQty(row, row.quantity) }} <span class="muted">{{ row.unit }}</span></template>
           </template>
         </el-table-column>
@@ -518,7 +528,10 @@ const boardMeta = computed(() => {
             <span v-else class="muted">0</span>
           </template>
         </el-table-column>
-        <el-table-column label="库存数量" width="100" align="center">
+        <el-table-column label="销售单价" width="120" align="center" show-overflow-tooltip>
+          <template #default="{ row }">{{ salePriceText(row) }}</template>
+        </el-table-column>
+        <el-table-column label="可用数量" width="100" align="center">
           <template #default="{ row }">
             <el-tag v-if="row.repeatSale" size="small" type="success" effect="plain">重复售卖</el-tag>
             <span v-else style="font-weight: 600; color: var(--success-color);">{{ formatAssetQty(row, availableQty(row)) }}</span>
@@ -549,12 +562,12 @@ const boardMeta = computed(() => {
           </template>
         </el-table-column>
         <template #empty>
-          <el-empty description="暂无资产，点击右上角「登记资产」" :image-size="80" />
+          <el-empty description="暂无产品，点击右上角「登记产品」" :image-size="80" />
         </template>
       </el-table>
     </el-card>
 
-    <!-- 资产快览抽屉：行内核心参数，查看详情才进入详情页 -->
+    <!-- 产品快览抽屉：行内核心参数，查看详情才进入详情页 -->
     <el-drawer v-model="drawerVisible" size="640px" class="asset-drawer">
       <template v-if="drawerAsset" #header>
         <div class="dr-head">
@@ -578,24 +591,24 @@ const boardMeta = computed(() => {
       </template>
 
       <template v-if="drawerAsset">
-        <!-- 库存进度（ADR-011：容器资产不展示；数字保留在图例，指标卡已移除） -->
+        <!-- 数量进度（ADR-011：容器产品不展示；数字保留在图例，指标卡已移除） -->
         <div v-if="dProgress && !isRemote" class="dr-section">
-          <div class="sec-title">库存进度</div>
-          <div class="sec-desc muted">按库存扣减口径</div>
+          <div class="sec-title">数量进度</div>
+          <div class="sec-desc muted">按数量扣减口径</div>
           <div class="dr-bar">
             <span class="seg seg-shipped" :style="{ width: dProgress.shippedPct }" />
             <span class="seg seg-locked" :style="{ width: dProgress.lockedPct }" />
             <span class="seg seg-avail" :style="{ width: dProgress.availPct }" />
           </div>
           <div class="dr-bar-legend muted">
-            <span><i class="dot dot-shipped" />已出库 {{ drawerAsset.shippedQty }}</span>
+            <span><i class="dot dot-shipped" />已交付 {{ drawerAsset.shippedQty }}</span>
             <span><i class="dot dot-locked" />锁定 {{ drawerAsset.lockedQty }}</span>
             <span><i class="dot dot-avail" />可售 {{ formatAssetQty(drawerAsset, availableQty(drawerAsset)) }}</span>
-            <span class="bar-total">入库合计 {{ formatAssetQty(drawerAsset, drawerAsset.quantity) }} {{ drawerAsset.unit }}</span>
+            <span class="bar-total">总数量 {{ formatAssetQty(drawerAsset, drawerAsset.quantity) }} {{ drawerAsset.unit }}</span>
           </div>
         </div>
 
-        <!-- 可重复售卖说明（仅可重复资产；ADR-011：容器资产不展示） -->
+        <!-- 可重复售卖说明（仅可重复产品；ADR-011：容器产品不展示） -->
         <div v-if="drawerAsset.repeatSale && !isRemote" class="dr-notice">
           <el-icon><InfoFilled /></el-icon>
           <span>可重复售卖：重复售卖不扣减原始数据量，按售卖次数与金额累计。</span>
@@ -604,7 +617,7 @@ const boardMeta = computed(() => {
         <!-- 产品清单（全类型统一 15px 标题 + 弱说明） -->
         <div class="dr-section">
           <div class="sec-title">产品清单</div>
-          <div class="sec-desc muted">合同产品清单文件，支持在线预览</div>
+          <div class="sec-desc muted">销售记录产品清单文件，支持在线预览</div>
           <div v-if="drawerAsset.contractFile" class="contract-row">
             <el-icon class="contract-ic"><Document /></el-icon>
             <span class="contract-name">{{ fileDisplayName(drawerAsset.contractFile) }}</span>
@@ -629,18 +642,18 @@ const boardMeta = computed(() => {
           </div>
         </div>
 
-        <!-- 关键信息（全类型统一字段；repeatSale 资产与容器追加销售口径行，指标卡数字在此补偿） -->
+        <!-- 关键信息（全类型统一字段；repeatSale 产品与容器追加销售口径行，指标卡数字在此补偿） -->
         <div class="dr-section">
           <div class="sec-title">关键信息</div>
-          <div class="sec-desc muted">资产基础信息与销售口径</div>
+          <div class="sec-desc muted">产品基础信息与销售口径</div>
           <div class="info-grid info-grid-1">
             <div class="info-item">
               <span class="il">销售单价</span>
               <!-- 遥感容器：按明细定价（明细单价为权威口径） -->
               <span v-if="isRemote" class="iv iv-weak">按明细定价</span>
-              <!-- ADR-008：包量定价资产单价为参考口径（元/万Token），不参与计价 -->
+              <!-- ADR-008：包量定价产品单价为参考口径（元/万Token），不参与计价 -->
               <span v-else-if="isAmountMode(drawerAsset)" class="iv">
-                {{ drawerAsset.salePrice ? `约 ¥${drawerAsset.salePrice}/万Token（参考）` : '-' }}
+                {{ drawerAsset.salePrice ? `¥${drawerAsset.salePrice}/万Token（参考）` : '-' }}
               </span>
               <span v-else class="iv">{{ drawerAsset.salePrice ? formatMoney(drawerAsset.salePrice) : '-' }}<template v-if="drawerAsset.repeatSale"> / {{ drawerAsset.unit }}</template></span>
             </div>
@@ -649,7 +662,7 @@ const boardMeta = computed(() => {
               <span class="iv">{{ drawerAsset.spec || '-' }}</span>
             </div>
             <div class="info-item">
-              <span class="il">入库时间</span>
+              <span class="il">登记时间</span>
               <span class="iv">{{ drawerAsset.inboundDate || '-' }}</span>
             </div>
             <div class="info-item">
@@ -660,7 +673,7 @@ const boardMeta = computed(() => {
               <span class="il">备注</span>
               <span class="iv">{{ drawerAsset.remark }}</span>
             </div>
-            <!-- repeatSale 普通资产：销售口径 2 行（对外页面不展示累计售卖金额，ADR-011） -->
+            <!-- repeatSale 普通产品：销售口径 2 行（对外页面不展示累计售卖金额，ADR-011） -->
             <template v-if="drawerAsset.repeatSale && !isRemote">
               <div class="info-item">
                 <span class="il">数据规模</span>
@@ -689,7 +702,7 @@ const boardMeta = computed(() => {
           </div>
         </div>
 
-        <!-- ADR-011：容器资产五段式第 3 段——可售明细 -->
+        <!-- ADR-011：容器产品五段式第 3 段——可售明细 -->
         <div v-if="isRemote" class="dr-section">
           <div class="sec-title">可售明细</div>
           <div class="sec-desc muted">按 省 / 精度 / 月份 维护的可售子项（只计次不扣量）</div>
@@ -708,7 +721,7 @@ const boardMeta = computed(() => {
               <template #default="{ row }">{{ dSoldMap.get(row.id) ?? 0 }}</template>
             </el-table-column>
           </el-table>
-          <el-empty v-else description="暂无可售明细，请在资产详情维护" :image-size="56" />
+          <el-empty v-else description="暂无可售明细，请在产品详情维护" :image-size="56" />
         </div>
 
         <!-- 交付物（全类型统一 15px 标题 + 弱说明） -->
@@ -736,10 +749,10 @@ const boardMeta = computed(() => {
           </div>
         </div>
 
-        <!-- 最近动态（全类型统一：操作日志 + 出入库流水合并，细线时间线） -->
+        <!-- 最近动态（全类型统一：操作日志 + 数量流水合并，细线时间线） -->
         <div class="dr-section">
           <div class="sec-title">最近动态</div>
-          <div class="sec-desc muted">操作日志与出入库流水合并，倒序前 8 条 · 关联销售 {{ dProjects.length }} 项</div>
+          <div class="sec-desc muted">操作日志与数量流水合并，倒序前 8 条 · 关联销售 {{ dProjects.length }} 项</div>
           <div v-if="dActivities.length" class="rs-tl">
             <div v-for="act in dActivities" :key="act.key" class="rs-tl-item">
               <span class="rs-tl-dot" :class="act.kind" aria-hidden="true"></span>
@@ -777,7 +790,7 @@ const boardMeta = computed(() => {
       />
     </el-dialog>
 
-    <!-- 资产直接下单（与购物车下单同一表单，单资产 + 数量；遥感数据 = 订单级客户 + N 行明细） -->
+    <!-- 产品直接下单（与购物车下单同一表单，单产品 + 数量；遥感数据 = 订单级客户 + N 行明细） -->
     <SalesOrderDialog
       v-model="saleVisible"
       title="销售下单"
@@ -853,7 +866,7 @@ const boardMeta = computed(() => {
 
 <!-- 抽屉样式（非 scoped：抽屉内容挂载到 body，scoped 选择器无法命中） -->
 <style>
-/* ============ 资产快览抽屉 ============ */
+/* ============ 产品快览抽屉 ============ */
 .asset-drawer .el-drawer__header {
   margin-bottom: 0;
   padding: 16px 20px;
@@ -937,7 +950,7 @@ const boardMeta = computed(() => {
   margin-left: 2px;
 }
 
-/* 库存进度条 */
+/* 数量进度条 */
 .asset-drawer .dr-bar {
   display: flex;
   height: 8px;
@@ -1052,7 +1065,7 @@ const boardMeta = computed(() => {
   align-items: center;
   gap: 8px;
 }
-/* 该类资产业务规则提示 */
+/* 该类产品业务规则提示 */
 .asset-drawer .dr-rule {
   display: flex;
   align-items: flex-start;

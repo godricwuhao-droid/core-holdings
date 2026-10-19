@@ -1,10 +1,10 @@
 <script setup lang="ts">
 /**
- * 基础设置 - 资产交付物设置
+ * 基础设置 - 产品交付物设置
  *
- * 两级结构：板块大类页签（具身智能/卫星服务/…）→ 大类内资产类型胶囊切换，
+ * 两级结构：板块大类页签（具身智能/卫星服务/…）→ 大类内产品类型胶囊切换，
  * 每类独立配置标准交付包（交付物名称 / 分类 / 默认必选 / 适用说明）。
- * 资产详情页的「交付物」清单按类型模板初始化。
+ * 产品详情页的「交付物」清单按类型模板初始化。
  */
 import { computed, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -37,7 +37,7 @@ import {
 } from '@/api'
 import { canWrite, READONLY_TIP } from '@/auth'
 
-/** 资产类型 → 线性图标（仅作识别，不用插画） */
+/** 产品类型 → 线性图标（仅作识别，不用插画） */
 const TYPE_ICONS: Record<string, typeof Cpu> = {
   机器人: Service,
   数采设备: Collection,
@@ -51,11 +51,11 @@ const TYPE_ICONS: Record<string, typeof Cpu> = {
 
 /** 一级：板块大类 */
 const activeBoard = ref<Board>(CATEGORY_UNITS[0].board)
-/** 当前大类下的资产类型（二级） */
+/** 当前大类下的产品类型（二级） */
 const boardTypes = computed(() =>
   CATEGORY_UNITS.filter((cu) => cu.board === activeBoard.value),
 )
-/** 二级：资产类型细类 */
+/** 二级：产品类型细类 */
 const activeType = ref(CATEGORY_UNITS[0].type)
 watch(activeBoard, () => {
   const first = boardTypes.value[0]
@@ -71,7 +71,7 @@ const activeCu = computed(
 const dialog = reactive({
   visible: false,
   editing: null as DeliverableTemplateItem | null,
-  type: '', // 资产类型
+  type: '', // 产品类型
   submitting: false,
   form: {
     name: '',
@@ -112,7 +112,7 @@ async function handleSubmit() {
       ElMessage.success('更新成功')
     } else {
       await addTemplateItem(dialog.type, { ...dialog.form })
-      ElMessage.success('新增成功，新初始化的资产将包含该交付物')
+      ElMessage.success('新增成功，新初始化的产品将包含该交付物')
     }
     dialog.visible = false
   } catch (e) {
@@ -125,7 +125,7 @@ async function handleSubmit() {
 async function handleDelete(type: string, item: DeliverableTemplateItem) {
   try {
     await ElMessageBox.confirm(
-      `确定删除【${type}】的交付物「${item.name}」吗？仅影响后续新初始化的资产。`,
+      `确定删除【${type}】的交付物「${item.name}」吗？仅影响后续新初始化的产品。`,
       '删除确认',
       { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
     )
@@ -149,9 +149,9 @@ void db
     <!-- 页面头部 -->
     <div class="page-head">
       <div>
-        <div class="crumb">基础设置 / 资产交付物设置</div>
-        <h1>资产交付物设置</h1>
-        <div class="desc">按资产类型独立配置标准交付包；资产按类型模板初始化交付物清单，销售交付时按清单选择版本。</div>
+        <div class="crumb">基础设置 / 产品交付物设置</div>
+        <h1>产品交付物设置</h1>
+        <div class="desc">按产品类型独立配置标准交付包；产品按类型模板初始化交付物清单，销售交付时按清单选择版本。</div>
       </div>
       <div class="head-actions">
         <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="bottom">
@@ -168,7 +168,7 @@ void db
     <div class="info-bar">
       <el-icon aria-hidden="true"><InfoFilled /></el-icon>
       <span>
-        模板修改即时生效，仅影响之后新初始化的资产；已在资产详情中生成清单的交付物需在资产内单独维护。验收类交付物默认「待完善」，完善后可编辑版本并置为「已就绪」。
+        模板修改即时生效，仅影响之后新初始化的产品；已在产品详情中生成清单的交付物需在产品内单独维护。验收类交付物默认「待完善」，完善后可编辑版本并置为「已就绪」。
       </span>
     </div>
 
@@ -182,7 +182,7 @@ void db
       />
     </el-tabs>
 
-    <!-- 二级：大类内资产类型胶囊切换 -->
+    <!-- 二级：大类内产品类型胶囊切换 -->
     <div class="type-chips">
       <button
         v-for="cu in boardTypes"
@@ -276,7 +276,7 @@ void db
       :close-on-click-modal="false"
     >
       <el-form label-width="96px">
-        <el-form-item v-if="!dialog.editing" label="资产类型">
+        <el-form-item v-if="!dialog.editing" label="产品类型">
           <el-input :model-value="dialog.type" disabled />
           <div class="muted dl-tip">针对当前选中的类型新增；其他类型请先在上方切换页签 / 胶囊</div>
         </el-form-item>
@@ -339,7 +339,7 @@ void db
   font-weight: 500;
 }
 
-/* 二级：资产类型胶囊 */
+/* 二级：产品类型胶囊 */
 .type-chips {
   display: flex;
   flex-wrap: wrap;

@@ -1,4 +1,4 @@
-"""Core Holdings 资产管理平台 - 后端入口（FastAPI + SQLAlchemy + SQLite）
+"""Core Holdings 产品及服务平台 - 后端入口（FastAPI + SQLAlchemy + SQLite）
 
 启动：cd backend && uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 """
@@ -25,13 +25,13 @@ def _ensure_migration() -> None:
         with engine.begin() as conn:
             conn.execute(text("ALTER TABLE assets ADD COLUMN contractFile VARCHAR(255) DEFAULT ''"))
         print("[migration] assets.contractFile 列已补充")
-    # 操作日志关联资产 id（target='asset' 时记录，便于按资产追溯）；幂等补列
+    # 操作日志关联产品 id（target='asset' 时记录，便于按产品追溯）；幂等补列
     log_cols = [c["name"] for c in insp.get_columns("logs")]
     if "assetId" not in log_cols:
         with engine.begin() as conn:
             conn.execute(text("ALTER TABLE logs ADD COLUMN assetId INTEGER"))
         print("[migration] logs.assetId 列已补充")
-    # 资产功能清单附件（替换 saleDetail 电子表格的 UI 载体；saleDetail 列保留不删）；幂等补列
+    # 产品功能清单附件（替换 saleDetail 电子表格的 UI 载体；saleDetail 列保留不删）；幂等补列
     if "featureDoc" not in cols:
         with engine.begin() as conn:
             conn.execute(text("ALTER TABLE assets ADD COLUMN featureDoc VARCHAR(255) DEFAULT ''"))
@@ -47,6 +47,13 @@ def _ensure_migration() -> None:
         with engine.begin() as conn:
             conn.execute(text("ALTER TABLE projects ADD COLUMN businessOwner VARCHAR(64) DEFAULT ''"))
         print("[migration] projects.businessOwner 列已补充")
+    # 项目下单账号（实际登录下单的 username；存量为空）。生态人员（viewer）按
+    # 「自己下单」口径过滤销售项目可见性（2026-10-16）；幂等补列 + 索引
+    if "creator" not in proj_cols:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE projects ADD COLUMN creator VARCHAR(64) DEFAULT ''"))
+            conn.execute(text("CREATE INDEX ix_projects_creator ON projects (creator)"))
+        print("[migration] projects.creator 列已补充")
     # 流水操作账号（存量流水保持空，前端显示 "-"）；幂等补列
     flow_cols = [c["name"] for c in insp.get_columns("flows")]
     if "operator" not in flow_cols:
@@ -58,7 +65,7 @@ def _ensure_migration() -> None:
         with engine.begin() as conn:
             conn.execute(text("ALTER TABLE logs ADD COLUMN changes VARCHAR(512) DEFAULT ''"))
         print("[migration] logs.changes 列已补充")
-    # 项目明细「下单时刻是否真实加锁」标记（repeatSale 资产下单不加锁）；存量数据视为 False
+    # 项目明细「下单时刻是否真实加锁」标记（repeatSale 产品下单不加锁）；存量数据视为 False
     item_cols = [c["name"] for c in insp.get_columns("project_items")]
     if "locked" not in item_cols:
         with engine.begin() as conn:
@@ -71,7 +78,7 @@ def _ensure_migration() -> None:
             conn.execute(text("ALTER TABLE project_items ADD COLUMN contractId INTEGER"))
             conn.execute(text("CREATE INDEX ix_project_items_contractId ON project_items (contractId)"))
         print("[migration] project_items.contractId 列已补充")
-    # 2) outbounds.contractId：出库记录精确关联合同（projectId 保留）
+    # 2) outbounds.contractId：交付记录精确关联合同（projectId 保留）
     ob_cols = [c["name"] for c in insp.get_columns("outbounds")]
     if "contractId" not in ob_cols:
         with engine.begin() as conn:
@@ -125,8 +132,8 @@ def _ensure_migration() -> None:
             conn.execute(text("ALTER TABLE project_items ADD COLUMN itemId INTEGER"))
             conn.execute(text("CREATE INDEX ix_project_items_itemId ON project_items (itemId)"))
         print("[migration] project_items.itemId 列已补充")
-    # 12) ADR-011 数据清理（幂等一次性）：删除 ADR-010 演示遥感数据资产
-    #（type='遥感数据' 且带三维字段值的存量行；ADR-011 新建的父资产容器 4 列恒空，不会被误删）。
+    # 12) ADR-011 数据清理（幂等一次性）：删除 ADR-010 演示遥感数据产品
+    #（type='遥感数据' 且带三维字段值的存量行；ADR-011 新建的父产品容器 4 列恒空，不会被误删）。
     # 删前 assert 无合同/购物车/项目明细引用（当前库应无；有引用则启动失败暴露问题，
     # 与 delete_asset 的 400 逻辑等价，迁移场景直接 assert）。
     with engine.begin() as conn:
@@ -141,19 +148,19 @@ def _ensure_migration() -> None:
             ), {"aid": aid}).scalar() + conn.execute(
                 text("SELECT COUNT(*) FROM cart_items WHERE assetId=:aid"), {"aid": aid}
             ).scalar()
-            assert refs == 0, f"ADR-011 迁移：演示资产 {aname}(id={aid}) 存在 {refs} 条销售/购物车引用，禁止自动删除"
+            assert refs == 0, f"ADR-011 迁移：演示产品 {aname}(id={aid}) 存在 {refs} 条销售/购物车引用，禁止自动删除"
             conn.execute(text("DELETE FROM rs_items WHERE assetId=:aid"), {"aid": aid})
             conn.execute(text("DELETE FROM asset_deliverables WHERE asset_id=:aid"), {"aid": aid})
             conn.execute(text("DELETE FROM flows WHERE assetId=:aid"), {"aid": aid})
             conn.execute(text("DELETE FROM assets WHERE id=:aid"), {"aid": aid})
-            print(f"[migration] ADR-011 已删除演示遥感数据资产 {aname} (id={aid})")
-    # 9) ADR-008 存量回填：卫星 Token 资产 pricingMode → 'amount'（幂等，salePrice 原值保留为参考值）
+            print(f"[migration] ADR-011 已删除演示遥感数据产品 {aname} (id={aid})")
+    # 9) ADR-008 存量回填：卫星 Token 产品 pricingMode → 'amount'（幂等，salePrice 原值保留为参考值）
     with engine.begin() as conn:
         r = conn.execute(text(
             "UPDATE assets SET pricingMode='amount' WHERE type='卫星Token' AND pricingMode='unit'"
         ))
         if r.rowcount:
-            print(f"[migration] 卫星Token 资产 pricingMode 回填 {r.rowcount} 条 → amount")
+            print(f"[migration] 卫星Token 产品 pricingMode 回填 {r.rowcount} 条 → amount")
     # 10) ADR-009 购物车按登录用户隔离：存量 userId='admin' 行回填为 admin 账号的 users.id
     #（隔离后 admin 仍可见自己的存量行；幂等——第二次启动无 userId='admin' 行，命中 0 条）
     with engine.begin() as conn:
@@ -297,7 +304,7 @@ app.include_router(api_router)
 
 
 def seed_if_empty() -> None:
-    """首次启动写入种子数据（资产/供应商/分类单位/交付物模板）"""
+    """首次启动写入种子数据（产品/供应商/分类单位/交付物模板）"""
     db = SessionLocal()
     try:
         if db.query(Asset).count() > 0:
@@ -312,17 +319,17 @@ def seed_if_empty() -> None:
         for tname, items in seed_data.DELIVERABLE_TEMPLATES.items():
             for it in items:
                 db.add(DeliverableTemplate(type=tname, **it))
-        db.flush()  # 生成资产 id，用于关联初始流水
+        db.flush()  # 生成产品 id，用于关联初始流水
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
         for asset, raw in assets:
             db.add(AssetFlow(
                 assetId=asset.id, type="purchase_in", qty=raw["quantity"],
                 unit=raw["unit"], amount=0, date=raw["inboundDate"],
-                ref="-", note="历史入库（初始化）", operator="system",
+                ref="-", note="历史登记（初始化）", operator="system",
             ))
             db.add(OpLog(
-                target="asset", targetName=raw["name"], action="入库",
-                detail=f"入库 {raw['quantity']}{raw['unit']}", operator="admin", time=now,
+                target="asset", targetName=raw["name"], action="登记",
+                detail=f"登记 {raw['quantity']}{raw['unit']}", operator="admin", time=now,
                 assetId=asset.id,
             ))
         db.commit()

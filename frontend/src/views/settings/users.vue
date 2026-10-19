@@ -36,8 +36,8 @@ function roleLabel(role: string): string {
 const ACTION_TYPE_OPTIONS = [
   { value: '', label: '全部' },
   { value: 'sale', label: '销售' },
-  { value: 'outbound', label: '出库' },
-  { value: 'asset_change', label: '资产变更' },
+  { value: 'outbound', label: '交付' },
+  { value: 'asset_change', label: '产品变更' },
   { value: 'setting', label: '设置' },
   { value: 'user_mgmt', label: '账号管理' },
   { value: 'auth', label: '登录认证' },
@@ -276,7 +276,7 @@ onMounted(() => {
     <div class="info-bar">
       <el-icon aria-hidden="true"><InfoFilled /></el-icon>
       <span>
-        管理员：全部权限（含账号与审计）；商务人员：业务写操作（资产 / 销售 / 出库 / 基础资料）；生态人员：仅资产管理浏览与购物车（加购 / 改数量 / 改客户 / 删行 / 结算 / 直接下单），资产编辑类操作禁用。
+        管理员：全部权限（含账号与审计）；商务人员：业务写操作（产品 / 销售 / 交付 / 基础资料）；生态人员：仅产品浏览与购物车（加购 / 改数量 / 改客户 / 删行 / 结算 / 直接下单），产品编辑类操作禁用。
       </span>
     </div>
 

@@ -17,15 +17,15 @@ export interface BoardMeta {
 export const BOARDS: BoardMeta[] = [
   { key: 'embodied', label: '具身智能' },
   { key: 'satellite', label: '卫星服务' },
-  { key: 'software', label: '软件库存' },
-  { key: 'hardware', label: '硬件库存' },
+  { key: 'software', label: '软件产品' },
+  { key: 'hardware', label: '硬件产品' },
   { key: 'compute', label: '算力服务', wip: true },
 ]
 
 export const boardLabel = (b: Board) => BOARDS.find((x) => x.key === b)?.label ?? b
 
 /**
- * 资产类型 → 标签色板 class（列表类型列区分颜色，覆盖 light/plain 两种效果）
+ * 产品类型 → 标签色板 class（列表类型列区分颜色，覆盖 light/plain 两种效果）
  * 同一板块内保证互异：具身智能 蓝/绿/灰，卫星 橙/紫，软件 蓝，硬件 绿，算力 橙
  */
 export const TYPE_TAG_CLASS: Record<string, string> = {
@@ -61,43 +61,43 @@ export function entityShort(name: string): string {
 }
 
 // ============================================================
-// 资产
+// 产品
 // ============================================================
-/** 资产状态：仅两种，由库存自动判定（锁定/在售关联在销售项目中体现，不占用状态） */
+/** 产品状态：仅两种，由数量自动判定（锁定/在售关联在销售项目中体现，不占用状态） */
 export type AssetStatus = 'in_stock' | 'all_sold'
 
 export interface Asset {
   id: number
-  code: string // 资产编号（自动生成，不可编辑）
+  code: string // 产品编号（自动生成，不可编辑）
   name: string
   board: Board
-  type: string // 资产类型
+  type: string // 产品类型
   subject: string // 所在主体
   unit: string // 计量单位
-  quantity: number // 资产总数
+  quantity: number // 产品总数
   lockedQty: number // 锁定数量（被进行中的销售项目占用）
-  shippedQty: number // 售卖数量（已出库）
+  shippedQty: number // 售卖数量（已交付）
   repeatSale: boolean // 可重复售卖
   pricingMode?: 'unit' | 'amount' // 计价模式（ADR-008）：unit=单价×数量（默认）；amount=包量金额权威（卫星 Token），salePrice 仅参考
   salePrice: number // 单价（元/单位）；amount 模式下为参考单价（元/万Token），不参与计价
   soldAmount: number // 累计售卖金额（元）
   soldCount: number // 授权/销售次数（可重复售卖）
-  status: AssetStatus // 库存可售 / 全部出售
-  inboundDate: string // 入库时间
+  status: AssetStatus // 可售 / 全部出售
+  inboundDate: string // 登记时间
   expiryDate: string // 到期时间（长期买断时为空）
   perpetual: boolean // 长期买断（无到期时间）
   spec: string // 规格/说明
-  saleDetail?: IWorkbookData // 售卖内容明细（Excel 快照，入库时录入；结构自由、可含行列合并）
+  saleDetail?: IWorkbookData // 售卖内容明细（Excel 快照，登记时录入；结构自由、可含行列合并）
   contractFile?: string // 产品清单（uploads 目录散列文件名，抽屉内可在线预览；展示原始名走 fileDisplayName）
   featureDoc?: string // 功能清单附件（uploads 目录散列文件名；"" = 未上传，与 contractFile 同模式）
   remark: string
   updatedAt: string
 }
 
-/** 遥感数据可售明细（ADR-011，Supersedes ADR-010）：父资产（type='遥感数据'）下的可售卖子项，维度 省（可含市）× 精度 × 月份 */
+/** 遥感数据可售明细（ADR-011，Supersedes ADR-010）：父产品（type='遥感数据'）下的可售卖子项，维度 省（可含市）× 精度 × 月份 */
 export interface RsItem {
   id: number
-  assetId: number // 父资产 id
+  assetId: number // 父产品 id
   province: string // 省/自治区/直辖市，必填
   city: string // 市，可空（默认 ""）
   resolution: number // 精度（米），如 1.5
@@ -118,7 +118,7 @@ export function isAmountMode(a: Pick<Asset, 'pricingMode'>): boolean {
   return a.pricingMode === 'amount'
 }
 
-/** 文件元数据（bootstrap files 全量）：storedName=散列名（URL/资产字段用），name=原始文件名（展示用） */
+/** 文件元数据（bootstrap files 全量）：storedName=散列名（URL/产品字段用），name=原始文件名（展示用） */
 export interface FileMeta {
   storedName: string
   name: string
@@ -135,7 +135,7 @@ export interface CartItem {
   itemId?: number // 遥感数据明细 id（ADR-011，挂 rs_items；含 itemId 行数量恒 1）
   customer?: string // 行级客户（ADR-007）：结算时按 customer 分组拆合同；"" = 未填写
   qty: number
-  amount?: number // 合同金额（元，整数；ADR-008，仅包量定价资产行有值）
+  amount?: number // 合同金额（元，整数；ADR-008，仅包量定价产品行有值）
   createdAt: string
   updatedAt: string
 }
@@ -149,27 +149,27 @@ export function availableQty(a: Asset): number | null {
 /** 可售金额 = 可售数量 × 单价。
  * 包量定价（amount 模式，卫星Token）返回 0：其 salePrice 为「元/万Token」参考值（不参与计价，
  * ADR-008），quantity 为 Token 个数，两者相乘不是真实金额（曾导致看板/板块「可售金额」虚高）。
- * 该类资产以合同金额（整数元）为权威口径，已体现在项目/合同的 contractAmount 统计中。 */
+ * 该类产品以合同金额（整数元）为权威口径，已体现在项目/合同的 contractAmount 统计中。 */
 export function availableValue(a: Asset): number {
   if (isAmountMode(a)) return 0
   const q = availableQty(a)
   return q === null ? 0 : q * a.salePrice
 }
 
-/** 资产库存状态（两态，列表/详情/算力板块共用）：库存可售（绿）/ 暂无库存（红）。可重复售卖归入"库存可售" */
+/** 产品数量状态（两态，列表/详情/算力板块共用）：可售（绿）/ 已售罄（红）。可重复售卖归入"可售" */
 export type AssetStockState = 'in_stock' | 'no_stock'
 
-/** 两态判定：无可售库存（售罄 / 全锁定 / 无库存）→ 暂无库存；否则 → 库存可售（可重复售卖自然归入库存可售） */
+/** 两态判定：无可用数量（售罄 / 全锁定 / 无数量）→ 已售罄；否则 → 可售（可重复售卖自然归入可售） */
 export function assetStockState(a: Asset): AssetStockState {
   return noSellableStock(a) ? 'no_stock' : 'in_stock'
 }
 
 export const ASSET_STOCK_STATE: Record<AssetStockState, { label: string; tag: 'success' | 'info' | 'warning' | 'danger' | 'primary' }> = {
-  in_stock: { label: '库存可售', tag: 'success' },
-  no_stock: { label: '暂无库存', tag: 'danger' },
+  in_stock: { label: '可售', tag: 'success' },
+  no_stock: { label: '已售罄', tag: 'danger' },
 }
 
-/** 是否无可售库存（非可重复售卖且可售数量≤0）：用于禁止编辑 / 登记销售 */
+/** 是否无可用数量（非可重复售卖且可售数量≤0）：用于禁止编辑 / 登记销售 */
 export function noSellableStock(a: Asset): boolean {
   return !a.repeatSale && (availableQty(a) ?? 0) <= 0
 }
@@ -192,11 +192,13 @@ export function expiringSoon(a: Asset, days: number, now = Date.now()): boolean 
 // 销售项目
 // ============================================================
 export type ProjectStatus =
+  | 'pending'
   | 'active'
   | 'delivered'
   | 'terminated'
 
 export const PROJECT_STATUS: Record<ProjectStatus, { label: string; tag: 'success' | 'info' | 'warning' | 'danger' | 'primary' }> = {
+  pending: { label: '待审核', tag: 'warning' },
   active: { label: '进行中', tag: 'primary' },
   delivered: { label: '已完成', tag: 'success' },
   terminated: { label: '已终止', tag: 'danger' },
@@ -211,11 +213,11 @@ export const PROJECT_FLOW: ProjectStatus[] = [
 export type ItemStatus = 'pending_asset' | 'pending_amount' | 'locked' | 'confirmed' | 'shipped' | 'released'
 
 export const ITEM_STATUS: Record<ItemStatus, { label: string; tag: 'success' | 'info' | 'warning' | 'danger' | 'primary' }> = {
-  pending_asset: { label: '待关联资产', tag: 'info' },
+  pending_asset: { label: '待关联产品', tag: 'info' },
   pending_amount: { label: '待确认金额', tag: 'warning' },
   locked: { label: '已锁定资源', tag: 'primary' },
   confirmed: { label: '已确认销售', tag: 'success' },
-  shipped: { label: '已完成出库', tag: 'success' },
+  shipped: { label: '已完成交付', tag: 'success' },
   released: { label: '已取消释放', tag: 'danger' },
 }
 
@@ -243,13 +245,14 @@ export interface Project {
   customer: string // 多合同时为空字符串（前端显示「N 位客户」）
   industry: string
   rep: string // 生态人员（原销售人员）
+  creator?: string // 实际下单账号（2026-10-16 起；生态可见性口径 creator==自己，存量为空回退 rep）
   businessOwner?: string // 商务负责人（存量项目为空，展示 '-'）
   subject: string
   status: ProjectStatus // 派生字段：由名下合同状态推导（ADR-007），前端不可手动变更
   expectedAmount: number // 预计销售金额（=Σ合同金额，派生）
-  quoteAmount: number // 报价金额
+  quoteAmount?: number // 报价金额（2026-10-19 废弃，仅存量数据）
   contractAmount: number // 合同金额（=Σ合同金额，派生兼容口径）
-  paidAmount: number // 已回款金额
+  paidAmount?: number // 已回款金额（2026-10-19 废弃，仅存量数据）
   expectedSignDate: string
   lastFollowDate: string
   remark: string
@@ -260,7 +263,7 @@ export interface Project {
 }
 
 // ============================================================
-// 合同（ADR-007：项目下按客户拆分的合同，库存联动最小单位）
+// 合同（ADR-007：项目下按客户拆分的合同，数量联动最小单位）
 // ============================================================
 export interface ContractItem {
   id: number
@@ -283,10 +286,10 @@ export interface Contract {
   id: number
   code: string // 合同编号 HT-XXXX
   projectId: number
-  customer: string // 合同客户（合同内强制同一资产主体）
-  subject: string // 资产主体（由明细带出）
+  customer: string // 合同客户（合同内强制同一产品主体）
+  subject: string // 产品主体（由明细带出）
   contractAmount: number // 合同金额（元）
-  status: ProjectStatus // active / delivered / terminated（与项目三态同构）
+  status: ProjectStatus // pending / active / delivered / terminated（与项目四态同构；ADR-012 pending=待审核）
   remark: string
   items: ContractItem[]
   createdAt: string
@@ -294,7 +297,7 @@ export interface Contract {
 }
 
 // ============================================================
-// 出库记录
+// 交付记录
 // ============================================================
 export type OutboundType = 'physical' | 'data_auth' | 'software_auth' | 'service'
 
@@ -305,7 +308,7 @@ export const OUTBOUND_TYPES: Record<OutboundType, string> = {
   service: '服务开通',
 }
 
-/** 板块默认出库类型 */
+/** 板块默认交付类型 */
 export function defaultOutboundType(board: Board): OutboundType {
   if (board === 'satellite') return 'data_auth'
   if (board === 'software') return 'software_auth'
@@ -313,14 +316,14 @@ export function defaultOutboundType(board: Board): OutboundType {
   return 'physical'
 }
 
-/** 出库性质：new=新出库（扣减当前库存）；history=历史补录（仅登记台账，不扣减库存） */
+/** 交付性质：new=新交付（扣减当前数量）；history=历史补录（仅登记台账，不扣减数量） */
 export type OutboundMode = 'new' | 'history'
 
 export interface Outbound {
   id: number
-  code: string // 出库单号 CK-XXXX
+  code: string // 交付单号 CK-XXXX
   projectId: number | null
-  contractId?: number | null // 关联合同（ADR-007）：合同交付自动出库时非空；存量/手工补录为 null
+  contractId?: number | null // 关联合同（ADR-007）：合同交付自动交付时非空；存量/手工补录为 null
   projectName: string
   customer: string
   assetId: number
@@ -342,9 +345,9 @@ export interface Outbound {
 export type FlowType = 'purchase_in' | 'project_lock' | 'sale_out' | 'cancel_release' | 'manual_adjust'
 
 export const FLOW_TYPES: Record<FlowType, { label: string; tag: 'success' | 'info' | 'warning' | 'danger' | 'primary' }> = {
-  purchase_in: { label: '入库', tag: 'success' },
+  purchase_in: { label: '登记', tag: 'success' },
   project_lock: { label: '项目锁定', tag: 'primary' },
-  sale_out: { label: '销售出库', tag: 'warning' },
+  sale_out: { label: '销售交付', tag: 'warning' },
   cancel_release: { label: '取消释放', tag: 'info' },
   manual_adjust: { label: '手工调整', tag: 'danger' },
 }
@@ -359,20 +362,20 @@ export interface AssetFlow {
   date: string
   ref: string // 关联单号/项目
   note: string
-  operator?: string // 操作账号（存量流水为空显示 -；"system" = 初始化入库，显示「系统」）
+  operator?: string // 操作账号（存量流水为空显示 -；"system" = 初始化登记，显示「系统」）
 }
 
 export interface OpLog {
   id: number
   target: 'asset' | 'project' | 'outbound' | 'setting'
   targetName: string
-  /** 目标为资产时的资产 ID（后端 logs[] 回传，用于按 ID 精确过滤、避免重名串台） */
+  /** 目标为产品时的产品 ID（后端 logs[] 回传，用于按 ID 精确过滤、避免重名串台） */
   assetId?: number
-  action: string // 新增/编辑/状态变更/删除/出库...
+  action: string // 新增/编辑/状态变更/删除/交付...
   detail: string
   operator: string
   time: string
-  changes?: string // 字段级变更明细（仅资产「编辑」日志有；"" = 无变更不展示）
+  changes?: string // 字段级变更明细（仅产品「编辑」日志有；"" = 无变更不展示）
 }
 
 // ============================================================
@@ -394,7 +397,7 @@ export interface CategoryUnit {
 }
 
 // ============================================================
-// 交付物（按资产类型可配置的标准交付包）
+// 交付物（按产品类型可配置的标准交付包）
 // ============================================================
 export type DeliverableCategory = 'install' | 'license' | 'feature' | 'accept'
 
@@ -408,7 +411,7 @@ export const DELIVERABLE_CATEGORIES: Record<
   accept: { label: '验收材料', icon: 'neutral' },
 }
 
-/** 交付物模板项（基础设置中按资产类型配置） */
+/** 交付物模板项（基础设置中按产品类型配置） */
 export interface DeliverableTemplateItem {
   id: number
   name: string
@@ -417,7 +420,7 @@ export interface DeliverableTemplateItem {
   note: string // 适用说明
 }
 
-/** 交付物实例项（资产详情中，由模板初始化 + 可维护状态/版本） */
+/** 交付物实例项（产品详情中，由模板初始化 + 可维护状态/版本） */
 export interface AssetDeliverable {
   id: number
   name: string
@@ -489,18 +492,18 @@ export function formatTokens(n: number | null | undefined): string {
   return `${n} 个`
 }
 
-/** 数量展示口径（ADR-008）：包量定价（Token）资产用 formatTokens，其余用 formatWan */
+/** 数量展示口径（ADR-008）：包量定价（Token）产品用 formatTokens，其余用 formatWan */
 export function formatAssetQty(a: Pick<Asset, 'pricingMode'>, n: number | null | undefined): string {
   return isAmountMode(a) ? formatTokens(n) : formatWan(n)
 }
 
 /**
  * 派生参考单价（ADR-008，仅包量定价模式展示用）：合同金额 ÷ 数量 ÷ 1e4（元/万Token），
- * 保留 4 位小数并带「约」；不参与任何金额计算。
+ * 保留 4 位小数（2026-10-16 起去掉「约」前缀，直接显示数值）；不参与任何金额计算。
  */
 export function derivedUnitPrice(amount: number, qty: number): string {
   if (!amount || !qty) return '-'
-  return `约 ${(amount / qty / 1e4).toFixed(4)} 元/万Token`
+  return `${(amount / qty / 1e4).toFixed(4)} 元/万Token`
 }
 
 /** 标准金额展示：字段单位即元（ADR-006），直显「¥ + 千分位 + 两位小数」，0/空显示 '-' */

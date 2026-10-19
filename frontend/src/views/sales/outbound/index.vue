@@ -1,9 +1,9 @@
 <script setup lang="ts">
 /**
- * 销售管理 - 销售出库记录
+ * 销售管理 - 销售交付记录
  *
  * 来源：销售项目交付完成自动生成 + 手工补录
- * 撤销出库必须填写原因，并反向生成调整流水（设计稿 8）
+ * 撤销交付必须填写原因，并反向生成调整流水（设计稿 8）
  */
 import { computed, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
@@ -34,8 +34,8 @@ function goProjectDetail(row: Outbound) {
 }
 
 /**
- * 关联合同（ADR-007）：contractId 非空（合同交付自动出库）→ 合同号；
- * 合同无独立详情页，故整词纯文本 mono 展示**不跳转**（避免死链），hover tooltip 显示合同客户名；
+ * 关联合同（ADR-007）：contractId 非空（合同交付自动生成交付记录）→ 按「客户-产品主体」命名展示（2026-10-19，
+ * 合同编号不再对外展示）；纯文本**不跳转**（合同无独立详情页，避免死链），hover tooltip 显示完整「客户 - 主体」；
  * 存量 / 手工补录 contractId 为 null（或合同已随项目删除）→ '-'。
  */
 function contractOf(row: Outbound) {
@@ -45,14 +45,15 @@ function contractOf(row: Outbound) {
 const list = computed(() =>
   db.outbounds.filter((o) => {
     const kw = searchText.value.trim()
-    if (kw && !`${o.code}${o.assetName}${o.projectName}${o.customer}`.includes(kw)) return false
+    // 交付单号已不在页面展示（2026-10-19），搜索不再匹配 code
+    if (kw && !`${o.assetName}${o.projectName}${o.customer}`.includes(kw)) return false
     if (typeFilter.value && o.type !== typeFilter.value) return false
     return true
   }),
 )
 
 // ============================================================
-// 补录出库
+// 补录交付
 // ============================================================
 const createDialog = reactive({
   visible: false,
@@ -89,7 +90,7 @@ const activeProjects = computed(() =>
   db.projects.filter((p) => p.status !== 'terminated'),
 )
 
-/** 可选资产：新出库排除无可售库存资产；历史补录放开（仅登记台账） */
+/** 可选产品：新交付排除无可用数量产品；历史补录放开（仅登记台账） */
 const selectableAssets = computed(() =>
   db.assets.filter((a) => (createDialog.form.mode === 'history' ? true : !noSellableStock(a))),
 )
@@ -125,32 +126,32 @@ function onAssetChange() {
 async function confirmCreate() {
   const f = createDialog.form
   if (!f.assetId) {
-    ElMessage.warning('请选择资产')
+    ElMessage.warning('请选择产品')
     return
   }
   if (!f.qty || f.qty <= 0) {
     ElMessage.warning('请输入数量 / 额度')
     return
   }
-  // 新出库：校验不超过可售数量（可重复售卖不限制）；历史补录不校验
+  // 新交付：校验不超过可售数量（可重复售卖不限制）；历史补录不校验
   if (f.mode === 'new') {
     const a = getAsset(f.assetId)
     if (a && !a.repeatSale) {
       const avail = availableQty(a) ?? 0
       if (f.qty > avail) {
-        ElMessage.warning(`「${a.name}」可售 ${formatWan(avail)}${a.unit}，本次出库 ${f.qty} 超出可售数量，请调整数量或改选“历史补录”`)
+        ElMessage.warning(`「${a.name}」可售 ${formatWan(avail)}${a.unit}，本次交付 ${f.qty} 超出可售数量，请调整数量或改选“历史补录”`)
         return
       }
     }
   }
-  // 防重复出库：新出库且关联项目时，检查该项目下该资产的明细是否已全部出库
+  // 防重复交付：新交付且关联项目时，检查该项目下该产品的明细是否已全部交付
   if (f.mode === 'new' && f.projectId) {
     const p = db.projects.find((x) => x.id === f.projectId)
     const a = getAsset(f.assetId)
     if (p && a) {
       const items = p.items.filter((it) => it.assetId === a.id)
       if (items.length > 0 && items.every((it) => it.status === 'shipped' || it.status === 'released')) {
-        ElMessage.warning(`「${a.name}」在项目 ${p.code} 下的明细已全部出库，请勿重复登记；历史记录请改选「历史补录」`)
+        ElMessage.warning(`「${a.name}」在项目 ${p.code} 下的明细已全部交付，请勿重复登记；历史记录请改选「历史补录」`)
         return
       }
     }
@@ -158,7 +159,7 @@ async function confirmCreate() {
   createDialog.submitting = true
   try {
     await createOutbound({ ...f, assetId: f.assetId })
-    ElMessage.success(f.mode === 'history' ? '历史补录登记成功，仅记录台账，未调整当前库存' : '出库登记成功，资产库存已更新')
+    ElMessage.success(f.mode === 'history' ? '历史补录登记成功，仅记录台账，未调整当前数量' : '交付登记成功，产品数量已更新')
     createDialog.visible = false
   } catch (e) {
     ElMessage.error(e instanceof Error ? e.message : '登记失败')
@@ -168,14 +169,14 @@ async function confirmCreate() {
 }
 
 // ============================================================
-// 撤销出库
+// 撤销交付
 // ============================================================
 async function handleRevert(o: Outbound) {
   let reason = ''
   try {
     const { value } = await ElMessageBox.prompt(
-      `撤销出库 ${o.code}（${o.assetName} ${formatWan(o.qty)}${o.unit}）将反向更新资产库存，请填写撤销原因。`,
-      '撤销出库',
+      `撤销交付 ${o.code}（${o.assetName} ${formatWan(o.qty)}${o.unit}）将反向更新产品数量${o.contractId ? '，并把销售记录回退到「进行中」（明细重新锁定，可再次交付）' : ''}，请填写撤销原因。`,
+      '撤销交付',
       {
         inputPattern: /\S+/,
         inputErrorMessage: '撤销原因不能为空',
@@ -188,7 +189,8 @@ async function handleRevert(o: Outbound) {
     return
   }
   await revertOutbound(o.id, reason)
-  ElMessage.success('已撤销并生成调整流水')
+  // 2026-10-19：撤销合同交付会联动回滚合同到「进行中」（项目状态同步重算），提示中体现
+  ElMessage.success(o.contractId ? '已撤销：产品数量已回退，销售记录已回退「进行中」' : '已撤销并生成调整流水')
 }
 </script>
 
@@ -197,15 +199,15 @@ async function handleRevert(o: Outbound) {
     <!-- 页面头部 -->
     <div class="page-head">
       <div>
-        <div class="crumb">销售管理 / 出库记录</div>
-        <h1>销售出库记录</h1>
-        <div class="desc">出库记录由销售项目「交付完成」后自动生成，也支持手工补录；撤销须填写原因并保留审计流水。</div>
+        <div class="crumb">销售管理 / 交付记录</div>
+        <h1>销售交付记录</h1>
+        <div class="desc">交付记录由销售项目「交付完成」后自动生成，也支持手工补录；撤销须填写原因并保留审计流水。</div>
       </div>
       <div class="head-actions">
         <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="bottom">
           <span>
             <el-button type="primary" :icon="Plus" :disabled="!canWrite" @click="openCreate">
-              补录出库记录
+              补录交付记录
             </el-button>
           </span>
         </el-tooltip>
@@ -216,7 +218,7 @@ async function handleRevert(o: Outbound) {
     <div class="stat-cards">
       <div class="stat-card">
         <div>
-          <div class="s-label">出库记录</div>
+          <div class="s-label">交付记录</div>
           <div class="s-value">{{ summary.count }}</div>
           <div class="s-sub">未撤销记录</div>
         </div>
@@ -224,9 +226,9 @@ async function handleRevert(o: Outbound) {
       </div>
       <div class="stat-card">
         <div>
-          <div class="s-label">累计出库金额</div>
+          <div class="s-label">累计交付金额</div>
           <div class="s-value">{{ formatMoney(summary.amount) }}</div>
-          <div class="s-sub">按出库单金额汇总</div>
+          <div class="s-sub">按交付单金额汇总</div>
         </div>
         <el-icon class="s-icon" aria-hidden="true"><Money /></el-icon>
       </div>
@@ -234,7 +236,7 @@ async function handleRevert(o: Outbound) {
         <div>
           <div class="s-label">关联项目</div>
           <div class="s-value">{{ summary.projects }}</div>
-          <div class="s-sub">有出库记录的销售项目</div>
+          <div class="s-sub">有交付记录的销售项目</div>
         </div>
         <el-icon class="s-icon" aria-hidden="true"><Document /></el-icon>
       </div>
@@ -243,20 +245,20 @@ async function handleRevert(o: Outbound) {
     <!-- 业务规则提示条 -->
     <div class="info-bar">
       <el-icon aria-hidden="true"><InfoFilled /></el-icon>
-      <span>撤销出库必须填写原因，系统将反向生成调整流水；审计记录不可删除，仅可追溯。</span>
+      <span>撤销交付必须填写原因，系统将反向生成调整流水；审计记录不可删除，仅可追溯。</span>
     </div>
 
     <!-- 表格卡 -->
     <el-card shadow="never">
       <div class="table-head">
-        <span class="t">出库记录</span>
+        <span class="t">交付记录</span>
         <span class="c">共 {{ list.length }} 条</span>
       </div>
 
       <div class="toolbar">
         <el-input
           v-model="searchText"
-          placeholder="搜索单号 / 资产 / 项目 / 客户"
+          placeholder="搜索产品 / 项目 / 客户"
           clearable
           style="width: 280px;"
           :prefix-icon="Search"
@@ -267,7 +269,7 @@ async function handleRevert(o: Outbound) {
       </div>
 
       <el-table :data="list" border stripe>
-        <el-table-column prop="code" label="出库单号" width="120" align="left" />
+        <!-- 2026-10-19：交付单号列移除（不对外展示）；销售记录改为「客户-产品主体」命名 -->
         <el-table-column label="关联项目" min-width="200">
           <template #default="{ row }">
             <span v-if="row.projectName" style="display: inline-flex; align-items: center; gap: 6px;">
@@ -290,32 +292,35 @@ async function handleRevert(o: Outbound) {
             <el-tag v-else size="small" type="info" effect="plain">补录</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="关联合同" width="110" align="left">
+        <el-table-column label="销售记录" min-width="200" align="left">
           <template #default="{ row }">
+            <!-- 命名方式：客户-产品主体（2026-10-19，替代销售记录编号展示） -->
             <el-tooltip
               v-if="contractOf(row)"
-              :content="`合同客户：${contractOf(row)!.customer || '-'}`"
+              :content="`${contractOf(row)!.customer || '-'} - ${contractOf(row)!.subject || '-'}`"
               placement="top"
             >
-              <span class="contract-code">{{ contractOf(row)!.code }}</span>
+              <span class="contract-naming">
+                {{ contractOf(row)!.customer || '-' }}-{{ contractOf(row)!.subject || '-' }}
+              </span>
             </el-tooltip>
             <span v-else class="muted">-</span>
           </template>
         </el-table-column>
         <el-table-column prop="customer" label="客户" width="140" show-overflow-tooltip />
-        <el-table-column prop="assetName" label="资产" min-width="180" show-overflow-tooltip />
+        <el-table-column prop="assetName" label="产品" min-width="180" show-overflow-tooltip />
         <el-table-column label="数量/额度" width="110" align="right">
           <template #default="{ row }">{{ formatWan(row.qty) }} {{ row.unit }}</template>
         </el-table-column>
         <el-table-column label="销售金额" width="120" align="right">
           <template #default="{ row }">{{ formatMoney(row.amount) }}</template>
         </el-table-column>
-        <el-table-column label="出库类型" width="110" align="center">
+        <el-table-column label="交付类型" width="110" align="center">
           <template #default="{ row }">
             <el-tag size="small" effect="plain">{{ typeLabel(row.type) }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column prop="date" label="出库日期" width="110" align="left" />
+        <el-table-column prop="date" label="交付日期" width="110" align="left" />
         <el-table-column prop="operator" label="经办人" width="100" align="left" />
         <el-table-column label="状态" width="90" align="center">
           <template #default="{ row }">
@@ -342,32 +347,32 @@ async function handleRevert(o: Outbound) {
           </template>
         </el-table-column>
         <template #empty>
-          <el-empty description="暂无出库记录。销售项目标记「交付完成」后自动生成，或点击「补录入库出库」" :image-size="80" />
+          <el-empty description="暂无交付记录。销售项目标记「交付完成」后自动生成，或点击「补录交付」" :image-size="80" />
         </template>
       </el-table>
     </el-card>
 
     <!-- 补录对话框（对齐创建页表单视觉：顶标签 + 分区块） -->
-    <el-dialog v-model="createDialog.visible" title="补录销售出库" class="dlg-form" :close-on-click-modal="false">
+    <el-dialog v-model="createDialog.visible" title="补录销售交付" class="dlg-form" :close-on-click-modal="false">
       <div class="info-bar" style="margin-bottom: 14px;">
         <el-icon aria-hidden="true"><InfoFilled /></el-icon>
         <span>
           <template v-if="createDialog.form.mode === 'new'">
-            选择资产后出库类型按板块自动带出；确认登记后自动扣减库存、累计销售金额并生成流水。
+            选择产品后交付类型按板块自动带出；确认登记后自动扣减数量、累计销售金额并生成流水。
           </template>
           <template v-else>
-            历史补录仅将已发生的出库补登入账，不扣减当前库存、不计入当前累计销售金额；撤销时同样不回拨。
+            历史补录仅将已发生的交付补登入账，不扣减当前数量、不计入当前累计销售金额；撤销时同样不回拨。
           </template>
         </span>
       </div>
 
       <el-form label-position="top">
-        <!-- 出库性质 -->
+        <!-- 交付性质 -->
         <div class="dlg-sec">
-          <div class="dlg-sec-title">出库性质</div>
+          <div class="dlg-sec-title">交付性质</div>
           <el-radio-group v-model="createDialog.form.mode">
-            <el-radio value="new">新出库（扣减当前库存）</el-radio>
-            <el-radio value="history">历史补录（仅登记台账，不扣减库存）</el-radio>
+            <el-radio value="new">新交付（扣减当前数量）</el-radio>
+            <el-radio value="history">历史补录（仅登记台账，不扣减数量）</el-radio>
           </el-radio-group>
         </div>
         <!-- 交付来源 -->
@@ -394,7 +399,7 @@ async function handleRevert(o: Outbound) {
             <el-form-item label="客户">
               <el-input v-model="createDialog.form.customer" placeholder="关联项目后自动带出，补录时手填" />
             </el-form-item>
-            <el-form-item label="出库日期">
+            <el-form-item label="交付日期">
               <el-date-picker
                 v-model="createDialog.form.date"
                 type="date"
@@ -408,14 +413,14 @@ async function handleRevert(o: Outbound) {
           </div>
         </div>
 
-        <!-- 出库明细 -->
+        <!-- 交付明细 -->
         <div class="dlg-sec">
-          <div class="dlg-sec-title">出库明细</div>
-          <el-form-item label="资产" required>
+          <div class="dlg-sec-title">交付明细</div>
+          <el-form-item label="产品" required>
             <el-select
               v-model="createDialog.form.assetId"
               filterable
-              placeholder="选择要出库的资产"
+              placeholder="选择要交付的产品"
               style="width: 100%;"
               @change="onAssetChange"
             >
@@ -428,7 +433,7 @@ async function handleRevert(o: Outbound) {
             </el-select>
           </el-form-item>
           <div class="form-grid">
-            <el-form-item label="出库类型">
+            <el-form-item label="交付类型">
               <el-select v-model="createDialog.form.type" style="width: 100%;">
                 <el-option v-for="(label, k) in OUTBOUND_TYPES" :key="k" :label="label" :value="k" />
               </el-select>
@@ -445,7 +450,7 @@ async function handleRevert(o: Outbound) {
               v-model="createDialog.form.remark"
               type="textarea"
               :rows="2"
-              placeholder="补录原因 / 出库单号 / 特殊说明"
+              placeholder="补录原因 / 交付单号 / 特殊说明"
             />
           </el-form-item>
         </div>
@@ -463,7 +468,7 @@ async function handleRevert(o: Outbound) {
 </template>
 
 <style scoped>
-/* 文字链接：与资产详情页 .link 同规格（复用平台 token，不引入新色值） */
+/* 文字链接：与产品详情页 .link 同规格（复用平台 token，不引入新色值） */
 .link {
   color: var(--primary-color);
   font-weight: 500;
@@ -474,7 +479,12 @@ async function handleRevert(o: Outbound) {
   text-decoration: underline;
 }
 
-/* 合同号：纯文本 mono（与项目详情页 .contract-code 同规格；无独立详情页，不跳转） */
+/* 关联合同「客户-产品主体」命名：纯文本（无独立详情页，不跳转） */
+.contract-naming {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .contract-code {
   font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
   font-size: 13px;

@@ -31,7 +31,7 @@ class Asset(Base):
     soldAmount: Mapped[float] = mapped_column(Float, default=0)  # 元
     soldCount: Mapped[int] = mapped_column(Integer, default=0)
     # 计价模式（ADR-008）：'unit'（默认，单价×数量）| 'amount'（包量金额整数元权威）。
-    # 卫星 Token 类型入库时置 'amount'（salePrice 仅作参考值，不参与金额计算）。
+    # 卫星 Token 类型登记时置 'amount'（salePrice 仅作参考值，不参与金额计算）。
     pricingMode: Mapped[str] = mapped_column(String(16), default="unit")
     # 遥感数据三维字段（ADR-010，⚠️ 已废弃 ADR-011）：列保留不删（技术债），
     # 服务层不再读写、schema 不再暴露；遥感数据的售卖粒度改由 rs_items 明细表承载。
@@ -66,10 +66,14 @@ class Project(Base):
     customer: Mapped[str] = mapped_column(String(128), default="")
     industry: Mapped[str] = mapped_column(String(128), default="")
     rep: Mapped[str] = mapped_column(String(64), default="")
+    # 下单账号（实际登录下单的 username；存量项目为空）。
+    # 生态人员（viewer）可见性判定用：creator == 自己 即可见；
+    # creator 为空的存量项目回退 rep == 自己姓名 判定（见 services.user_sees_project）。
+    creator: Mapped[str] = mapped_column(String(64), default="", index=True)
     # 商务负责人（可选，默认空；存量项目为空，前端显示 "-"）
     businessOwner: Mapped[str] = mapped_column(String(64), default="")
-    # 签约主体：后端权威推导（下单路径由资产带出；手动建项目输入为空时取首条明细资产主体）。
-    # 存量项目 subject 为空不做批量回填，前端展示时用资产主体兜底。
+    # 签约主体：后端权威推导（下单路径由产品带出；手动建项目输入为空时取首条明细产品主体）。
+    # 存量项目 subject 为空不做批量回填，前端展示时用产品主体兜底。
     subject: Mapped[str] = mapped_column(String(128), default="")
     status: Mapped[str] = mapped_column(String(32), default="active", index=True)
     # 金额列单位=元（ADR-006；Decimal↔float 转换在 ORM 边界处理，见 Asset 金额列注释）
@@ -97,9 +101,9 @@ class Project(Base):
 
 
 class Contract(Base):
-    """合同（ADR-007）：项目下按客户拆分的合同，库存联动的最小单位。
+    """合同（ADR-007）：项目下按客户拆分的合同，数量联动的最小单位。
 
-    - 合同内强制同一资产主体（subject 建合同时从合同内资产主体推导）；
+    - 合同内强制同一产品主体（subject 建合同时从合同内产品主体推导）；
     - 合同一经生成不可增删改明细（终止再重下）；
     - 项目 status/customer/subject/expectedAmount 均由合同派生（见 services._recompute_project）。
     """
@@ -112,7 +116,7 @@ class Contract(Base):
     # 与 project_items.project_id 既有做法一致；引用完整性由服务层保证（H7 策略）
     projectId: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True)
     customer: Mapped[str] = mapped_column(String(128), default="")
-    # 签约主体：建合同时从合同内资产主体推导（合同内强制同主体）
+    # 签约主体：建合同时从合同内产品主体推导（合同内强制同主体）
     subject: Mapped[str] = mapped_column(String(128), default="")
     contractAmount: Mapped[float] = mapped_column(Float, default=0)  # 元（ADR-006）
     status: Mapped[str] = mapped_column(String(32), default="active", index=True)  # active/delivered/terminated
@@ -141,8 +145,8 @@ class ProjectItem(Base):
     amount: Mapped[float] = mapped_column(Float, default=0)  # 元（= price × qty，Decimal 重算）
     status: Mapped[str] = mapped_column(String(32), default="pending_asset", index=True)
     deliveryReq: Mapped[str] = mapped_column(Text, default="")
-    # 下单时刻该资产是否真实加锁（= 非 repeatSale）。存量数据默认 False（未锁过，语义正确）。
-    # WHY：repeatSale 资产下单只记 status='locked' 但实际不加锁，交付/终止需据此区分
+    # 下单时刻该产品是否真实加锁（= 非 repeatSale）。存量数据默认 False（未锁过，语义正确）。
+    # WHY：repeatSale 产品下单只记 status='locked' 但实际不加锁，交付/终止需据此区分
     # 「真锁过要释放」与「从未锁过不可写 cancel_release 幽灵流水」。
     locked: Mapped[bool] = mapped_column(Boolean, default=False)
     lockedDate: Mapped[str] = mapped_column(String(32), default="")
@@ -162,7 +166,7 @@ class Outbound(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     code: Mapped[str] = mapped_column(String(32), unique=True, index=True)
     projectId: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
-    # 所属合同（ADR-007）：合同交付自动出库时精确关联；projectId 保留（项目级手动出库为 NULL）
+    # 所属合同（ADR-007）：合同交付自动交付时精确关联；projectId 保留（项目级手动交付为 NULL）
     contractId: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     projectName: Mapped[str] = mapped_column(String(128), default="")
     customer: Mapped[str] = mapped_column(String(128), default="")
@@ -207,9 +211,9 @@ class OpLog(Base):
     detail: Mapped[str] = mapped_column(String(512), default="")
     operator: Mapped[str] = mapped_column(String(64), default="admin")
     time: Mapped[str] = mapped_column(String(32), default="")
-    # 关联资产 id（target='asset' 时记录，便于按资产追溯操作日志）；存量数据为 NULL
+    # 关联产品 id（target='asset' 时记录，便于按产品追溯操作日志）；存量数据为 NULL
     assetId: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    # 字段级变更描述（如「销售单价: 330,000 元 → 3,200,000 元；资产总数: 10 → 12 台」，金额单位=元）；
+    # 字段级变更描述（如「销售单价: 330,000 元 → 3,200,000 元；产品总数: 10 → 12 台」，金额单位=元）；
     # 仅 update_asset 有实际变更时写入，其余日志点为空
     changes: Mapped[str] = mapped_column(String(512), default="")
     # 关联合同 id（ADR-007）：合同级状态变更日志记录；非合同场景为 NULL
@@ -219,8 +223,8 @@ class OpLog(Base):
 class FileMeta(Base):
     """上传文件原名映射：散列落盘名 → 原始文件名。
 
-    上传文件以散列名落盘 uploads/，资产/日志直接存散列名；本表记录散列名与
-    原始文件名的对应关系，供前端展示与下载时还原原始名。上传不是资产操作，
+    上传文件以散列名落盘 uploads/，产品/日志直接存散列名；本表记录散列名与
+    原始文件名的对应关系，供前端展示与下载时还原原始名。上传不是产品操作，
     故 add_file_meta 只写本表、不写 OpLog。
     """
 
@@ -328,10 +332,10 @@ class CartItem(Base):
     userId: Mapped[str] = mapped_column(String(64), default="admin", index=True)
     assetId: Mapped[int] = mapped_column(Integer, index=True)
     # 行级客户（ADR-007）：购物车支持跨主体加购，结算时按 customer 分组拆合同。
-    # 唯一键语义：(userId, assetId, customer) 相同才合并（不同 customer 同资产 = 两行）。
+    # 唯一键语义：(userId, assetId, customer) 相同才合并（不同 customer 同产品 = 两行）。
     customer: Mapped[str] = mapped_column(String(128), default="")
     qty: Mapped[int] = mapped_column(Integer, default=1)
-    # 包量计价合同金额（ADR-008，元，整数）：仅 pricingMode='amount' 资产行使用，
+    # 包量计价合同金额（ADR-008，元，整数）：仅 pricingMode='amount' 产品行使用，
     # 结算时必填（缺失 400）；unit 模式行为不变（忽略本列，恒 NULL）。
     amount: Mapped[float | None] = mapped_column(Float, nullable=True)
     # 遥感数据明细（ADR-011）：非空时本行售卖 rs_items 明细（qty 恒 1，结算金额=明细 price 权威）；
@@ -344,7 +348,7 @@ class CartItem(Base):
 
 
 class RsItem(Base):
-    """遥感数据可售明细（ADR-011）：父资产（assets 行，容器）下的真正售卖单位。
+    """遥感数据可售明细（ADR-011）：父产品（assets 行，容器）下的真正售卖单位。
 
     维度 = 省（可含市）× 精度（米）× 月份（YYYY-MM），每份一个单价（整数元/份），
     默认可重复售卖（只计次不扣量）。唯一性 (assetId, province, city, resolution, saleMonth)
@@ -359,7 +363,7 @@ class RsItem(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    assetId: Mapped[int] = mapped_column(Integer, index=True)  # 父资产（type='遥感数据'）
+    assetId: Mapped[int] = mapped_column(Integer, index=True)  # 父产品（type='遥感数据'）
     province: Mapped[str] = mapped_column(String(64), default="")  # 省/自治区/直辖市，必填
     city: Mapped[str] = mapped_column(String(64), default="")  # 市，可空（默认 ''）
     resolution: Mapped[float] = mapped_column(Float, default=0)  # 精度，单位米（如 1.5）

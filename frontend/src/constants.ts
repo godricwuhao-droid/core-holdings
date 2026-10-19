@@ -4,17 +4,17 @@
  * - CATEGORY_UNITS：分类单位（板块 → 类型 → 计量单位）
  * - FEATURE_CATALOGS：功能清单（软件/平台软件类产品的结构化模块树）
  *
- * 业务数据（资产/项目/出库/流水/日志/交付物）由后端 + db 镜像提供，见 @/api。
+ * 业务数据（产品/项目/交付/流水/日志/交付物）由后端 + db 镜像提供，见 @/api。
  */
 import type { CategoryUnit, FeatureModule } from '@/types'
 
 export const CATEGORY_UNITS: CategoryUnit[] = [
-  { board: 'embodied', type: '机器人', unit: '套 / 台', note: '整机交付，可选序列号出库' },
+  { board: 'embodied', type: '机器人', unit: '套 / 台', note: '整机交付，可选序列号交付' },
   { board: 'embodied', type: '数采设备', unit: '套', note: '数采软件及设备接入' },
   { board: 'embodied', type: '平台软件', unit: '套', note: '管理平台类' },
   { board: 'satellite', type: '卫星Token', unit: '颗（Token 额度）', note: '按 Token 额度与有效期售卖' },
-  { board: 'satellite', type: '卫星数据', unit: '轨 / 期 / 条', note: '默认可重复售卖，不扣减库存' },
-  { board: 'satellite', type: '遥感数据', unit: '份（可售明细）', note: '父资产容器，按 省/精度/月份 维护明细售卖' },
+  { board: 'satellite', type: '卫星数据', unit: '轨 / 期 / 条', note: '默认可重复售卖，不扣减数量' },
+  { board: 'satellite', type: '遥感数据', unit: '份（可售明细）', note: '父产品容器，按 省/精度/月份 维护明细售卖' },
   { board: 'software', type: '软件', unit: '套', note: '永久 / 年限 / 并发 / 账号许可' },
   { board: 'hardware', type: '硬件集群', unit: '集群 / 台', note: '整机柜或单台交付' },
   { board: 'compute', type: '算力服务器', unit: '台（服务期）', note: '按服务期售卖，建设中' },

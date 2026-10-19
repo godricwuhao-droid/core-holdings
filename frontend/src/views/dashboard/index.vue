@@ -2,7 +2,7 @@
 /**
  * 首页仪表盘（经营看板）
  *
- * 区域：板块库存总览 / 待办提醒
+ * 区域：板块数量总览 / 待办提醒
  */
 import { computed } from 'vue'
 import {
@@ -18,7 +18,7 @@ const router = useRouter()
 
 const data = computed(() => getDashboard())
 
-/** 无任何待办（临期资产与长期未跟进项目均为空） */
+/** 无任何待办（临期产品与长期未跟进项目均为空） */
 const noTodos = computed(
   () =>
     data.value.todos.expiring.length +
@@ -45,14 +45,14 @@ function handleBoardRow(row: { board: string }) {
     </div>
 
     <el-row :gutter="16">
-      <!-- 板块库存 -->
+      <!-- 板块数量 -->
       <el-col :xs="24">
         <el-card shadow="never" style="height: 100%;">
           <template #header>
             <div class="card-header">
               <div class="title">
                 <el-icon><Box /></el-icon>
-                <span>板块库存总览</span>
+                <span>板块数量总览</span>
               </div>
               <span class="muted" style="font-size: 12px;">点击行进入对应板块</span>
             </div>
@@ -74,10 +74,10 @@ function handleBoardRow(row: { board: string }) {
                 </span>
               </template>
             </el-table-column>
-            <el-table-column label="资产项数" width="90" align="right">
+            <el-table-column label="产品项数" width="90" align="right">
               <template #default="{ row }">{{ row.count }} 项</template>
             </el-table-column>
-            <el-table-column label="入库数量" min-width="100" align="right">
+            <el-table-column label="总数量" min-width="100" align="right">
               <template #default="{ row }">{{ formatWan(row.inQty) }}</template>
             </el-table-column>
             <el-table-column label="已锁定" min-width="90" align="right">
@@ -85,7 +85,7 @@ function handleBoardRow(row: { board: string }) {
                 <span :style="{ color: row.lockedQty > 0 ? 'var(--primary-color)' : undefined, fontWeight: row.lockedQty > 0 ? 600 : 400 }">{{ formatWan(row.lockedQty) }}</span>
               </template>
             </el-table-column>
-            <el-table-column label="已出库" min-width="90" align="right">
+            <el-table-column label="已交付" min-width="90" align="right">
               <template #default="{ row }">
                 <span :style="{ color: row.shippedQty > 0 ? 'var(--warning-color)' : undefined, fontWeight: row.shippedQty > 0 ? 600 : 400 }">{{ formatWan(row.shippedQty) }}</span>
               </template>
@@ -122,7 +122,7 @@ function handleBoardRow(row: { board: string }) {
           <div v-else class="todo-groups">
             <div class="todo-group" v-if="data.todos.expiring.length">
               <div class="todo-group-title">
-                <el-tag size="small" type="warning" effect="light">临期资产</el-tag>
+                <el-tag size="small" type="warning" effect="light">临期产品</el-tag>
                 <span class="muted" style="font-size: 12px;">90 天内到期 · 共 {{ data.todos.expiring.length }} 项</span>
               </div>
               <div

@@ -46,8 +46,8 @@ async function handleLogin() {
       <div class="login-logo">
         <el-icon :size="34"><Coin /></el-icon>
       </div>
-      <h1 class="login-title">蜂云资产管理平台</h1>
-      <p class="login-sub">登录后进入资产管理</p>
+      <h1 class="login-title">蜂云产品及服务平台</h1>
+      <p class="login-sub">登录后进入产品及服务</p>
       <el-form @submit.prevent>
         <el-form-item>
           <el-input

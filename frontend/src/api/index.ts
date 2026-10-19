@@ -53,7 +53,7 @@ const http = axios.create({ baseURL: '/api', timeout: 20000 })
 
 /**
  * viewer（生态人员）放行的写端点白名单（与后端 `require_order` 对齐，ADR-009）：
- * 下单链路（加购 / 批量加购 / 改数量 / 改行级客户 / 删行 / 清空 / 购物车结算 / 资产直接下单）
+ * 下单链路（加购 / 批量加购 / 改数量 / 改行级客户 / 删行 / 清空 / 购物车结算 / 产品直接下单）
  * 后端已全部改为 require_order（认证即放行），前端白名单同步覆盖全部购物车端点。
  */
 const VIEWER_ALLOWED_REQUESTS: { method: string; pattern: RegExp }[] = [
@@ -90,7 +90,7 @@ interface PydanticIssue {
 
 /**
  * 统一解析后端错误体 detail：
- *  - 业务错误：字符串（如「库存不足：…」）
+ *  - 业务错误：字符串（如「可用数量不足：…」）
  *  - 校验错误：Pydantic 数组（拼成「字段: 说明」可读中文，避免退化成 status 422）
  *  - 兜底：对象（取 msg）或 JSON 串
  */
@@ -243,9 +243,10 @@ export interface ProjectItemInput {
   price: number
   amount: number
   deliveryReq: string
+  itemId?: number // ADR-011：遥感明细行（重新提交预填时携带；qty 恒 1）
 }
 
-/** 合同入参（ADR-007）：POST /projects 的 contracts[] 元素；合同内强制同一资产主体（后端校验） */
+/** 合同入参（ADR-007）：POST /projects 的 contracts[] 元素；合同内强制同一产品主体（后端校验） */
 export interface ContractInput {
   customer: string // 必填：合同客户
   items: ProjectItemInput[]
@@ -261,9 +262,9 @@ export interface ProjectInput {
   businessOwner?: string // 商务负责人（可选，默认空）
   subject: string
   expectedAmount: number
-  quoteAmount: number
+  quoteAmount?: number // 2026-10-19：字段已废弃（不再填写），可选兼容
   contractAmount: number
-  paidAmount: number
+  paidAmount?: number // 2026-10-19：字段已废弃（不再填写），可选兼容
   expectedSignDate: string
   lastFollowDate: string
   remark: string
@@ -492,15 +493,22 @@ export async function createProject(input: ProjectInput): Promise<Project> {
   return data
 }
 
+/** 重新提交（2026-10-20）：已终止项目按（可修改的）明细新建 pending 订单，旧项目保留终止历史 */
+export async function resubmitProject(id: number, input: ProjectInput): Promise<Project> {
+  const { data } = await http.post<Project>(`/projects/${id}/resubmit`, input)
+  await afterWrite()
+  return data
+}
+
 export async function updateProject(id: number, input: ProjectInput): Promise<void> {
   await http.put(`/projects/${id}`, input)
   await afterWrite()
 }
 
 /**
- * 合同状态流转（ADR-007，库存联动最小单位）：
- *  - delivered：逐明细交付（释放锁定/扣 shippedQty/生成出库记录）
- *  - terminated：active 合同释放锁定；delivered 合同撤销出库并回退售出数量与金额
+ * 合同状态流转（ADR-007，数量联动最小单位）：
+ *  - delivered：逐明细交付（释放锁定/扣 shippedQty/生成交付记录）
+ *  - terminated：active 合同释放锁定；delivered 合同撤销交付并回退售出数量与金额
  * 项目 status/expectedAmount/customer/subject 由后端按合同派生重算。
  */
 export async function changeContractStatus(
@@ -512,7 +520,67 @@ export async function changeContractStatus(
   await afterWrite()
 }
 
-/** 删除项目：后端先回滚（释放锁定 / 撤销该项目出库）再硬删 */
+/**
+ * 项目级状态批量快捷（PATCH /projects/{id}/status）：
+ * 对名下全部 **active** 合同批量执行该状态动作（delivered=全部交付 / terminated=全部终止），
+ * 主入口仍是合同级 changeContractStatus；项目列表抽屉的「交付 / 终止」用本函数。
+ * viewer（生态人员）仅可终止自己下单的项目（后端同样校验归属与动作）。
+ */
+export async function changeProjectStatus(
+  id: number,
+  status: 'delivered' | 'terminated',
+  reason = '',
+): Promise<void> {
+  await http.patch(`/projects/${id}/status`, { status, reason })
+  await afterWrite()
+}
+
+/**
+ * 订单审核（ADR-012，仅商务/管理员；生态人员 403）：
+ * - confirm = 确认下单（items 可带行级改价：unit 行传 price 实际单价、amount 行传 amount 实际合同金额，
+ *   整数元；遥感明细行不接受改价；确认后实际价同步写回平台挂牌价）；
+ * - reject = 驳回（reason 必填，释放锁定、项目终止并留痕）。
+ */
+export async function reviewProject(
+  id: number,
+  payload: {
+    action: 'confirm' | 'reject'
+    reason?: string
+    items?: { itemId: number; price?: number; amount?: number }[]
+  },
+): Promise<void> {
+  await http.post(`/projects/${id}/review`, payload)
+  await afterWrite()
+}
+
+/** 商务账号选项（ADR-012 §5.1）：editor/admin 有效账号，供商务负责人筛选与 username→姓名 展示映射 */
+export interface UserOption {
+  id: number
+  username: string
+  name: string
+  role: string
+}
+export async function userOptions(): Promise<UserOption[]> {
+  const { data } = await http.get<UserOption[]>('/users/options')
+  return data
+}
+
+/** 全部启用账号（2026-10-20：含生态 viewer）——项目页「账号 → 姓名」显示映射用；
+ *  商务接手/转交下拉仍用 userOptions（商务专属，不得转给生态） */
+export async function allUserOptions(): Promise<UserOption[]> {
+  const { data } = await http.get<UserOption[]>('/users/options/all')
+  return data
+}
+
+/** 商务接手/转交（ADR-012 §5.1 纯移交制）：无负责人=接手（绑当前账号）；
+ * 已有负责人=仅负责人可转交（newOwner=目标商务账号）或 admin 越过（newOwner 空=接手给自己）；
+ * 非负责人普通商务 400；delivered/terminated 400 */
+export async function claimProject(id: number, newOwner = ''): Promise<void> {
+  await http.post(`/projects/${id}/claim`, { newOwner })
+  await afterWrite()
+}
+
+/** 删除项目：后端先回滚（释放锁定 / 撤销该项目交付）再硬删 */
 export async function deleteProject(id: number): Promise<void> {
   await http.delete(`/projects/${id}`)
   await afterWrite()
@@ -654,7 +722,7 @@ export async function setCartQty(id: number, qty: number): Promise<void> {
 }
 
 /**
- * 修改购物车行合同金额（ADR-008，仅包量定价资产行）：整数元，后端校验 int > 0。
+ * 修改购物车行合同金额（ADR-008，仅包量定价产品行）：整数元，后端校验 int > 0。
  * ⚠️ 后端 PUT /cart/{id} 对 qty<=0 执行删行，必须同时回传该行当前 qty（缺省=0 会误删行）。
  */
 export async function setCartAmount(id: number, qty: number, amount: number): Promise<void> {
@@ -662,7 +730,7 @@ export async function setCartAmount(id: number, qty: number, amount: number): Pr
   await afterWrite()
 }
 
-/** 修改购物车行级客户（ADR-007）：400「购物车中该资产在客户「X」下已有行，无法修改客户（请先删除原行）」 */
+/** 修改购物车行级客户（ADR-007）：400「购物车中该产品在客户「X」下已有行，无法修改客户（请先删除原行）」 */
 export async function patchCartItem(id: number, customer: string): Promise<void> {
   await http.patch(`/cart/${id}`, { customer })
   await afterWrite()
@@ -709,14 +777,14 @@ export interface ProjectOut {
   contractCount?: number // ADR-007：合同数量（=客户组数）
 }
 
-/** 购物车下单：生成「进行中」销售项目并锁定库存（不自动出库），随后清空购物车 */
+/** 购物车下单：生成「进行中」销售项目并锁定数量（不自动交付），随后清空购物车 */
 export async function checkoutCart(data: CheckoutInput): Promise<ProjectOut> {
   const { data: d } = await http.post<ProjectOut>('/cart/checkout', data)
   await afterWrite()
   return d
 }
 
-/** 资产直接下单：单/多资产生成「进行中」销售项目并锁定库存（与购物车下单同一流程） */
+/** 产品直接下单：单/多产品生成「进行中」销售项目并锁定数量（与购物车下单同一流程） */
 export async function createSaleOrder(data: SaleOrderInput): Promise<ProjectOut> {
   const { data: d } = await http.post<ProjectOut>('/sales/order', data)
   await afterWrite()

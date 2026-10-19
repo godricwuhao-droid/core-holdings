@@ -6,7 +6,7 @@
         <span class="header-logo">
           <el-icon :size="24"><Coin /></el-icon>
         </span>
-        <span class="header-title">蜂云资产管理平台</span>
+        <span class="header-title">蜂云产品及服务平台</span>
         <el-button
           @click="isCollapse = !isCollapse"
           :icon="isCollapse ? Expand : Fold"
@@ -59,12 +59,12 @@
           <el-sub-menu index="assets">
             <template #title>
               <el-icon><Box /></el-icon>
-              <span>资产管理</span>
+              <span>产品及服务</span>
             </template>
             <el-menu-item index="/assets/embodied">具身智能</el-menu-item>
             <el-menu-item index="/assets/satellite">卫星服务</el-menu-item>
-            <el-menu-item index="/assets/software">软件库存</el-menu-item>
-            <el-menu-item index="/assets/hardware">硬件库存</el-menu-item>
+            <el-menu-item index="/assets/software">软件产品</el-menu-item>
+            <el-menu-item index="/assets/hardware">硬件产品</el-menu-item>
             <el-menu-item index="/assets/compute">
               <span style="display: inline-flex; align-items: center; gap: 6px;">
                 算力服务
@@ -73,7 +73,11 @@
             </el-menu-item>
           </el-sub-menu>
 
-          <!-- viewer（生态人员）：销售管理整组不可见，购物车以独立菜单项保留（含角标） -->
+          <!-- viewer（生态人员）：销售管理整组不可见，仅「销售项目」（后端已按自己下单过滤）与购物车独立保留 -->
+          <el-menu-item v-if="isViewer" index="/sales/projects">
+            <el-icon><TrendCharts /></el-icon>
+            <template #title><span>销售项目</span></template>
+          </el-menu-item>
           <el-menu-item v-if="isViewer" index="/cart">
             <el-icon><ShoppingCart /></el-icon>
             <template #title>
@@ -90,7 +94,7 @@
               <span>销售管理</span>
             </template>
             <el-menu-item index="/sales/projects">销售项目</el-menu-item>
-            <el-menu-item index="/sales/outbound">出库记录</el-menu-item>
+            <el-menu-item index="/sales/outbound">交付记录</el-menu-item>
             <el-menu-item index="/cart" :disabled="!canWrite">
               <span style="display: inline-flex; align-items: center; gap: 6px;">
                 购物车
@@ -145,7 +149,7 @@ const activeMenu = computed(() => route.path)
 /** 购物车角标：当前购物车条目总数量（预留账号权限后按登录用户统计） */
 const cartCount = computed(() => db.cart.reduce((s, c) => s + c.qty, 0))
 
-/** 角色标签配色（对齐 global.css 资产类型色板，不用 Element 默认色） */
+/** 角色标签配色（对齐 global.css 产品类型色板，不用 Element 默认色） */
 const roleTagClass = computed(() => {
   const role = currentUser.value?.role
   if (role === 'admin') return 'blue'
