@@ -127,9 +127,10 @@ def get_current_user(
 
 
 def require_editor(user: models.User = Depends(get_current_user)) -> models.User:
-    """业务写操作：admin + editor 可执行，viewer 403"""
+    """业务写操作：admin + editor 可执行，viewer 403
+    （ADR-014：文案统一由后端给出，前端拦截器对 403 直接 toast detail）"""
     if user.role not in EDITOR_ROLES:
-        raise HTTPException(403, "无权限执行此操作")
+        raise HTTPException(403, "只读账号不可执行该操作")
     return user
 
 

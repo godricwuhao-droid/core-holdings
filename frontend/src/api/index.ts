@@ -41,9 +41,7 @@ import {
 import { CATEGORY_UNITS, FEATURE_CATALOGS } from '@/constants'
 import {
   clearSession,
-  currentUser,
   getToken,
-  READONLY_TIP,
   setUser,
   type CurrentUser,
   type Role,
@@ -51,34 +49,13 @@ import {
 
 const http = axios.create({ baseURL: '/api', timeout: 20000 })
 
-/**
- * viewer（生态人员）放行的写端点白名单（与后端 `require_order` 对齐，ADR-009）：
- * 下单链路（加购 / 批量加购 / 改数量 / 改行级客户 / 删行 / 清空 / 购物车结算 / 产品直接下单）
- * 后端已全部改为 require_order（认证即放行），前端白名单同步覆盖全部购物车端点。
- */
-const VIEWER_ALLOWED_REQUESTS: { method: string; pattern: RegExp }[] = [
-  { method: 'post', pattern: /^\/cart\/?$/ },
-  { method: 'post', pattern: /^\/cart\/batch$/ },
-  { method: 'post', pattern: /^\/cart\/checkout$/ },
-  { method: 'put', pattern: /^\/cart\/\d+$/ },
-  { method: 'patch', pattern: /^\/cart\/\d+$/ },
-  { method: 'delete', pattern: /^\/cart\/\d+$/ },
-  { method: 'delete', pattern: /^\/cart$/ },
-  { method: 'post', pattern: /^\/sales\/order$/ },
-]
-
-// 请求拦截器：已登录时统一携带 Bearer token；
-// 全局写操作兜底：viewer（生态人员）的非 GET 请求仅放行下单链路白名单，其余在发出前直接拒绝（避免 UI 漏网点）
+// 请求拦截器：已登录时统一携带 Bearer token。
+// 2026-10-20（ADR-014）：移除前端 viewer 写请求白名单预拦截——权限判定统一由后端守卫
+// （require_order / require_editor）兜底，避免前后端两套权限清单再次漂移；
+// viewer 越权时后端返回 403（detail 为可读中文提示），由下方响应拦截器统一 toast。
 http.interceptors.request.use((config) => {
   const token = getToken()
   if (token) config.headers.Authorization = `Bearer ${token}`
-  if (config.method && config.method !== 'get' && currentUser.value?.role === 'viewer') {
-    const url = config.url || ''
-    const allowed = VIEWER_ALLOWED_REQUESTS.some(
-      (r) => r.method === config.method && r.pattern.test(url),
-    )
-    if (!allowed) return Promise.reject(new Error(READONLY_TIP))
-  }
   return config
 })
 
@@ -119,9 +96,13 @@ function detailMessage(detail: unknown): string | null {
   return null
 }
 
+/** 403 权限错误（ADR-014，2026-10-20）：响应拦截器已统一 toast 后端 detail，调用方经 showError 跳过重复提示 */
+export class PermissionError extends Error {}
+
 // 统一错误：把后端 detail 转成 Error，便于调用方 catch 后展示
 //  - 401（token 缺失/过期/账号禁用）：清本地态并整页跳 /login（登录接口自身 401 不跳转，留在登录页提示）
-//  - 403（角色不足）：走既有 detail 解析，提示「无权限执行此操作」
+//  - 403（角色/归属不足）：文案统一由后端给出（detail），拦截器统一 toast 并抛 PermissionError
+//    （ADR-014：不再出现前端本地「只读账号…」文案；调用方经 showError 跳过重复提示）
 http.interceptors.response.use(
   (r) => r,
   (err) => {
@@ -136,9 +117,23 @@ http.interceptors.response.use(
       return Promise.reject(new Error('未登录或登录已过期'))
     }
     const msg = detailMessage(err?.response?.data?.detail) ?? err?.message ?? '请求失败'
+    if (status === 403) {
+      ElMessage.error(msg)
+      return Promise.reject(new PermissionError(msg))
+    }
     return Promise.reject(new Error(msg))
   },
 )
+
+/**
+ * 统一错误提示（ADR-014，2026-10-20）：
+ * 403 权限错误（PermissionError）已由响应拦截器统一 toast（文案 = 后端 detail），此处跳过避免重复弹框；
+ * 其余错误展示后端 detail 文案（拦截器已解析进 Error.message），无则回退 fallback。
+ */
+export function showError(e: unknown, fallback: string): void {
+  if (e instanceof PermissionError) return
+  ElMessage.error(e instanceof Error ? e.message : fallback)
+}
 
 // ============================================================
 // 响应式数据镜像（由 refresh() 填充，视图直接响应式读取）
@@ -246,7 +241,7 @@ export interface ProjectItemInput {
   itemId?: number // ADR-011：遥感明细行（重新提交预填时携带；qty 恒 1）
 }
 
-/** 合同入参（ADR-007）：POST /projects 的 contracts[] 元素；合同内强制同一产品主体（后端校验） */
+/** 合同入参（ADR-007）：POST /projects 的 contracts[] 元素（2026-10-20 ADR-013：「合同内同一产品主体」限制已移除，允许混合主体明细） */
 export interface ContractInput {
   customer: string // 必填：合同客户
   items: ProjectItemInput[]
@@ -272,6 +267,7 @@ export interface ProjectInput {
   contracts?: ContractInput[] // ADR-007：合同结构入参（每客户一个合同）
 }
 
+/** 补录交付入参（ADR-015，2026-10-20：移除 operator 字段——后端一直不采信，经办人统一取触发请求的登录账号） */
 export interface OutboundInput {
   projectId: number | null
   customer: string
@@ -281,7 +277,6 @@ export interface OutboundInput {
   type: OutboundType
   mode: OutboundMode
   date: string
-  operator: string
   remark: string
 }
 
@@ -656,7 +651,7 @@ export async function removeAssetDeliverable(assetId: number, id: number): Promi
 }
 
 // ============================================================
-// 遥感数据可售明细（ADR-011：require_editor，admin/editor 可维护；viewer 不在白名单，403 兜底）
+// 遥感数据可售明细（ADR-011：require_editor，admin/editor 可维护；viewer 由后端守卫 403 拒绝）
 // ============================================================
 export function rsItemsOfAsset(assetId: number): RsItem[] {
   return db.rsItems.filter((r) => r.assetId === assetId)

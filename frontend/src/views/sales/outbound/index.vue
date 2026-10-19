@@ -21,8 +21,8 @@ import {
   type OutboundMode,
   type OutboundType,
 } from '@/types'
-import { createOutbound, db, getAsset, revertOutbound } from '@/api'
-import { canWrite, READONLY_TIP } from '@/auth'
+import { createOutbound, db, getAsset, revertOutbound, showError } from '@/api'
+import { canWrite, NO_PERM_TIP } from '@/auth'
 
 const router = useRouter()
 const searchText = ref('')
@@ -58,6 +58,8 @@ const list = computed(() =>
 const createDialog = reactive({
   visible: false,
   submitting: false,
+  // 2026-10-20（问题5/ADR-015）：移除「经办人」字段——后端一直不采信 operator，
+  // 交付记录经办人统一取触发请求的登录账号
   form: {
     projectId: null as number | null,
     customer: '',
@@ -67,7 +69,6 @@ const createDialog = reactive({
     type: 'physical' as OutboundType,
     mode: 'new' as OutboundMode,
     date: today(),
-    operator: 'admin',
     remark: '',
   },
 })
@@ -86,8 +87,10 @@ const summary = computed(() => {
   }
 })
 
+/** 可交付项目：排除已终止与待审核（2026-10-20 问题9：待审核项目不可登记交付——
+ *  审核前不产生交付与销售额，后端 400「该项目当前状态不可登记交付」同口径） */
 const activeProjects = computed(() =>
-  db.projects.filter((p) => p.status !== 'terminated'),
+  db.projects.filter((p) => p.status !== 'terminated' && p.status !== 'pending'),
 )
 
 /** 可选产品：新交付排除无可用数量产品；历史补录放开（仅登记台账） */
@@ -105,7 +108,6 @@ function openCreate() {
     type: 'physical',
     mode: 'new',
     date: today(),
-    operator: 'admin',
     remark: '',
   }
   createDialog.visible = true
@@ -162,7 +164,7 @@ async function confirmCreate() {
     ElMessage.success(f.mode === 'history' ? '历史补录登记成功，仅记录台账，未调整当前数量' : '交付登记成功，产品数量已更新')
     createDialog.visible = false
   } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : '登记失败')
+    showError(e, '登记失败')
   } finally {
     createDialog.submitting = false
   }
@@ -204,7 +206,7 @@ async function handleRevert(o: Outbound) {
         <div class="desc">交付记录由销售项目「交付完成」后自动生成，也支持手工补录；撤销须填写原因并保留审计流水。</div>
       </div>
       <div class="head-actions">
-        <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="bottom">
+        <el-tooltip :content="NO_PERM_TIP" :disabled="canWrite" placement="bottom">
           <span>
             <el-button type="primary" :icon="Plus" :disabled="!canWrite" @click="openCreate">
               补录交付记录
@@ -330,7 +332,7 @@ async function handleRevert(o: Outbound) {
         </el-table-column>
         <el-table-column label="操作" width="90" fixed="right" align="center">
           <template #default="{ row }">
-            <el-tooltip v-if="row.status === 'done'" :content="READONLY_TIP" :disabled="canWrite" placement="top">
+            <el-tooltip v-if="row.status === 'done'" :content="NO_PERM_TIP" :disabled="canWrite" placement="top">
               <span>
                 <el-button
                   link
@@ -407,9 +409,8 @@ async function handleRevert(o: Outbound) {
                 style="width: 100%;"
               />
             </el-form-item>
-            <el-form-item label="经办人">
-              <el-input v-model="createDialog.form.operator" placeholder="登记操作的经办人" />
-            </el-form-item>
+            <!-- 2026-10-20（问题5/ADR-015）：「经办人」输入框已删除——后端不采信该字段，
+                 交付记录经办人统一取触发请求的登录账号 -->
           </div>
         </div>
 

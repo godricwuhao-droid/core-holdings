@@ -4,6 +4,105 @@
 
 ---
 
+## 2026-10-20 变更（FIX-20261020 业务逻辑 13 项修复，分支 fix/business-logic-bugs-20261020，⚠️ 部分行为变更）
+
+### 权限与 403 语义（ADR-014，FIX-20261020-#1）
+
+- 所有写接口（POST/PUT/PATCH/DELETE）均有守卫，无裸接口：
+  - `require_editor`：业务写操作（产品/项目/合同审核/交付/基础资料/上传等），admin + editor 可执行；
+  - `require_order`：下单链路（购物车 7 端点、`POST /sales/order`、项目编辑/状态/重新提交、合同状态），三角色放行，归属约束在 services 层（viewer 仅自己下单的项目）；
+  - `require_admin`：账号管理 / 审计查询，仅 admin。
+- **viewer 越权统一返回 403**，`detail` 为可读中文提示（文案来源统一为后端，前端拦截器对 403 直接 toast `detail`，不再有前端本地"只读账号…"文案）：
+  - `require_editor` 拦截：`403 { "detail": "只读账号不可执行该操作" }`
+  - `require_admin` 拦截：`403 { "detail": "无权限执行此操作" }`
+  - services 层归属拦截（viewer 操作非自己项目）：`403 { "detail": "生态人员仅可…自己下单的项目" }`（各端点具体文案）
+
+### Outbound 输出（FIX-20261020-#7）
+
+`OutboundOut` 新增字段：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `projectItemId` | `number \| null` | 所属项目明细（`ProjectItem.id`）。合同交付自动生成的交付记录非空；手动补录与存量记录为 `null`。前端不展示，仅类型定义同步 |
+
+响应示例（`GET /bootstrap` 的 `outbounds[]` 元素、`POST /outbounds` 返回值）：
+
+```json
+{
+  "id": 12, "code": "CK-0012", "projectId": 3, "contractId": 8,
+  "projectItemId": 21,
+  "projectName": "项目一", "customer": "客户甲", "assetId": 1, "assetName": "软件A",
+  "qty": 2, "unit": "套", "amount": 200.0, "type": "physical", "mode": "new",
+  "date": "2026-10-20", "operator": "biz", "status": "done", "remark": ""
+}
+```
+
+### POST /api/outbounds（补录交付，ADR-015，FIX-20261020-#2/#9/#13a）
+
+请求：`POST /api/outbounds`（守卫 `require_editor`，viewer 403）
+
+请求体（⚠️ `operator` 字段已移除，后端不采信，操作人取登录账号）：
+
+```json
+{
+  "projectId": 3, "customer": "客户甲", "assetId": 1, "qty": 2,
+  "amount": 200, "type": "physical", "mode": "new", "date": "2026-10-20", "remark": ""
+}
+```
+
+#### 400 场景表（本次新增，文案为契约原文）
+
+| 场景 | detail |
+|---|---|
+| `qty <= 0` | 交付数量必须大于 0 |
+| 项目状态为 pending 或 terminated | 该项目当前状态不可登记交付 |
+| `assetId` 不在该项目明细中 | 该产品不属于所选项目 |
+| `asset.type == '遥感数据'` 父产品 | 遥感容器不可直接交付，请交付其数据明细 |
+
+既有 400 场景保持不变：产品不存在 / 项目下该产品明细已全部交付/释放（防重复）/ 交付数量超出可用数量。
+
+#### 库存口径（ADR-015）
+
+- 手动交付（`mode != "history"`）仅 `shippedQty += qty`（`min(quantity, …)` 夹零防御），**不再触碰 `lockedQty`**；
+- 可售校验 `qty <= quantity - lockedQty - shippedQty` 基于**未改动**的 `lockedQty` 计算；
+- `soldCount + 1`、`soldAmount += amount` 口径不变；`mode == "history"`（历史补录）不扣数量、不累计销售。
+
+### GET /api/bootstrap（viewer 过滤口径补齐，FIX-20261020-#6）
+
+admin/editor：全量（现状）。**viewer（生态人员）**：
+
+| 数据集 | 过滤口径 |
+|---|---|
+| `projects` | 仅自己下单的项目（`creator == 自己`；存量 creator 为空回退 rep 判定）——既有口径 |
+| `contracts` | 跟随项目可见性（`projectId ∈ 可见项目`）——既有口径 |
+| `outbounds` | `projectId ∈ 可见项目` **或** `contractId ∈ 可见合同` |
+| `flows` | `contractId ∈ 可见合同`，或 `ref` 指向可见编号（`SP-` 项目 / `HT-` 合同 / `CK-` 交付）；产品级流水（ref=产品编号，如登记 `purchase_in`）放行（产品目录对 viewer 全量可见） |
+| `logs` | `target=project`：detail 中 `SP-` 编号 ∈ 可见项目，或 `contractId ∈ 可见合同`，或（无编号时）项目名 ∈ 可见项目名；`target=outbound`：detail 中 `CK-` 编号 ∈ 可见交付；`target=asset/setting`：放行（引用产品/基础资料，全量可见） |
+| 其余（assets/rsItems/基础资料/模板/购物车/文件） | 不变（assets 等为全量可见的主数据；cart 按登录用户隔离） |
+
+过滤原则：宁可保守过滤，不漏放跨客户信息。
+
+### GET /api/users/options/all（viewer 过滤口径，FIX-20261020-#6）
+
+- admin/editor：全部启用账号（现状）。
+- **viewer**：仅返回本人 + 其可见项目中 `rep` / `creator` / `businessOwner` 出现过的启用账号（供「账号 → 姓名」显示映射，不暴露其他客户相关账号）。
+
+### 建单/加购校验（FIX-20261020-#13b/#13c）
+
+| 端点 | 场景 | 400 detail |
+|---|---|---|
+| `POST /projects` | 任一合同 `customer` 为空 | 请为每份销售记录填写客户 |
+| `POST /cart`、`POST /cart/batch`、`POST /sales/order`、`POST /projects` | 产品 `type == '遥感数据'` 父产品（非其明细行） | 遥感数据容器不可直接购买，请购买其数据明细 |
+
+容器明细行（`itemId` 非空，指向 `rs_items`）放行，仅拦父产品本身。
+
+### 其他口径（FIX-20261020）
+
+- `PATCH /contracts/{id}/status`（交付）与撤销交付：接口不变；生成的 `Outbound.operator` 统一取**触发请求的登录账号**（不再取 `project.rep`），`projectItemId` 指向被交付明细。
+- `PUT /assets/{id}`：`type` 变更时后端自动重算 `pricingMode`（卫星Token → `amount`，其余 → `unit`），前端无需传 `pricingMode`。
+- `rep` 字段统一存 **username**：`POST /sales/order`、`POST /projects` 的 `rep` 若传姓名，后端按用户表归一为 username（查不到则原样存）。
+- `POST /projects/{id}/review`（驳回）：合同备注改为**追加**（原备注非空时 `原备注｜驳回：{reason}`），不再覆盖。
+
 ## 2026-10-19 变更（ADR-013 销售记录：一资产一条记录 + 多主体 + 文案改名，⚠️ 行为变更）
 
 - **记录粒度**：`POST /api/cart/checkout` 与 `POST /api/sales/order` 改为**按产品分组**——每个产品一条销售记录（遥感明细行归父产品），同客户多主体产品可一单混装（原「同主体」400 校验全部移除）；手动建单 `POST /projects` 保留自由结构（不再校验同主体）。
@@ -202,6 +301,7 @@ unit 模式行 PUT 传 amount=12345 → 忽略，行 amount 仍为 null
 ### POST /api/outbounds（FIX-1 新增可售校验）
 
 请求：`POST /api/outbounds`，body 同既有（`assetId/qty/amount/type/mode/date/projectId?/customer?/operator?/remark?`）
+> 注（2026-10-20 FIX-20261020）：`operator` 字段已从 `OutboundInput` 移除（后端不采信，操作人取登录账号）；新增 4 个 400 场景与库存口径（不再触碰 `lockedQty`）见文首「2026-10-20 变更」节。
 新增校验：`mode != "history"` 且产品**非 repeatSale** 时，`qty > quantity - lockedQty - shippedQty`（按当前库值）→ 400。
 `mode = "history"`（历史补录，不扣数量）与 repeatSale 产品跳过校验。
 
@@ -497,7 +597,8 @@ Content-Disposition: attachment; filename*=UTF-8''%E5%BE%B7%E6%95%B0%E4%BA%A4%E9
 | 401 | `{"detail":"未登录或登录已过期"}` | 未带 token / token 无效或过期 / 账号不存在或已禁用（禁用账号的旧 token 立即失效） |
 | 401 | `{"detail":"用户名或密码错误"}` | 登录时凭据错误 |
 | 401 | `{"detail":"账号已被禁用"}` | 登录时账号 `enabled=false` |
-| 403 | `{"detail":"无权限执行此操作"}` | 已登录但角色不足 |
+| 403 | `{"detail":"无权限执行此操作"}` | 已登录但角色不足（`require_admin` 拦截；2026-10-20 起 `require_editor` 拦截文案改为下行） |
+| 403 | `{"detail":"只读账号不可执行该操作"}` | viewer 触发 `require_editor` 写接口（2026-10-20 FIX-20261020 起文案；前端 403 统一 toast `detail`） |
 
 ### 权限矩阵（固定三角色，无动态权限表）
 

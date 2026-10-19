@@ -3,8 +3,8 @@
  * 购物车 - 汇总待售产品
  *
  * 展示已加入购物车的产品，支持调整数量 / 移除 / 清空；数量受可用数量约束。
- * ADR-007：允许跨主体混装；每行填写「客户」，结算时按客户分组——
- * 每客户生成一份合同（合同内强制同一主体），全部挂在同一个「进行中」销售项目下并锁定数量。
+ * ADR-007：允许跨主体混装；每行填写「客户」，结算时按（产品, 客户）双键分组（ADR-016，2026-10-20）——
+ * 每个「产品 × 客户」组合生成一份合同（一资产一客户一记录），全部挂在同一个「进行中」销售项目下并锁定数量。
  * 交付（扣数量 + 交付记录）在项目详情页对合同执行「交付」后触发。
  * 数据预留 userId 维度（当前默认 admin），为后续账号权限管控做准备。
  */
@@ -13,7 +13,7 @@ import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Delete, InfoFilled, Sell, ShoppingCart } from '@element-plus/icons-vue'
 import { availableQty, entityShort, formatMoney, formatTokens, isAmountMode, rsItemName, type Asset, type CartItem, type RsItem } from '@/types'
-import { checkoutCart, clearCart, db, getAsset, patchCartItem, refresh, removeCartItem, rsItemById, setCartAmount, setCartQty, type OrderFields } from '@/api'
+import { checkoutCart, clearCart, db, getAsset, patchCartItem, refresh, removeCartItem, rsItemById, setCartAmount, setCartQty, showError, type OrderFields } from '@/api'
 import SalesOrderDialog from '@/components/SalesOrderDialog.vue'
 import type { OrderItem } from '@/components/SalesOrderDialog.vue'
 import { isViewer } from '@/auth'
@@ -51,7 +51,7 @@ const cartRows = computed<CartRow[]>(() =>
 const totalQty = computed(() => db.cart.reduce((s, c) => s + c.qty, 0))
 const totalAmount = computed(() => cartRows.value.reduce((s, r) => s + r.subtotal, 0))
 
-// ==================== 行级客户（ADR-007：结算时按客户分组拆合同） ====================
+// ==================== 行级客户（ADR-007/ADR-016：结算时按（产品, 客户）双键分组拆合同） ====================
 /** 客户校验失败（标红）的购物车行 id 集合 */
 const customerErrors = reactive(new Set<number>())
 
@@ -78,22 +78,25 @@ async function onAmountChange(row: CartRow) {
     // 回传该行当前 qty：后端 PUT 对 qty<=0 会删行，金额提交绝不能触发删除
     await setCartAmount(row.cart.id, row.cart.qty, n)
   } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : '销售金额更新失败')
+    showError(e, '销售金额更新失败')
     await refresh(true)
   }
 }
 
-/** 结算预览：按客户分组（保持行序），每组 = 未来一份合同 */
+/** 结算预览：按（产品, 客户）双键分组（保持行序），每组 = 未来一份合同
+ *  2026-10-20（ADR-016）：原按客户单键分组，与后端 checkout 的 (assetId, customer) 分组口径不一致
+ *  （同产品多客户被静默合并为一条记录）；改为双键后「将生成 N 份销售记录」提示与落库一致 */
 const previewGroups = computed(() => {
-  const groups: { customer: string; qty: number; amount: number }[] = []
+  const groups: { assetName: string; customer: string; qty: number; amount: number }[] = []
   const idx = new Map<string, number>()
   for (const r of cartRows.value) {
     const customer = (r.cart.customer ?? '').trim()
     if (!customer) continue
-    const i = idx.get(customer)
+    const key = `${r.cart.assetId}::${customer}`
+    const i = idx.get(key)
     if (i === undefined) {
-      idx.set(customer, groups.length)
-      groups.push({ customer, qty: r.cart.qty, amount: r.subtotal })
+      idx.set(key, groups.length)
+      groups.push({ assetName: r.asset.name, customer, qty: r.cart.qty, amount: r.subtotal })
     } else {
       groups[i].qty += r.cart.qty
       groups[i].amount += r.subtotal
@@ -110,7 +113,7 @@ async function onCustomerChange(row: CartRow) {
   try {
     await patchCartItem(id, next)
   } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : '客户修改失败')
+    showError(e, '客户修改失败')
     await refresh(true) // 回滚到后端值
   }
 }
@@ -145,7 +148,7 @@ async function onQtyChange(row: CartRow) {
   try {
     await setCartQty(row.cart.id, row.cart.qty)
   } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : '数量更新失败')
+    showError(e, '数量更新失败')
     row.cart.qty = avail ?? row.cart.qty
     await refresh(true)
   }
@@ -156,7 +159,7 @@ async function removeRow(row: CartRow) {
     await removeCartItem(row.cart.id)
     ElMessage.success('已移除')
   } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : '移除失败')
+    showError(e, '移除失败')
   }
 }
 
@@ -175,7 +178,7 @@ async function clearAll() {
     await clearCart()
     ElMessage.success('购物车已清空')
   } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : '清空失败')
+    showError(e, '清空失败')
   }
 }
 
@@ -236,7 +239,7 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
     await refresh(true)
     router.push(`/sales/projects/${p.id}/detail`)
   } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : '下单失败')
+    showError(e, '下单失败')
     await refresh(true)
   } finally {
     orderLoading.value = false
@@ -251,7 +254,7 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
       <div>
         <div class="crumb">销售管理 / 购物车</div>
         <h1>购物车</h1>
-        <div class="desc">汇总待售产品，可调整数量、移除或清空；为每件产品填写客户后下单，按客户分组生成销售记录并锁定数量，交付在项目详情页对销售记录执行「交付」即生成交付记录。</div>
+        <div class="desc">汇总待售产品，可调整数量、移除或清空；为每件产品填写客户后下单，按「产品 + 客户」分组生成销售记录并锁定数量，交付在项目详情页对销售记录执行「交付」即生成交付记录。</div>
       </div>
     </div>
 
@@ -266,7 +269,7 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
       <!-- 提示条 -->
       <div class="info-bar">
         <el-icon aria-hidden="true"><InfoFilled /></el-icon>
-        <span>购物车可混装不同主体的产品，数量受产品「可用数量」约束：暂无可用数量的产品不可加入，超出可用数量的数量会被自动拦截；可重复售卖产品不受限。包量定价（Token）产品按包售卖，需为该行填写销售金额（整数元），结算以销售金额为准。点击「下单」前请为每件产品填写客户：下单后每个产品生成一条销售记录（不同主体的产品可同单混装），销售项目进入「待审核」并锁定数量，商务接手确认（可改价）后生效，再在项目详情页对销售记录执行「交付」即生成交付记录。</span>
+        <span>购物车可混装不同主体的产品，数量受产品「可用数量」约束：暂无可用数量的产品不可加入，超出可用数量的数量会被自动拦截；可重复售卖产品不受限。包量定价（Token）产品按包售卖，需为该行填写销售金额（整数元），结算以销售金额为准。点击「下单」前请为每件产品填写客户：下单后每个产品按客户各生成一条销售记录（同一产品卖给多个客户会拆成多条；不同主体的产品可同单混装），销售项目进入「待审核」并锁定数量，商务接手确认（可改价）后生效，再在项目详情页对销售记录执行「交付」即生成交付记录。</span>
       </div>
 
       <!-- 表格卡 -->
@@ -293,7 +296,7 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
           <el-table-column label="客户" width="180" align="left">
             <template #default="{ row }">
               <!-- 行级客户对三角色均可编辑（含生态人员） -->
-              <el-tooltip content="结算时按客户分组生成销售记录" placement="top">
+              <el-tooltip content="结算时按「产品 + 客户」分组生成销售记录" placement="top">
                 <el-input
                   v-model="row.cart.customer"
                   size="small"
@@ -306,9 +309,8 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
           </el-table-column>
           <el-table-column label="销售单价" width="140" align="right" header-align="right">
             <template #default="{ row }">
-              <!-- ADR-008：包量定价行单价为参考口径（元/万Token），不参与计价 -->
-              <span v-if="row.isAmount" class="muted">¥{{ row.price }}/万Token</span>
-              <span v-else>{{ formatMoney(row.price) }}</span>
+              <!-- ADR-017（2026-10-20）：包量定价行单价与普通产品一致（元/份，参考口径），删除「元/万Token」特判 -->
+              <span :class="{ muted: row.isAmount }">{{ formatMoney(row.price) }}</span>
             </template>
           </el-table-column>
           <el-table-column label="数量" width="160" align="center">

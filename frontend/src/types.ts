@@ -79,7 +79,7 @@ export interface Asset {
   shippedQty: number // 售卖数量（已交付）
   repeatSale: boolean // 可重复售卖
   pricingMode?: 'unit' | 'amount' // 计价模式（ADR-008）：unit=单价×数量（默认）；amount=包量金额权威（卫星 Token），salePrice 仅参考
-  salePrice: number // 单价（元/单位）；amount 模式下为参考单价（元/万Token），不参与计价
+  salePrice: number // 单价（元/单位）；amount 模式下为参考单价（元/份，ADR-017），不参与计价
   soldAmount: number // 累计售卖金额（元）
   soldCount: number // 授权/销售次数（可重复售卖）
   status: AssetStatus // 可售 / 全部出售
@@ -147,9 +147,9 @@ export function availableQty(a: Asset): number | null {
 }
 
 /** 可售金额 = 可售数量 × 单价。
- * 包量定价（amount 模式，卫星Token）返回 0：其 salePrice 为「元/万Token」参考值（不参与计价，
- * ADR-008），quantity 为 Token 个数，两者相乘不是真实金额（曾导致看板/板块「可售金额」虚高）。
- * 该类产品以合同金额（整数元）为权威口径，已体现在项目/合同的 contractAmount 统计中。 */
+ * 包量定价（amount 模式，卫星Token）返回 0：其 salePrice 为参考值（元/份，不参与计价，
+ * ADR-008/ADR-017），以合同金额（整数元）为权威口径，两者相乘不是真实金额
+ * （曾导致看板/板块「可售金额」虚高）。已体现在项目/合同的 contractAmount 统计中。 */
 export function availableValue(a: Asset): number {
   if (isAmountMode(a)) return 0
   const q = availableQty(a)
@@ -286,7 +286,7 @@ export interface Contract {
   id: number
   code: string // 合同编号 HT-XXXX
   projectId: number
-  customer: string // 合同客户（合同内强制同一产品主体）
+  customer: string // 合同客户（2026-10-20 ADR-013：「合同内同一产品主体」限制已移除）
   subject: string // 产品主体（由明细带出）
   contractAmount: number // 合同金额（元）
   status: ProjectStatus // pending / active / delivered / terminated（与项目四态同构；ADR-012 pending=待审核）
@@ -324,6 +324,7 @@ export interface Outbound {
   code: string // 交付单号 CK-XXXX
   projectId: number | null
   contractId?: number | null // 关联合同（ADR-007）：合同交付自动交付时非空；存量/手工补录为 null
+  projectItemId?: number | null // 关联合同明细（2026-10-20 问题7）：合同交付指向 ProjectItem.id；手动补录为 null（界面不展示，仅类型同步）
   projectName: string
   customer: string
   assetId: number
@@ -498,12 +499,14 @@ export function formatAssetQty(a: Pick<Asset, 'pricingMode'>, n: number | null |
 }
 
 /**
- * 派生参考单价（ADR-008，仅包量定价模式展示用）：合同金额 ÷ 数量 ÷ 1e4（元/万Token），
- * 保留 4 位小数（2026-10-16 起去掉「约」前缀，直接显示数值）；不参与任何金额计算。
+ * 派生参考单价（ADR-017，仅包量定价模式展示用）：合同金额 ÷ 数量（元/份），
+ * 与后端 `_derived_price` 同口径，无 1e4 换算（2026-10-20：删除「元/万Token」口径）；
+ * 不参与任何金额计算。
+ * @param unit 产品计量单位，用于「元/{unit}」展示；缺省显示「元/份」
  */
-export function derivedUnitPrice(amount: number, qty: number): string {
+export function derivedUnitPrice(amount: number, qty: number, unit?: string): string {
   if (!amount || !qty) return '-'
-  return `${(amount / qty / 1e4).toFixed(4)} 元/万Token`
+  return `${(amount / qty).toFixed(2)} 元/${unit || '份'}`
 }
 
 /** 标准金额展示：字段单位即元（ADR-006），直显「¥ + 千分位 + 两位小数」，0/空显示 '-' */

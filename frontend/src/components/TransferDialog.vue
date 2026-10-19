@@ -7,7 +7,7 @@
  */
 import { computed, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
-import { claimProject, userOptions, type UserOption } from '@/api'
+import { claimProject, showError, userOptions, type UserOption } from '@/api'
 import { currentUser, isAdmin } from '@/auth'
 
 const SELF_KEY = '__self__'
@@ -59,7 +59,7 @@ async function onConfirm() {
     emit('done')
     visible.value = false
   } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : '操作失败')
+    showError(e, '操作失败')
   } finally {
     submitting.value = false
   }

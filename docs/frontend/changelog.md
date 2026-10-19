@@ -2,6 +2,29 @@
 
 > 记录 core-holdings 前端（Vue3 + TS + Element Plus + Vite）的页面/组件/接口封装变更。
 
+## 2026-10-20 ｜ 修复：业务逻辑 bug 10 项（FIX-20261020）
+
+**关联任务**：FIX-20261020（问题清单 `docs/business-logic-bugs-20261020.md`）；接口契约以 `docs/api-contracts.md`「FIX-20261020 批次」为准；决策依据 ADR-014 / ADR-016 / ADR-017。
+
+| 日期 | 类型 | 变更内容 | 影响文件范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-20 | 修复 | 删除前端 viewer 写请求白名单（`VIEWER_ALLOWED_REQUESTS`）与 axios 请求预拦截；响应拦截器对 403 统一 toast 后端 `detail` 并抛 `PermissionError`；新增 `showError` 统一提示函数，全部 catch 调用点（13 个文件 33 处）改用它避免 403 重复弹框；原 `READONLY_TIP` 更名为 `NO_PERM_TIP`（仅保留禁用按钮 UX 提示用途，403 错误文案统一由后端给出） | api/index.ts, auth.ts, views/{cart,login,assets/*,sales/*,settings/*}, components/TransferDialog.vue | FIX-20261020-#1 | ADR-014：权限判定统一由后端守卫（require_order/require_editor）兜底，viewer 编辑/取消/终止/交付/重新提交恢复可用 |
+| 2026-10-20 | 修复 | 购物车结算预览 `previewGroups` 分组键由 customer 改为 `(assetId, customer)` 双键（同产品不同客户 = 两份销售记录），与后端 checkout 分组一致；预览行追加产品名区分同客户多产品分组；页面/tooltip「按客户分组」文案同步 | views/cart/index.vue, components/SalesOrderDialog.vue | FIX-20261020-#3 | ADR-016；「将生成 N 份销售记录」文案保持 |
+| 2026-10-20 | 修复 | Token 计价展示统一：`derivedUnitPrice` 去掉 `/1e4`，改为 `amount/qty`（`元/{unit}`，2 位小数，新增可选 unit 参数，调用方传产品 unit）；产品列表/详情/创建/购物车「¥{salePrice}/万Token」特判分支全部删除，改为与普通产品一致的 `formatMoney(salePrice)` 展示；创建页数量提示改「份数」口径、单价标签统一「销售单价（元）」 | types.ts, views/assets/{list,detail,create}.vue, views/cart/index.vue, views/sales/projects/{create,detail}.vue, components/SalesOrderDialog.vue | FIX-20261020-#4 | ADR-017：前后端派生价同口径（元/份）；存量 Token 数据不自动迁移，由业务页面手工修正 |
+| 2026-10-20 | 修复 | 产品编辑模式「产品类型」下拉加 `:disabled="isEdit"`（与所属板块一致），避免改类型造成计价模式脱钩 | views/assets/create.vue | FIX-20261020-#8 | 后端 type 变更时亦自动重算 pricingMode（契约 §7） |
+| 2026-10-20 | 修复 | 补录交付弹窗删除「经办人」输入框与 `form.operator` 字段（提交不再携带 operator，`OutboundInput` 同步移除）；项目下拉 `activeProjects` 过滤改为排除 `terminated` 与 `pending` | views/sales/outbound/index.vue, api/index.ts | FIX-20261020-#5 / #9 | ADR-015：经办人统一取触发请求的登录账号；表格「经办人」列保留（展示后端返回值） |
+| 2026-10-20 | 修复 | rep 统一存 username：下单弹窗静默取 `currentUser.username`（原 name）；建单页新建表单生态人员下拉由 db.reps 基础资料（value=姓名）切换为全量账号名册（value=username、label 显示姓名），去掉 allow-create（防手输姓名回潮）；列表筛选选项仅收集 `p.rep`（username），显示名走 `repName`（/users/options/all 映射） | components/SalesOrderDialog.vue, views/sales/projects/{create,index}.vue | FIX-20261020-#10 | 后端对姓名入参亦归一为 username（契约 §7）；编辑面板原已 username 不动 |
+| 2026-10-20 | 修复 | 项目详情 `customerText`：p.customer 为空时从合同客户去重提取——1 个 → 直接显示客户名；多个 → 「N 位客户」（N 为去重客户数）；0 个 → '-'（修复空客户合同误显示「1 位客户」） | views/sales/projects/detail.vue | FIX-20261020-#12a | 原按合同数回退 |
+| 2026-10-20 | 修复 | 资产详情「销售关联」tab 生态人员列由裸 `row.project.rep` 改为账号→姓名映射显示（复用项目页既有口径：/users/options/all 名册 + repName 同构实现） | views/assets/detail.vue | FIX-20261020-#12b | 2026-10-20 前只修了 4 个项目页，本页遗漏 |
+| 2026-10-20 | 修复 | 建单页 `onItemAssetChange` 删除「同合同内产品主体必须一致」预校验及「后端 400 兜底」过时注释（后端 ADR-013 已移除该限制）；`ContractInput`/`Contract` 等相关注释同步 | views/sales/projects/create.vue, api/index.ts, types.ts | FIX-20261020-#12c | 手工混合主体合同不再被前端拦截 |
+| 2026-10-20 | 修复 | 建单页 `contractAmount` 改只读展示（disabled，仍显示 Σ 明细金额实时值），删除 `contractTouched` 手改逻辑与相关注释；重新提交预填后按明细重算合同金额 | views/sales/projects/create.vue | FIX-20261020-#12d | 后端 review 仍按 Σ 明细重算，口径一致；提交值 = 明细合计（非手改值） |
+
+### 验证
+
+- `npx vue-tsc --noEmit` 0 error（strict + noUnusedLocals）；IDE 诊断 0。
+- 全局搜索：`READONLY_TIP` / `VIEWER_ALLOWED_REQUESTS` 无残留引用；「万Token」展示特判无残留（仅删除说明性注释）；outbound 表单 `operator` 无残留（表格列保留，展示后端值）；`contractTouched` 仅剩 SalesOrderDialog 直接下单对话框的同名局部逻辑（非本次范围）。
+- 未修改 backend/ 下任何文件；未 commit。
+
 ## 2026-10-20 ｜ 修复：列表「生态人员」列裸账号外露（显示名册缺生态账号）
 
 **根因**：账号→姓名映射用的 `/users/options` 只返回商务（editor/admin）账号（商务负责人下拉专用），生态 viewer 账号不在其中 → `repName` 查不到回退原值；且 10-19 起 rep 归一为 username，保存过的项目列值变账号后直接外露（老单存姓名所以看着"又变回账号了"）。

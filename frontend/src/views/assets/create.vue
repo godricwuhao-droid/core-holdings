@@ -31,14 +31,13 @@ import {
   ASSET_STOCK_STATE,
   BOARDS,
   ENTITIES,
-  formatTokens,
   today,
   type AssetStatus,
   type AssetStockState,
   type Board,
 } from '@/types'
 import { createAsset, fileDisplayName, getAsset, refresh, updateAsset, uploadFile, type AssetInput } from '@/api'
-import { canWrite, READONLY_TIP } from '@/auth'
+import { canWrite, NO_PERM_TIP } from '@/auth'
 import FilePreview from '@/components/FilePreview.vue'
 
 const route = useRoute()
@@ -258,7 +257,9 @@ onMounted(async () => {
               </el-select>
             </el-form-item>
             <el-form-item label="产品类型" prop="type">
-              <el-select v-model="form.type" placeholder="选择产品类型" style="width: 100%;">
+              <!-- 2026-10-20（问题8）：编辑模式禁用（与所属板块一致）——计价模式（pricingMode）由产品类型决定，
+                   可改类型会造成计价模式与类型脱钩；后端 type 变更时自动重算 pricingMode（契约 FIX-20261020） -->
+              <el-select v-model="form.type" :disabled="isEdit" placeholder="选择产品类型" style="width: 100%;">
                 <el-option v-for="t in typeOptions[form.board] || []" :key="t" :label="t" :value="t" />
               </el-select>
             </el-form-item>
@@ -317,12 +318,14 @@ onMounted(async () => {
             </el-form-item>
             <el-form-item label="产品总数" prop="quantity">
               <el-input-number v-model="form.quantity" :min="0" :precision="0" :step="1" style="width: 100%;" />
-              <!-- ADR-008：Token 产品数量按 formatTokens 展示（库内仍存原始个数） -->
+              <!-- ADR-017（2026-10-20）：Token 产品数量口径统一为「可售份数」（与普通产品一致）；
+                   「每份内含多少 Token」只写进规格说明，不参与计算 -->
               <div v-if="isAmount" class="muted" style="font-size: 12px; margin-top: 4px;">
-                {{ formatTokens(form.quantity) }} Token（按原始个数登记）
+                {{ form.quantity }} 份（数量为可售份数；「每份含多少 Token」请写入规格说明）
               </div>
             </el-form-item>
-            <el-form-item :label="isAmount ? '参考单价（元/万Token）' : '销售单价（元）'" prop="salePrice">
+            <!-- ADR-017（2026-10-20）：Token 产品单价口径与普通产品一致（元/份），删除「元/万Token」特判 -->
+            <el-form-item label="销售单价（元）" prop="salePrice">
               <el-input-number v-model="form.salePrice" :min="0" :precision="2" style="width: 100%;" />
             </el-form-item>
             <!-- ADR-008：包量定价说明（浅蓝提示条） -->
@@ -364,7 +367,7 @@ onMounted(async () => {
                 @change="onContractPicked"
               />
               <template v-if="!form.contractFile">
-                <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="top">
+                <el-tooltip :content="NO_PERM_TIP" :disabled="canWrite" placement="top">
                   <span>
                     <el-button :icon="Upload" :loading="uploading" :disabled="!canWrite" @click="pickContract">
                       上传产品清单（PDF / Word / 图片）
@@ -388,7 +391,7 @@ onMounted(async () => {
         <!-- 底部操作区：右对齐，不悬浮 -->
         <div class="bottom-actions">
           <el-button @click="handleCancel">返回</el-button>
-          <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="top">
+          <el-tooltip :content="NO_PERM_TIP" :disabled="canWrite" placement="top">
             <span>
               <el-button type="primary" :icon="CircleCheck" :loading="submitting" :disabled="!canWrite" @click="handleSubmit">
                 {{ isEdit ? '保存修改' : '创建产品' }}

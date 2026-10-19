@@ -91,16 +91,28 @@ def user_options(db: Session = Depends(get_db), _: models.User = Depends(securit
 
 
 @router.get("/users/options/all", response_model=list[schemas.UserOut])
-def user_options_all(db: Session = Depends(get_db), _: models.User = Depends(security.get_current_user)):
+def user_options_all(db: Session = Depends(get_db), user: models.User = Depends(security.get_current_user)):
     """全部启用账号（2026-10-20：含生态 viewer）——供项目页「账号 → 姓名」显示映射
     （生态人员列 rep 存生态账号，/users/options 只有商务查不到 → 裸账号外露）。
-    仅展示用途；商务接手/转交下拉仍用 /users/options（不得转给生态）。"""
-    return (
+    仅展示用途；商务接手/转交下拉仍用 /users/options（不得转给生态）。
+    FIX-20261020-#6：viewer 仅返回本人 + 其可见项目中 rep/creator/businessOwner
+    出现过的账号（此前全量返回会暴露其他客户相关账号）；admin/editor 全量（现状）。"""
+    all_enabled = (
         db.query(models.User)
         .where(models.User.enabled == True)  # noqa: E712
         .order_by(models.User.id.asc())
         .all()
     )
+    if user.role != "viewer":
+        return all_enabled
+    visible_projects = [p for p in db.query(models.Project).all()
+                        if services.user_sees_project(user, p)]
+    known = {user.username}
+    for p in visible_projects:
+        for v in (p.rep, p.creator, p.businessOwner):
+            if v:
+                known.add(v)
+    return [u for u in all_enabled if u.username in known]
 
 
 @router.post("/users", response_model=schemas.UserOut)

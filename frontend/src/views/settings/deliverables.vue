@@ -33,9 +33,10 @@ import {
   addTemplateItem,
   deleteTemplateItem,
   getDeliverableTemplate,
+  showError,
   updateTemplateItem,
 } from '@/api'
-import { canWrite, READONLY_TIP } from '@/auth'
+import { canWrite, NO_PERM_TIP } from '@/auth'
 
 /** 产品类型 → 线性图标（仅作识别，不用插画） */
 const TYPE_ICONS: Record<string, typeof Cpu> = {
@@ -116,7 +117,7 @@ async function handleSubmit() {
     }
     dialog.visible = false
   } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : '保存失败')
+    showError(e, '保存失败')
   } finally {
     dialog.submitting = false
   }
@@ -154,7 +155,7 @@ void db
         <div class="desc">按产品类型独立配置标准交付包；产品按类型模板初始化交付物清单，销售交付时按清单选择版本。</div>
       </div>
       <div class="head-actions">
-        <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="bottom">
+        <el-tooltip :content="NO_PERM_TIP" :disabled="canWrite" placement="bottom">
           <span>
             <el-button type="primary" :icon="Plus" :disabled="!canWrite" @click="openCreate()">
               新增交付物
@@ -212,7 +213,7 @@ void db
           <span class="muted" style="font-size: 12px;">
             共 {{ getDeliverableTemplate(activeCu.type).length }} 项
           </span>
-          <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="bottom">
+          <el-tooltip :content="NO_PERM_TIP" :disabled="canWrite" placement="bottom">
             <span>
               <el-button plain size="small" :icon="Plus" :disabled="!canWrite" @click="openCreate(activeCu.type)">
                 新增交付物
@@ -246,14 +247,14 @@ void db
         </el-table-column>
         <el-table-column label="操作" width="130" align="center">
           <template #default="{ row }">
-            <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="top">
+            <el-tooltip :content="NO_PERM_TIP" :disabled="canWrite" placement="top">
               <span class="op-tip">
                 <el-button link type="primary" size="small" :disabled="!canWrite" @click="openEdit(activeCu.type, row)">
                   编辑
                 </el-button>
               </span>
             </el-tooltip>
-            <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="top">
+            <el-tooltip :content="NO_PERM_TIP" :disabled="canWrite" placement="top">
               <span class="op-tip">
                 <el-button link type="danger" size="small" :disabled="!canWrite" @click="handleDelete(activeCu.type, row)">
                   删除

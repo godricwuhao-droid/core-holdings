@@ -85,6 +85,13 @@ def _ensure_migration() -> None:
             conn.execute(text("ALTER TABLE outbounds ADD COLUMN contractId INTEGER"))
             conn.execute(text("CREATE INDEX ix_outbounds_contractId ON outbounds (contractId)"))
         print("[migration] outbounds.contractId 列已补充")
+    # FIX-20261020-#7：outbounds.projectItemId 交付记录精确关联项目明细（撤销交付按 id 定位，
+    # 同合同同产品多明细不再 limit(1) 猜行）；手动补录/存量记录为 NULL；幂等补列 + 索引
+    if "projectItemId" not in ob_cols:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE outbounds ADD COLUMN projectItemId INTEGER"))
+            conn.execute(text("CREATE INDEX ix_outbounds_projectItemId ON outbounds (projectItemId)"))
+        print("[migration] outbounds.projectItemId 列已补充")
     # 3) flows.contractId：合同级交付/终止产生的流水关联合同
     if "contractId" not in flow_cols:
         with engine.begin() as conn:

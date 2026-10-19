@@ -5,7 +5,8 @@
  * 新建：项目级字段（项目名称 / 生态人员 / 商务负责人 / 日期 / 备注）
  *   + 「合同清单」区——每客户一份合同卡片（客户 + 合同金额 + 明细行），
  *   提交走 POST /projects 的 contracts 结构（项目 subject/customer/expectedAmount 由后端派生）。
- * 合同内强制同一产品主体（前端预校验 + 后端 400 兜底）；合同一经生成不可增删改明细。
+ * 合同一经生成不可增删改明细（2026-10-20 ADR-013：「合同内同一产品主体」限制已移除，
+ * 允许一份合同内混合不同主体的产品明细）。
  * 编辑：只改基本信息（合同结构不可改——终止对应合同后重新下单）。
  * 项目状态由合同状态派生，本页不提供状态变更入口。
  * 从产品详情「登记销售」跳转时，自动同步带入 产品 + 单价 + 可售数量。
@@ -50,11 +51,12 @@ import {
   resubmitProject,
   updateProject,
   allUserOptions,
+  showError,
   type UserOption,
   type ContractInput,
   type ProjectInput,
 } from '@/api'
-import { canWrite, currentUser, isViewer, isAdmin, READONLY_TIP } from '@/auth'
+import { canWrite, currentUser, isViewer, isAdmin, NO_PERM_TIP } from '@/auth'
 import TransferDialog from '@/components/TransferDialog.vue'
 
 const route = useRoute()
@@ -96,8 +98,8 @@ interface ContractDraftItem {
 
 interface ContractDraft {
   customer: string
-  contractAmount: number // 元；未手改时随明细合计自动重算
-  contractTouched: boolean
+  // 元；= 明细金额合计（只读，2026-10-20 问题12d：删除手改逻辑——审核确认时后端按 Σ 明细重算，手改值会被静默丢弃）
+  contractAmount: number
   remark: string
   items: ContractDraftItem[]
 }
@@ -109,7 +111,7 @@ function newItem(): ContractDraftItem {
 }
 
 function addContract() {
-  contracts.push({ customer: '', contractAmount: 0, contractTouched: false, remark: '', items: [newItem()] })
+  contracts.push({ customer: '', contractAmount: 0, remark: '', items: [newItem()] })
 }
 
 function removeContract(idx: number) {
@@ -146,7 +148,7 @@ function itemMax(it: ContractDraftItem): number | undefined {
 /**
  * 明细金额计算（ADR-008 双模式）：
  *  - unit 模式：销售金额 = 数量 × 单价（元值，保留 2 位小数），空/非法按 0
- *  - amount 模式（包量定价）：合同金额（整数元）为权威输入，单价派生 = 金额 ÷ 数量（元/Token，6 位小数）
+ *  - amount 模式（包量定价）：合同金额（整数元）为权威输入，单价派生 = 金额 ÷ 数量（元/份，6 位小数，ADR-017）
  */
 function calcItemAmount(c: ContractDraft, it: ContractDraftItem) {
   const a = itemAsset(it)
@@ -164,9 +166,9 @@ function onItemAmountInput(it: ContractDraftItem, v: string) {
   it.amount = digits === '' ? 0 : Number(digits)
 }
 
-/** 合同金额默认 = 该合同明细金额合计（元）；用户手改后不再自动覆盖 */
+/** 合同金额 = 该合同明细金额合计（元），实时重算（2026-10-20 问题12d：只读展示，无手改；
+ *  后端审核确认时同样按 Σ 明细重算，口径一致） */
 function recalcContractAmount(c: ContractDraft) {
-  if (c.contractTouched) return
   c.contractAmount = Math.round(c.items.reduce((s, it) => s + (it.amount || 0), 0) * 100) / 100
 }
 
@@ -175,8 +177,8 @@ function contractItemsTotal(c: ContractDraft): number {
 }
 
 /**
- * 合同内主体预校验（ADR-007）：选产品时若与本合同内已选产品主体不同 → 提示并回退选择。
- * 后端仍有 400「客户「X」的产品主体不一致，请拆分」兜底。
+ * 明细产品变更处理（2026-10-20 问题12c：删除「合同内同一产品主体」预校验——
+ * 后端 ADR-013 已移除该限制，一份合同内允许混合不同主体的产品明细，原「后端 400 兜底」已失效）。
  */
 function onItemAssetChange(c: ContractDraft, it: ContractDraftItem) {
   const a = it.assetId ? getAsset(it.assetId) : undefined
@@ -192,18 +194,6 @@ function onItemAssetChange(c: ContractDraft, it: ContractDraftItem) {
   // 2026-10-20：产品变更后清空旧遥感明细绑定（明细必须归属所选产品，后端同口径校验）
   if (it.itemId != null && !(a?.type === '遥感数据' && db.rsItems.some((r) => r.id === it.itemId && r.assetId === it.assetId))) {
     it.itemId = undefined
-  }
-  if (a?.subject) {
-    const conflict = c.items.find(
-      (o) => o !== it && o.assetId && getAsset(o.assetId)?.subject && getAsset(o.assetId)!.subject !== a.subject,
-    )
-    if (conflict) {
-      ElMessage.warning('该产品主体与本销售记录内其它产品不一致，请新建一份销售记录')
-      it.assetId = null
-      it.price = 0
-      it.amount = 0
-      return
-    }
   }
   // ADR-008：包量定价产品单价为参考值，不作为明细单价预填（单价由合同金额派生）
   if (a && !isAmountMode(a) && !it.price && a.salePrice) it.price = a.salePrice
@@ -343,7 +333,7 @@ async function handleClaimInPanel() {
     ElMessage.success('已接手，现在可以改价并确认下单')
     // claimProject 内 afterWrite 已刷新 db 镜像 → canReviewEdit 自动翻转
   } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : '操作失败')
+    showError(e, '操作失败')
   } finally {
     reviewBusy.value = false
   }
@@ -377,7 +367,7 @@ async function handleTerminateProject() {
     ElMessage.success('项目已终止（记录留存，不可再编辑）')
     router.push('/sales/projects')
   } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : '操作失败')
+    showError(e, '操作失败')
   } finally {
     terminating.value = false
   }
@@ -548,10 +538,9 @@ onMounted(async () => {
     const oldContracts = db.contracts.filter((c) => c.projectId === cp.id)
     contracts.splice(0, contracts.length)
     oldContracts.forEach((c) => {
-      contracts.push({
+      const draft: ContractDraft = {
         customer: c.customer,
         contractAmount: 0,
-        contractTouched: false,
         remark: '',
         items: c.items.map((it) => ({
           assetId: it.assetId,
@@ -561,7 +550,10 @@ onMounted(async () => {
           amount: it.amount,
           deliveryReq: it.deliveryReq ?? '',
         })),
-      })
+      }
+      contracts.push(draft)
+      // 2026-10-20（问题12d）：合同金额只读 = 明细合计，预填后按明细重算
+      recalcContractAmount(draft)
     })
     Object.assign(form, {
       name: cp.name,
@@ -826,7 +818,7 @@ function handleCancel() {
           <el-button v-if="canWrite && isPendingEdit" type="primary" plain @click="router.push(`/sales/projects/${projectId}/review`)">
             审核订单
           </el-button>
-          <el-tooltip :content="canEditForm ? '' : READONLY_TIP" :disabled="canEditForm" placement="top">
+          <el-tooltip :content="canEditForm ? '' : NO_PERM_TIP" :disabled="canEditForm" placement="top">
             <span>
               <el-button type="primary" :icon="CircleCheck" :loading="submitting" :disabled="!canEditForm" @click="handleSubmit">
                 保存修改
@@ -858,7 +850,7 @@ function handleCancel() {
             <span class="bh-icon" aria-hidden="true"><el-icon><Link /></el-icon></span>
             <div>
               <div class="bh-title">销售记录清单</div>
-              <div class="bh-sub">每客户一份销售记录（可含不同主体的产品明细）；销售金额默认 = 明细合计，可手改。</div>
+              <div class="bh-sub">每客户一份销售记录（可含不同主体的产品明细）；销售金额 = 明细合计（自动计算，只读）。</div>
             </div>
             <span class="bh-hint">
               <el-button plain size="small" :icon="Plus" @click="addContract">添加销售记录</el-button>
@@ -882,14 +874,15 @@ function handleCancel() {
               </div>
               <div class="cf-item">
                 <span class="cf-label">销售金额（元）</span>
+                <!-- 2026-10-20（问题12d）：合同金额只读 = Σ 明细金额实时值——
+                     原手改值在审核确认时会被后端按 Σ 明细重算静默丢弃，删除手改入口 -->
                 <el-input-number
-                  v-model="c.contractAmount"
+                  :model-value="c.contractAmount"
                   :min="0"
                   :precision="2"
                   :controls="false"
-                  placeholder="默认=明细合计"
+                  disabled
                   style="width: 180px;"
-                  @update:model-value="() => { c.contractTouched = true }"
                 />
               </div>
             </div>
@@ -953,9 +946,9 @@ function handleCancel() {
                 </el-table-column>
                 <el-table-column label="单价（元）" width="180" align="center">
                   <template #default="{ row }">
-                    <!-- ADR-008：包量定价行单价为派生参考展示（金额÷数量÷1e4，保留 4 位 + 「约」） -->
+                    <!-- ADR-017：包量定价行单价为派生参考展示（金额÷数量，元/{unit}，无 1e4 换算） -->
                     <span v-if="itemAsset(row) && isAmountMode(itemAsset(row)!)" class="muted">
-                      {{ derivedUnitPrice(row.amount, row.qty) }}
+                      {{ derivedUnitPrice(row.amount, row.qty, itemAsset(row)?.unit) }}
                     </span>
                     <el-input-number
                       v-else
@@ -1033,16 +1026,18 @@ function handleCancel() {
           <template v-if="showMore">
             <div class="form-grid">
               <el-form-item label="生态人员">
-                <!-- 生态人员（viewer）编辑自己的项目时 rep 只读（后端同样忽略 viewer 的 rep 变更，防转移项目） -->
+                <!-- 生态人员（viewer）编辑自己的项目时 rep 只读（后端同样忽略 viewer 的 rep 变更，防转移项目）
+                     2026-10-20（问题10）：rep 统一存 username——选项源由 db.reps 基础资料（value=姓名）
+                     切换为全量账号名册（与编辑面板同源，value=username，label 显示姓名）；
+                     去掉 allow-create：手输会写入姓名，导致 rep 账号/姓名混存回潮 -->
                 <el-select
                   v-model="form.rep"
                   :disabled="isViewer"
                   filterable
-                  allow-create
                   placeholder="选择生态人员"
                   style="width: 100%;"
                 >
-                  <el-option v-for="r in db.reps" :key="r.id" :label="r.name" :value="r.name" />
+                  <el-option v-for="u in repUserOptions" :key="u.username" :label="ownerLabel(u.username)" :value="u.username" />
                 </el-select>
               </el-form-item>
               <el-form-item label="商务负责人">
@@ -1087,12 +1082,12 @@ function handleCancel() {
         <!-- 底部操作区：右对齐，不悬浮 -->
         <div class="bottom-actions">
           <template v-if="!isEdit">
-            <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="top">
+            <el-tooltip :content="NO_PERM_TIP" :disabled="canWrite" placement="top">
               <span>
                 <el-button plain :loading="submitting" :disabled="!canWrite" @click="saveDraft">保存草稿</el-button>
               </span>
             </el-tooltip>
-            <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="top">
+            <el-tooltip :content="NO_PERM_TIP" :disabled="canWrite" placement="top">
               <span>
                 <el-button type="primary" :icon="CircleCheck" :loading="submitting" :disabled="!canWrite" @click="handleSubmit">
                   创建项目
@@ -1102,7 +1097,7 @@ function handleCancel() {
           </template>
           <template v-else>
             <el-button @click="handleCancel">返回</el-button>
-            <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="top">
+            <el-tooltip :content="NO_PERM_TIP" :disabled="canWrite" placement="top">
               <span>
                 <el-button type="primary" :icon="CircleCheck" :loading="submitting" :disabled="!canWrite" @click="handleSubmit">
                   保存修改

@@ -24,8 +24,8 @@ import {
   type Project,
   type ProjectStatus,
 } from '@/types'
-import { allUserOptions, changeProjectStatus, claimProject, db, deleteProject, getAsset, userOptions, type UserOption } from '@/api'
-import { canWrite, currentUser, isViewer, isAdmin, READONLY_TIP } from '@/auth'
+import { allUserOptions, changeProjectStatus, claimProject, db, deleteProject, getAsset, showError, userOptions, type UserOption } from '@/api'
+import { canWrite, currentUser, isViewer, isAdmin, NO_PERM_TIP } from '@/auth'
 import TransferDialog from '@/components/TransferDialog.vue'
 
 const router = useRouter()
@@ -85,7 +85,7 @@ async function handleClaim(p: Project) {
     await claimProject(p.id)
     ElMessage.success('已接手，该订单现在归你负责')
   } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : '操作失败')
+    showError(e, '操作失败')
   }
 }
 
@@ -96,8 +96,11 @@ function openTransfer(p: Project) {
   transferVisible.value = true
 }
 
+/** 生态人员筛选选项（2026-10-20 问题10：rep 统一存 username——选项值收集 p.rep（username），
+ *  显示名走 repName（/users/options/all 账号→姓名映射）；不再混入 db.reps 基础资料姓名，
+ *  避免同一人出现「账号 + 姓名」两个不同值的选项导致筛选/统计拆分） */
 const reps = computed(() =>
-  Array.from(new Set([...db.projects.map((p) => p.rep), ...db.reps.map((r) => r.name)]))
+  Array.from(new Set(db.projects.map((p) => p.rep)))
     .filter(Boolean)
     .map(String),
 )
@@ -235,7 +238,7 @@ async function drawerChangeStatus(status: 'delivered' | 'terminated') {
     ElMessage.success(status === 'delivered' ? '项目已交付：产品数量与交付记录已自动更新' : '项目已终止：数量锁定已释放')
     drawerVisible.value = false
   } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : '项目状态变更失败')
+    showError(e, '项目状态变更失败')
   } finally {
     drawerActing.value = false
   }
@@ -259,7 +262,7 @@ async function handleDelete(p: Project) {
     await deleteProject(p.id)
     ElMessage.success('项目已删除：数量锁定已释放，相关交付记录已撤销')
   } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : '删除失败')
+    showError(e, '删除失败')
   }
 }
 </script>
@@ -379,7 +382,7 @@ async function handleDelete(p: Project) {
               <el-tooltip
                 v-if="canClaimRow(row)"
                 :content="!canWrite
-                  ? READONLY_TIP
+                  ? NO_PERM_TIP
                   : !row.businessOwner ? '接手后由你负责定价审核（确认下单/驳回）'
                   : row.businessOwner === currentUser?.username ? `转交给其他商务账号（当前负责人 ${ownerLabel(row.businessOwner)}）`
                   : '转交给其他商务账号，或 admin 接手给自己'"
@@ -401,7 +404,7 @@ async function handleDelete(p: Project) {
               <!-- ADR-012 §5.1：pending 项目入口按钮文案「审核订单」，仅负责人/admin 可点，其余禁用（禁止态） -->
               <el-tooltip
                 :content="!canEditRow
-                  ? READONLY_TIP
+                  ? NO_PERM_TIP
                   : canEditProject(row) ? ''
                   : row.status === 'pending' ? (isViewer ? '待审核项目由商务人员接手确认后生效' : '待审核项目仅商务负责人（或管理员）可进入，请先接手')
                   : '含已交付或已终止的项目不可编辑'"
@@ -431,7 +434,7 @@ async function handleDelete(p: Project) {
               >
                 重新提交
               </el-button>
-              <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="top">
+              <el-tooltip :content="NO_PERM_TIP" :disabled="canWrite" placement="top">
                 <span class="op-tip" @click.stop>
                   <el-button
                     link

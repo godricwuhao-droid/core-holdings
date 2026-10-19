@@ -14,6 +14,7 @@ import {
   deleteUser,
   listAuditLogs,
   listUsers,
+  showError,
   updateUser,
   type AuditLogOut,
   type UserOut,
@@ -59,7 +60,7 @@ async function loadUsers() {
   try {
     users.value = await listUsers()
   } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : '加载账号失败')
+    showError(e, '加载账号失败')
   } finally {
     loadingUsers.value = false
   }
@@ -156,7 +157,7 @@ async function handleSubmit() {
     dialog.visible = false
     await loadUsers()
   } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : '保存失败')
+    showError(e, '保存失败')
   } finally {
     dialog.submitting = false
   }
@@ -177,7 +178,7 @@ async function handleDelete(row: UserOut) {
     ElMessage.success('账号已删除')
     await loadUsers()
   } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : '删除失败')
+    showError(e, '删除失败')
   }
 }
 
@@ -206,7 +207,7 @@ async function loadAudit() {
     audit.total = res.total
     audit.items = res.items
   } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : '加载审计日志失败')
+    showError(e, '加载审计日志失败')
   } finally {
     audit.loading = false
   }

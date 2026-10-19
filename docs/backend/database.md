@@ -5,6 +5,34 @@
 
 ---
 
+## 2026-10-20 变更（FIX-20261020-#7：outbounds 新增 projectItemId 列）
+
+### 新增列
+
+| 列 | 类型 | 说明 |
+|---|---|---|
+| `outbounds.projectItemId` | INTEGER NULL INDEX | 所属项目明细，指向 `project_items.id`。合同交付（`_apply_item_delivery`）创建时写入被交付明细的 id；手动补录与存量记录为 NULL。撤销交付按此精确定位明细（同合同同产品多明细不再 `limit(1)` 猜行）；NULL 时回退 `contractId+assetId limit(1)` 兼容逻辑 |
+
+### 迁移语句（幂等，`main.py::_ensure_migration`）
+
+```sql
+ALTER TABLE outbounds ADD COLUMN projectItemId INTEGER;
+CREATE INDEX ix_outbounds_projectItemId ON outbounds (projectItemId);
+```
+
+### SQLite 兼容加列方式（存量库迁移）
+
+`Base.metadata.create_all` **只会创建不存在的表，不会给已有表加列**。项目采用 `backend/main.py` 的 `_ensure_migration()` 轻量迁移（启动时执行，先例：`assets.contractFile`、`projects.creator`、`outbounds.contractId` 等）：
+
+1. `sqlalchemy.inspect(engine).get_columns(<table>)` 检测目标列是否存在（等价 `PRAGMA table_info`）；
+2. 不存在则 `ALTER TABLE <table> ADD COLUMN <col> <type>`（SQLite 仅支持追加可空/带默认值列，追加列对存量行自动填 NULL/默认值，不触碰业务数据）+ 需要时补 `CREATE INDEX`；
+3. 幂等：列已存在时 no-op，可重复启动。
+
+本次（FIX-20261020-#7）：
+
+- 当前库 `outbounds` 为 0 行，**无数据迁移**（存量记录语义即 NULL=手动/未知明细，撤销走回退逻辑）；
+- 已在真实库副本验证：加列 + 索引成功，各业务表行数不变。
+
 ## 2026-10-16 变更（ADR-011 遥感数据「父产品 + 可售明细」两层模型，⚠️ Supersedes ADR-010）
 
 ### 新表 rs_items（遥感数据可售明细）
@@ -348,6 +376,7 @@ ALTER TABLE logs   ADD COLUMN changes    VARCHAR(512) DEFAULT '';
 | code | VARCHAR(32) UNIQUE | `CK-{4位序号}` |
 | projectId/assetId | INTEGER | 关联项目/产品（普通列，非外键） |
 | contractId | INTEGER NULL INDEX | 关联合同（2026-10-15 新增；合同交付自动交付时非空） |
+| projectItemId | INTEGER NULL INDEX | 关联项目明细（2026-10-20 FIX-20261020-#7 新增；合同交付时非空，手动补录/存量为 NULL，撤销交付据此精确定位明细） |
 | qty/amount | INTEGER/FLOAT | 金额 4 位小数 |
 | status | VARCHAR(16) | `done` / `reverted` |
 

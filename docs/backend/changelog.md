@@ -2,6 +2,35 @@
 
 > 记录 core-holdings 后端（FastAPI + SQLAlchemy + SQLite）的接口与行为变更。
 
+## 2026-10-20 ｜ 修复：FIX-20261020 业务逻辑 13 项修复（分支 fix/business-logic-bugs-20261020）
+
+| 日期 | 类型 | 变更内容 | 影响文件范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-20 | 修复 | 权限守卫自查：遍历 `routers/api.py` 全部写接口（POST/PUT/PATCH/DELETE），确认每个均有 `require_editor` / `require_order` / `require_admin` 守卫（自查结果：无裸接口，未新增守卫）；`require_editor` 的 403 `detail` 由「无权限执行此操作」改为「只读账号不可执行该操作」（契约文案，前端 403 统一 toast detail） | `backend/src/security.py` | FIX-20261020-#1 | ADR-014：前端移除 viewer 写请求白名单后，后端守卫为唯一安全边界；`require_admin` 文案保持「无权限执行此操作」（该守卫拦截对象含 editor，不适用"只读账号"措辞） |
+| 2026-10-20 | 修复 | `create_outbound`（补录交付）库存口径：`mode != "history"` 时不再执行 `lockedQty = max(0, lockedQty - qty)`，仅 `shippedQty += qty`（保留 `min(quantity, …)` 夹零防御）；可售校验保留且基于**未改动**的 `lockedQty` | `backend/src/services.py` | FIX-20261020-#2 | ADR-015：补录交付不对应订单明细、未释放过锁，偷减 lockedQty 会侵占其他订单锁定并造成超卖/撤销后凭空增可售 |
+| 2026-10-20 | 新增 | `create_outbound` 新增 400 校验（文案见 api-contracts.md）：`qty <= 0` →「交付数量必须大于 0」；项目状态 pending/terminated →「该项目当前状态不可登记交付」；`assetId` 不在所选项目明细中 →「该产品不属于所选项目」；`asset.type == '遥感数据'` 父产品 →「遥感容器不可直接交付，请交付其数据明细」 | `backend/src/services.py` | FIX-20261020-#9、FIX-20261020-#13a | ADR-015 §2-§4；校验顺序：qty → 产品存在 → 遥感容器 → 项目状态 → 产品归属 → 防重复 → 可售 |
+| 2026-10-20 | 删除 | ⚠️ `OutboundInput` 请求体移除 `operator` 字段（后端一直不采信，操作人取路由层登录账号）；前端旧版本多传该字段时 Pydantic 默认忽略未知字段，不报错 | `backend/src/schemas.py` | FIX-20261020-#2 | 契约 FIX-20261020 §2：前端同步删除该字段与输入框 |
+| 2026-10-20 | 修复 | `checkout`（购物车结算）分组键由 `assetId` 单键改为 `(assetId, customer)`，每组合并数量/金额后生成一条 `ContractInput`，合同 `customer` 取分组键；容器明细行（itemId 非空）与产品行的组合方式不变 | `backend/src/services.py` | FIX-20261020-#3 | ADR-016：一资产一客户一记录；修复同产品多客户行被静默合并为一条记录（客户归属/金额串账）；前端预览口径同步改双键分组 |
+| 2026-10-20 | 修复 | `_apply_item_delivery` 生成的 `Outbound.operator` 由 `project.rep`（生态人员/下单人）改为实际触发交付的登录账号（`operator` 参数，调用方透传 `user.username`）；合同交付（`change_contract_status`）与存量项目交付（legacy 路径）两条调用链均已透传 | `backend/src/services.py` | FIX-20261020-#5 | 契约 §3：交付记录「经办人」与审计日志操作人一致，可追溯实际操作人 |
+| 2026-10-20 | 修复 | `bootstrap` viewer 过滤补齐：`outbounds` 仅返回 `projectId ∈ 可见项目` 或 `contractId ∈ 可见合同` 的记录；`flows` 按引用过滤（contractId ∈ 可见合同，或 ref 指向可见 SP-/HT-/CK- 编号；产品级流水如登记 purchase_in 放行）；`logs` 按引用过滤（project 日志按 detail 中 SP- 编号 / contractId / 项目名匹配，outbound 日志按 CK- 编号匹配，asset/setting 日志放行） | `backend/src/services.py` | FIX-20261020-#6 | 修复 viewer 经 /bootstrap 获取全量交付记录/流水/日志的跨客户信息泄露；过滤口径宁可保守不漏放 |
+| 2026-10-20 | 修复 | `GET /users/options/all`：viewer 仅返回本人 + 其可见项目中 `rep`/`creator`/`businessOwner` 出现过的启用账号；admin/editor 返回全部启用账号（现状不变） | `backend/src/routers/api.py` | FIX-20261020-#6 | 契约 §5；可见项目判定复用 `services.user_sees_project` |
+| 2026-10-20 | 新增 | `Outbound` 新增 `projectItemId: int \| None`（nullable）列，指向 `ProjectItem.id`：合同交付（`_apply_item_delivery`）创建交付记录时写入对应明细 id；手动补录为 None。`schemas.OutboundOut` 同步新增该字段 | `backend/src/models.py`、`backend/src/schemas.py`、`backend/src/services.py` | FIX-20261020-#7 | 契约 §4；前端无需处理（不展示该字段），仅类型定义同步 |
+| 2026-10-20 | 修复 | 撤销交付（`_revert_outbound_inner`）明细定位：`projectItemId` 非空时按 id 精确定位（明细已随项目删除时回退 limit(1)）；为 None 时回退现有 `contractId+assetId limit(1)` 逻辑（兼容存量） | `backend/src/services.py` | FIX-20261020-#7 | 修复同合同同产品多明细时撤销取错行、再交付重复计收入 |
+| 2026-10-20 | 新增 | SQLite 兼容加列：`main._ensure_migration` 幂等补 `outbounds.projectItemId`（`PRAGMA table_info` 检测 + `ALTER TABLE ADD COLUMN` + 索引 `ix_outbounds_projectItemId`），与项目既有迁移先例一致 | `backend/main.py` | FIX-20261020-#7 | `create_all` 不会给已有表加列；当前库 outbounds=0 行，无数据迁移；幂等（列已存在时 no-op） |
+| 2026-10-20 | 修复 | `update_asset`：`type` 变更时重算 `pricingMode`（卫星Token → `amount`，其余 → `unit`），与新建逻辑（`create_asset`）一致；变更时追加「计价模式: x → y」日志 | `backend/src/services.py` | FIX-20261020-#8 | `pricingMode` 不在可更新白名单内，只能由类型权威推导，前端无需传 |
+| 2026-10-20 | 修复 | `rep`（生态人员）口径归一：新增 `_normalize_rep`——值在用户表中匹配 `name` 则替换为对应用户 `username`，已是 username 或无匹配则原样保存；应用于 `_create_project_core` 与 `_order_core` 入口（覆盖手动建单/重新提交/购物车结算/直接下单全部链路） | `backend/src/services.py` | FIX-20261020-#10 | 前端两处入口同步改传 username，后端归一为兜底；存量数据不迁移 |
+| 2026-10-20 | 修复 | `review_project` 驳回分支：合同备注由覆盖（`c.remark = f"驳回：{reason}"`）改为追加——原备注非空时 `c.remark = 原备注 + "｜驳回：" + reason`，空时保持原文案 | `backend/src/services.py` | FIX-20261020-#11 | 保留下单时的原合同备注，驳回原因仍留痕可见 |
+| 2026-10-20 | 新增 | `_create_project_core`：任一合同 `customer` 为空 → 400「请为每份销售记录填写客户」（覆盖 contracts 入参与 items 自动包装单合同两条路径） | `backend/src/services.py` | FIX-20261020-#13b | 契约 §6；前端有校验，此为 API 直调兜底 |
+| 2026-10-20 | 新增 | 遥感父产品（容器）购买拦截：`_cart_add_inner` / `_order_core` / `_create_project_core` 三个入口，产品 `type == '遥感数据'` 且非容器明细行（itemId 为空）→ 400「遥感数据容器不可直接购买，请购买其数据明细」；容器明细行（itemId 非空，指向 rs_items）放行 | `backend/src/services.py` | FIX-20261020-#13c | 契约 §6；覆盖 POST /cart、/cart/batch、POST /sales/order、POST /projects |
+| 2026-10-20 | 修改 | ADR-017 后端计价自查：确认 `_derived_price = amount / qty`（元/份）与免填金额兜底 `salePrice × qty`（取整元）全程无 1e4 换算，现状即符合，无代码改动 | （无） | FIX-20261020-#4 | 仅自查确认；全库检索 `1e4/10000/万Token` 仅命中注释与 seed 数据值 |
+
+### 验证
+
+- `python3 -m compileall src main.py` 通过；`import src.services / src.routers.api / src.schemas / src.models` 无错。
+- 内存 SQLite 冒烟测试 39 项断言全部通过（不触碰真实库）：rep 归一、空客户 400、遥感父产品三入口拦截 + 明细行放行、补录交付 4 个 400 场景 + lockedQty 不触碰 + 撤销对称、checkout 同产品双客户拆 2 条记录、驳回备注追加、合同交付 operator/projectItemId 落库、同合同同产品双明细撤销精确定位、type 变更 pricingMode 双向重算、bootstrap viewer 项目/合同/交付/流水/日志过滤 + admin 全量。
+- 真实库副本验证：`outbounds.projectItemId` 列（INTEGER，可空）+ 索引 `ix_outbounds_projectItemId` 存在，各业务表行数不变（无数据迁移）。
+- 未触碰 frontend/ 任何文件、未修改 core_holdings.db 业务数据、未 commit。
+
 ## 2026-10-20 ｜ 新增：GET /users/options/all 全量启用账号（含生态，仅供显示映射）
 
 | # | 类型 | 变更内容 | 影响文件 |

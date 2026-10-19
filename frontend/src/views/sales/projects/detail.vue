@@ -24,9 +24,9 @@ import {
   tagInfo,
   type Contract,
 } from '@/types'
-import { allUserOptions, changeContractStatus, claimProject, db, getAsset, refresh, type UserOption } from '@/api'
+import { allUserOptions, changeContractStatus, claimProject, db, getAsset, refresh, showError, type UserOption } from '@/api'
 import TransferDialog from '@/components/TransferDialog.vue'
-import { canWrite, isViewer, isAdmin, currentUser, READONLY_TIP } from '@/auth'
+import { canWrite, isViewer, isAdmin, currentUser, NO_PERM_TIP } from '@/auth'
 
 // 生态人员（viewer）：数据已按「自己下单」在后端过滤，能进入本页即自己项目——
 // 允许编辑基本信息 + 终止合同（含撤销 delivered 交付）；交付仍仅商务/管理员。
@@ -64,7 +64,7 @@ async function handleClaim() {
     await refresh()
     ElMessage.success('接手成功，现在可以审核该订单了')
   } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : '操作失败')
+    showError(e, '操作失败')
   }
 }
 
@@ -88,13 +88,16 @@ const contracts = computed<Contract[]>(() =>
   db.contracts.filter((c) => c.projectId === projectId.value).sort((a, b) => a.id - b.id),
 )
 
-/** 客户展示：多合同（customer 派生为空）显示「N 位客户」；单合同/存量显示客户名 */
+/** 客户展示：项目 customer 非空直接显示；为空时从合同客户去重提取（2026-10-20 问题12a）——
+ *  去重后 1 个 → 直接显示该客户名；多个 → 「N 位客户」（N 为去重客户数）；0 个 → '-'
+ *  （修复原按合同数回退：空客户合同/空草稿会误显示「1 位客户」） */
 const customerText = computed(() => {
   const p = project.value
   if (!p) return '-'
   if (p.customer) return p.customer
-  const n = contracts.value.length
-  return n ? `${n} 位客户` : '-'
+  const names = Array.from(new Set(contracts.value.map((c) => (c.customer || '').trim()).filter(Boolean)))
+  if (names.length === 1) return names[0]
+  return names.length ? `${names.length} 位客户` : '-'
 })
 
 onMounted(async () => {
@@ -126,7 +129,7 @@ function goAssetDetail(assetId: number | null) {
   if (assetId) router.push(`/assets/${assetId}/detail`)
 }
 
-/** ADR-008：明细行产品是否包量定价（单价列改派生参考展示，带「约」） */
+/** ADR-008/ADR-017：明细行产品是否包量定价（单价列改派生参考展示，元/{unit}） */
 function isAmountItem(assetId: number | null): boolean {
   const a = assetId ? getAsset(assetId) : undefined
   return !!a && isAmountMode(a)
@@ -191,7 +194,7 @@ async function changeContract(c: Contract, status: 'delivered' | 'terminated') {
         : `销售记录 ${c.code} 已终止`,
     )
   } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : '销售记录状态变更失败')
+    showError(e, '销售记录状态变更失败')
   } finally {
     actingContractId.value = null
   }
@@ -389,7 +392,7 @@ async function changeContract(c: Contract, status: 'delivered' | 'terminated') {
                       </span>
                     </el-tooltip>
                     <!-- 终止：自己项目可操作（含生态人员，后端校验归属） -->
-                    <el-tooltip :content="READONLY_TIP" :disabled="canOwn" placement="top">
+                    <el-tooltip :content="NO_PERM_TIP" :disabled="canOwn" placement="top">
                       <span>
                         <el-button
                           type="danger"
@@ -404,7 +407,7 @@ async function changeContract(c: Contract, status: 'delivered' | 'terminated') {
                       </span>
                     </el-tooltip>
                   </template>
-                  <el-tooltip v-else-if="c.status === 'delivered'" :content="READONLY_TIP" :disabled="canOwn" placement="top">
+                  <el-tooltip v-else-if="c.status === 'delivered'" :content="NO_PERM_TIP" :disabled="canOwn" placement="top">
                     <span>
                       <el-button
                         type="danger"
@@ -459,7 +462,7 @@ async function changeContract(c: Contract, status: 'delivered' | 'terminated') {
                 <el-table-column label="单价" width="170" align="right">
                   <!-- ADR-008：包量定价行单价为派生参考展示（带「约」），金额以销售金额为准 -->
                   <template #default="{ row }">
-                    <span v-if="isAmountItem(row.assetId)" class="muted">{{ derivedUnitPrice(row.amount, row.qty) }}</span>
+                    <span v-if="isAmountItem(row.assetId)" class="muted">{{ derivedUnitPrice(row.amount, row.qty, row.unit) }}</span>
                     <span v-else>{{ formatMoney(row.price) }}</span>
                   </template>
                 </el-table-column>
@@ -493,7 +496,7 @@ async function changeContract(c: Contract, status: 'delivered' | 'terminated') {
               <el-table-column label="单价" width="170" align="right">
                 <!-- ADR-008：包量定价行单价为派生参考展示（带「约」） -->
                 <template #default="{ row }">
-                  <span v-if="isAmountItem(row.assetId)" class="muted">{{ derivedUnitPrice(row.amount, row.qty) }}</span>
+                  <span v-if="isAmountItem(row.assetId)" class="muted">{{ derivedUnitPrice(row.amount, row.qty, row.unit) }}</span>
                   <span v-else>{{ formatMoney(row.price) }}</span>
                 </template>
               </el-table-column>

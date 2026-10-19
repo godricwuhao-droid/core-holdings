@@ -28,6 +28,7 @@ import {
   reviewProject,
   updateProject,
   allUserOptions,
+  showError,
   type UserOption,
 } from '@/api'
 import { canWrite, currentUser, isAdmin } from '@/auth'
@@ -152,7 +153,7 @@ async function handleClaim() {
     await claimProject(p.id)
     ElMessage.success('已接手，现在可以改价并确认下单')
   } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : '操作失败')
+    showError(e, '操作失败')
   } finally {
     reviewBusy.value = false
   }
@@ -202,7 +203,7 @@ async function handleConfirm() {
     ElMessage.success('订单已确认：项目转为进行中' + (items.length ? '，实际价格已同步到平台' : ''))
     router.push(`/sales/projects/${projectId.value}/detail`)
   } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : '确认下单失败')
+    showError(e, '确认下单失败')
   } finally {
     reviewBusy.value = false
   }
@@ -227,7 +228,7 @@ async function handleReject() {
     ElMessage.success('订单已驳回：数量锁定已释放，项目已终止')
     router.push(`/sales/projects/${projectId.value}/detail`)
   } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : '驳回失败')
+    showError(e, '驳回失败')
   } finally {
     reviewBusy.value = false
   }
@@ -258,7 +259,7 @@ async function saveRemark() {
     })
     ElMessage.success('备注已保存')
   } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : '保存失败')
+    showError(e, '保存失败')
   } finally {
     savingRemark.value = false
   }

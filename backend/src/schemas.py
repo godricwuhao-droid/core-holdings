@@ -276,12 +276,13 @@ class OutboundInput(BaseModel):
     projectId: int | None = None
     customer: str = ""
     assetId: int
-    qty: int = Field(ge=0)
+    qty: int = Field(ge=0)  # 服务层拒绝 0（FIX-20261020-#13a：交付数量必须大于 0）
     amount: float = Field(ge=0)  # 元（ADR-006）
     type: str
     mode: str
     date: str
-    operator: str = ""
+    # 注：operator 字段已移除（FIX-20261020/ADR-015 契约：后端一直不采信前端入参，
+    # 操作人取路由层真实登录账号；前端旧版本多传该字段时 Pydantic 默认忽略未知字段）
     remark: str = ""
 
 
@@ -290,6 +291,7 @@ class OutboundOut(_ORM):
     code: str
     projectId: int | None = None
     contractId: int | None = None  # 所属合同（ADR-007）；合同交付自动交付时非空
+    projectItemId: int | None = None  # 所属项目明细（FIX-20261020-#7）；合同交付时非空，手动补录/存量为 null
     projectName: str
     customer: str
     assetId: int

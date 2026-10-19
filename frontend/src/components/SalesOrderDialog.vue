@@ -10,7 +10,7 @@
  *  - 产品直接下单（/sales/order，默认模式）：payload 携带 customer + items + contractAmount，
  *    后端自动包装为单合同（SaleOrderInput 无 contracts 字段，已实测 200 且 contractCount=1）；
  *  - 购物车结算（/cart/checkout，cartMode=true）：客户已在购物车行级填写，对话框不再展示
- *    「客户名称」字段（payload 不带 customer，后端按行级客户分组拆合同）；合同金额改为
+ *    「客户名称」字段（payload 不带 customer，后端按（产品, 客户）双键分组拆合同，ADR-016）；合同金额改为
  *    只读汇总展示「合同合计（元）」= Σ各行小计（payload 不带 contractAmount，后端按分组小计派生）；
  *    项目名称默认「采购订单」可修改；previewGroups 传入时顶部展示「将生成 1 个项目 · N 份合同」分组预览。
  * 提交后由父组件调用对应下单接口，生成「进行中」销售项目并锁定数量（不自动交付）。
@@ -42,9 +42,11 @@ export interface OrderItem {
   itemId?: number
 }
 
-/** 结算预览分组（购物车场景）：按客户分组，每组 = 未来一份合同 */
+/** 结算预览分组（购物车场景）：按（产品, 客户）双键分组（ADR-016），每组 = 未来一份合同 */
 export interface OrderPreviewGroup {
   customer: string
+  /** 产品名（仅展示：同一客户跨多个产品会拆成多组，需产品名区分） */
+  assetName?: string
   qty: number
   amount: number
 }
@@ -129,10 +131,10 @@ const totalYuan = computed(() =>
   }, 0),
 )
 
-/** 派生参考单价（仅 amount 模式直接下单展示）：合同金额 ÷ 数量 ÷ 1e4，保留 4 位 + 「约」 */
+/** 派生参考单价（仅 amount 模式直接下单展示）：合同金额 ÷ 数量（元/{unit}，ADR-017，无 1e4 换算） */
 const derivedPriceText = computed(() => {
   if (!editableQty.value || !props.items.length || !isAmountMode(props.items[0].asset)) return ''
-  return derivedUnitPrice(parseYuan(contractText.value), qty.value)
+  return derivedUnitPrice(parseYuan(contractText.value), qty.value, props.items[0].asset.unit)
 })
 
 /** 用户是否手动改写过合同金额；未改写时随数量/明细自动重算 */
@@ -153,7 +155,8 @@ function reset() {
   form.customer = ''
   // 2026-10-19 UI 优化：rep 不再提供填写项，静默取当前登录账号（原 viewer 行为推广到全角色；
   // 保证「自己下单」的 rep 归属口径，仅供展示与可见性兜底）
-  form.rep = currentUser.value?.name ?? ''
+  // 2026-10-20（问题10）：rep 统一存 username（原存姓名，与建单页口径不一致导致账号/姓名混存）
+  form.rep = currentUser.value?.username ?? ''
   // 商务负责人：下单入口不再指定（纯移交制，接手时绑定），恒空提交
   form.businessOwner = ''
   form.expectedSignDate = ''
@@ -254,14 +257,17 @@ function close() {
     :close-on-click-modal="false"
     @update:model-value="(v: boolean) => emit('update:modelValue', v)"
   >
-    <!-- 结算预览（购物车场景）：按客户分组展示将生成的销售记录 -->
+    <!-- 结算预览（购物车场景）：按（产品, 客户）双键分组展示将生成的销售记录（ADR-016） -->
     <div v-if="previewGroups.length" class="sod-preview">
       <div class="sod-preview-title">
         将生成 1 个项目 · <b>{{ previewGroups.length }}</b> 份销售记录
       </div>
-      <!-- 2026-10-19 UI 优化：三列固定对齐（客户名弹性+超长省略 / 数量右对齐 / 金额右对齐等宽数字） -->
-      <div v-for="g in previewGroups" :key="g.customer" class="sod-preview-row">
-        <span class="sod-preview-customer" :title="g.customer">{{ g.customer }}</span>
+      <!-- 2026-10-19 UI 优化：三列固定对齐（客户名弹性+超长省略 / 数量右对齐 / 金额右对齐等宽数字）
+           2026-10-20（ADR-016）：同一客户跨多个产品会拆成多组，客户名后追加产品名区分 -->
+      <div v-for="(g, gi) in previewGroups" :key="gi" class="sod-preview-row">
+        <span class="sod-preview-customer" :title="g.assetName ? `${g.customer} · ${g.assetName}` : g.customer">
+          {{ g.customer }}<span v-if="g.assetName" class="muted"> · {{ g.assetName }}</span>
+        </span>
         <span class="muted sod-preview-qty">{{ g.qty }} 件</span>
         <span class="sod-amount sod-preview-amount">{{ formatMoney(g.amount) }}</span>
       </div>
@@ -302,7 +308,7 @@ function close() {
       <el-icon><InfoFilled /></el-icon>
       <template v-if="subject === '__multi__'">
         <span>所属主体：<b>多主体</b></span>
-        <span class="muted">（购物车允许跨主体混装，结算时每个产品生成一条销售记录）</span>
+        <span class="muted">（购物车允许跨主体混装，结算时每个产品按客户各生成一条销售记录）</span>
       </template>
       <template v-else>
         <span>所属主体：<b>{{ entityShort(subject) }}</b></span>

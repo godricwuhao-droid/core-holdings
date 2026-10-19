@@ -36,7 +36,6 @@ import {
   expiryText,
   formatAssetQty,
   formatMoney,
-  isAmountMode,
   noSellableStock,
   tagInfo,
   rsItemName,
@@ -56,21 +55,24 @@ import {
   deleteRsItem,
   getAsset,
   getAssetDeliverables,
+  allUserOptions,
   projectItemsOfAsset,
   refresh,
   rsItemsOfAsset,
+  showError,
   translateFileNames,
   updateAssetDeliverable,
   updateRsItem,
   db,
   type OrderFields,
   type RsItemInput,
+  type UserOption,
 } from '@/api'
 import SalesOrderDialog from '@/components/SalesOrderDialog.vue'
 import RsItemPicker from '@/components/RsItemPicker.vue'
 import type { OrderItem } from '@/components/SalesOrderDialog.vue'
 import { PROVINCES } from '@/constants'
-import { canWrite, READONLY_TIP } from '@/auth'
+import { canWrite, NO_PERM_TIP } from '@/auth'
 
 const route = useRoute()
 const router = useRouter()
@@ -87,6 +89,16 @@ const opLogs = computed(() =>
     ? db.logs.filter((l) => l.target === 'asset' && l.assetId === asset.value!.id)
     : [],
 )
+
+// 2026-10-20（问题12b）：「销售关联」生态人员走账号→姓名映射——
+// 复用项目页既有口径（/users/options/all 全量名册 + repName 同构实现，原本页裸账号外露）
+const repOptions = ref<UserOption[]>([])
+allUserOptions().then((u) => { repOptions.value = u }).catch(() => {})
+function repName(rep?: string): string {
+  if (!rep) return '-'
+  const u = repOptions.value.find((x) => x.username === rep) || repOptions.value.find((x) => x.name === rep)
+  return u?.name || rep
+}
 
 /** 状态点胶囊：可售绿 / 已售罄红（可重复售卖归入可售） */
 function statusPill(): { cls: 'ok' | 'off'; dot: string } {
@@ -150,7 +162,7 @@ async function onSaleSubmit(payload: { fields: OrderFields; items: { assetId: nu
     ElMessage.success(`下单成功，销售项目 ${p.code} 待审核，商务接手确认后生效`)
     await refresh(true)
   } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : '下单失败')
+    showError(e, '下单失败')
     await refresh(true)
   } finally {
     saleLoading.value = false
@@ -195,7 +207,7 @@ async function handleDelete() {
     ElMessage.success('删除成功')
     router.push(`/assets/${asset.value.board}`)
   } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : '删除失败')
+    showError(e, '删除失败')
   }
 }
 
@@ -397,7 +409,7 @@ async function saveRsItem() {
     }
     rsForm.visible = false
   } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : '保存失败')
+    showError(e, '保存失败')
   }
 }
 
@@ -416,7 +428,7 @@ async function removeRsItem(it: RsItem) {
     ElMessage.success('明细已删除')
   } catch (e) {
     // 后端 400「该明细存在销售关联，无法删除」原样 toast
-    ElMessage.error(e instanceof Error ? e.message : '删除失败')
+    showError(e, '删除失败')
   }
 }
 
@@ -478,7 +490,7 @@ function operatorText(f: AssetFlow): string {
             </div>
           </div>
           <div class="head-actions" v-if="!isWipBoard()">
-            <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="bottom">
+            <el-tooltip :content="NO_PERM_TIP" :disabled="canWrite" placement="bottom">
               <span>
                 <el-button type="primary" :icon="Edit" :disabled="!canWrite" @click="goEditAsset">
                   编辑产品
@@ -567,11 +579,8 @@ function operatorText(f: AssetFlow): string {
                   </div>
                   <div class="info-item">
                     <span class="il">销售单价</span>
-                    <!-- ADR-008：包量定价产品单价为参考口径（元/万Token），不参与计价 -->
-                    <span v-if="isAmountMode(asset)" class="iv">
-                      {{ asset.salePrice ? `¥${asset.salePrice}/万Token（参考）` : '-' }}
-                    </span>
-                    <span v-else class="iv">{{ asset.salePrice ? formatMoney(asset.salePrice) : '-' }}<template v-if="asset.repeatSale"> / {{ asset.unit }}</template></span>
+                    <!-- ADR-017（2026-10-20）：包量定价产品单价与普通产品一致（元/份），删除「元/万Token」特判 -->
+                    <span class="iv">{{ asset.salePrice ? formatMoney(asset.salePrice) : '-' }}<template v-if="asset.repeatSale"> / {{ asset.unit }}</template></span>
                   </div>
                   <div class="info-item">
                     <span class="il">登记时间</span>
@@ -602,7 +611,7 @@ function operatorText(f: AssetFlow): string {
                   <div class="card-title">可售明细</div>
                   <div class="card-desc">按 省/精度/月份 维护可售卖明细，每份明细独立计价（整数元/份），默认可重复售卖（只计次不扣量）。</div>
                 </div>
-                <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="bottom">
+                <el-tooltip :content="NO_PERM_TIP" :disabled="canWrite" placement="bottom">
                   <span>
                     <el-button type="primary" size="small" :icon="Plus" :disabled="!canWrite" @click="openRsCreate">
                       新增明细
@@ -634,14 +643,14 @@ function operatorText(f: AssetFlow): string {
                 </el-table-column>
                 <el-table-column label="操作" width="120" align="center">
                   <template #default="{ row }">
-                    <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="top">
+                    <el-tooltip :content="NO_PERM_TIP" :disabled="canWrite" placement="top">
                       <span>
                         <el-button link type="primary" size="small" :disabled="!canWrite" @click="openRsEdit(row)">
                           编辑
                         </el-button>
                       </span>
                     </el-tooltip>
-                    <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="top">
+                    <el-tooltip :content="NO_PERM_TIP" :disabled="canWrite" placement="top">
                       <span>
                         <el-button link type="danger" size="small" :disabled="!canWrite" @click="removeRsItem(row)">
                           删除
@@ -652,7 +661,7 @@ function operatorText(f: AssetFlow): string {
                 </el-table-column>
               </el-table>
               <el-empty v-else description="暂无可售明细" :image-size="70">
-                <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="top">
+                <el-tooltip :content="NO_PERM_TIP" :disabled="canWrite" placement="top">
                   <span>
                     <el-button type="primary" size="small" :icon="Plus" :disabled="!canWrite" @click="openRsCreate">
                       新增明细
@@ -708,7 +717,7 @@ function operatorText(f: AssetFlow): string {
                         :value="k"
                       />
                     </el-select>
-                    <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="bottom">
+                    <el-tooltip :content="NO_PERM_TIP" :disabled="canWrite" placement="bottom">
                       <span>
                         <el-button
                           v-if="!isWipBoard()"
@@ -795,7 +804,8 @@ function operatorText(f: AssetFlow): string {
                 </el-table-column>
                 <el-table-column prop="project.customer" label="客户名称" width="150" show-overflow-tooltip />
                 <el-table-column label="生态人员" width="110" align="left">
-                  <template #default="{ row }">{{ row.project.rep || '-' }}</template>
+                  <!-- 2026-10-20（问题12b）：rep 存 username，走姓名映射显示（与项目页 repName 同口径） -->
+                  <template #default="{ row }">{{ repName(row.project.rep) }}</template>
                 </el-table-column>
                 <el-table-column label="签约主体" width="130" align="left">
                   <template #default="{ row }">{{ entityShort(projectSubject(row.project, row.item)) }}</template>
@@ -970,7 +980,7 @@ function operatorText(f: AssetFlow): string {
           </div>
         </template>
         <template #footer>
-          <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="top">
+          <el-tooltip :content="NO_PERM_TIP" :disabled="canWrite" placement="top">
             <el-button
               v-if="viewing && viewing.status !== 'ready'"
               type="primary"
@@ -980,7 +990,7 @@ function operatorText(f: AssetFlow): string {
               标记就绪
             </el-button>
           </el-tooltip>
-          <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="top">
+          <el-tooltip :content="NO_PERM_TIP" :disabled="canWrite" placement="top">
             <el-button
               v-if="viewing && viewing.status === 'ready'"
               :disabled="!canWrite"

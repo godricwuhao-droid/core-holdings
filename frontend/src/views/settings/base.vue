@@ -7,8 +7,8 @@ import { computed, reactive, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Search } from '@element-plus/icons-vue'
-import { addBase, db, deleteBase, updateBase, type BaseKind } from '@/api'
-import { canWrite, READONLY_TIP } from '@/auth'
+import { addBase, db, deleteBase, showError, updateBase, type BaseKind } from '@/api'
+import { canWrite, NO_PERM_TIP } from '@/auth'
 
 const route = useRoute()
 
@@ -72,7 +72,7 @@ async function handleSubmit() {
     }
     dialog.visible = false
   } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : '保存失败')
+    showError(e, '保存失败')
   } finally {
     dialog.submitting = false
   }
@@ -103,7 +103,7 @@ async function handleDelete(row: { id: number; name: string }) {
         <div class="desc">{{ kindDesc }}</div>
       </div>
       <div class="head-actions">
-        <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="bottom">
+        <el-tooltip :content="NO_PERM_TIP" :disabled="canWrite" placement="bottom">
           <span>
             <el-button type="primary" :icon="Plus" :disabled="!canWrite" @click="openCreate">
               新增{{ kindLabel }}
@@ -143,12 +143,12 @@ async function handleDelete(row: { id: number; name: string }) {
         </el-table-column>
         <el-table-column label="操作" width="140" fixed="right" align="center">
           <template #default="{ row }">
-            <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="top">
+            <el-tooltip :content="NO_PERM_TIP" :disabled="canWrite" placement="top">
               <span class="op-tip">
                 <el-button link type="primary" size="small" :disabled="!canWrite" @click="openEdit(row)">编辑</el-button>
               </span>
             </el-tooltip>
-            <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="top">
+            <el-tooltip :content="NO_PERM_TIP" :disabled="canWrite" placement="top">
               <span class="op-tip">
                 <el-button link type="danger" size="small" :disabled="!canWrite" @click="handleDelete(row)">删除</el-button>
               </span>

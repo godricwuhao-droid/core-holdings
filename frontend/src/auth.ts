@@ -4,7 +4,8 @@
  *  - localStorage 持久化 `token` 与 `currentUser`（刷新/新标签页可恢复）；
  *  - `currentUser` 为响应式状态，布局/视图直接读取做角色化 UI；
  *  - axios 拦截器（api/index.ts）负责：请求带 Bearer token、401 清态跳登录、
- *    viewer 写请求统一拦截。本模块不依赖 axios，避免循环导入。
+ *    403 统一 toast（ADR-014：权限判定统一由后端守卫兜底，前端不再预拦截）。
+ *    本模块不依赖 axios，避免循环导入。
  */
 import { computed, reactive } from 'vue'
 
@@ -28,8 +29,10 @@ export const ROLE_LABELS: Record<Role, string> = {
   viewer: '生态人员',
 }
 
-/** 生态人员（viewer）写入口统一禁用提示文案 */
-export const READONLY_TIP = '生态人员无此操作权限'
+/** 无权限按钮的禁用态 tooltip 文案（2026-10-20 ADR-014：原「只读提示」常量更名——
+ *  原常量同时用于前端预拦截 toast，预拦截已移除，403 错误文案统一由后端给出；
+ *  本常量仅用于禁用按钮的 UX 提示，非错误提示） */
+export const NO_PERM_TIP = '生态人员无此操作权限'
 
 function loadUser(): CurrentUser | null {
   try {

@@ -168,6 +168,10 @@ class Outbound(Base):
     projectId: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     # 所属合同（ADR-007）：合同交付自动交付时精确关联；projectId 保留（项目级手动交付为 NULL）
     contractId: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    # 所属项目明细（FIX-20261020-#7）：合同交付自动交付时指向 ProjectItem.id，
+    # 撤销交付按此精确定位明细（同合同同产品多明细不再 limit(1) 猜行）；
+    # 手动补录/存量记录为 NULL（撤销时回退 contractId+assetId limit(1) 兼容逻辑）
+    projectItemId: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     projectName: Mapped[str] = mapped_column(String(128), default="")
     customer: Mapped[str] = mapped_column(String(128), default="")
     assetId: Mapped[int] = mapped_column(Integer, index=True)

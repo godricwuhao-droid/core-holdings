@@ -9,7 +9,7 @@ import { reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { Coin, Lock, User } from '@element-plus/icons-vue'
-import { login, refresh } from '@/api'
+import { login, refresh, showError } from '@/api'
 import { setSession } from '@/auth'
 
 const route = useRoute()
@@ -33,7 +33,7 @@ async function handleLogin() {
     const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : ''
     router.replace(redirect || '/')
   } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : '登录失败')
+    showError(e, '登录失败')
   } finally {
     loading.value = false
   }

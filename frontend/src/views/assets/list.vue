@@ -21,7 +21,6 @@ import {
   expiryText,
   formatAssetQty,
   formatMoney,
-  isAmountMode,
   noSellableStock,
   rsItemName,
   TYPE_TAG_CLASS,
@@ -40,12 +39,13 @@ import {
   getAssetDeliverables,
   projectItemsOfAsset,
   refresh,
+  showError,
   type OrderFields,
 } from '@/api'
 import FilePreview from '@/components/FilePreview.vue'
 import SalesOrderDialog from '@/components/SalesOrderDialog.vue'
 import RsItemPicker from '@/components/RsItemPicker.vue'
-import { canWrite, READONLY_TIP } from '@/auth'
+import { canWrite, NO_PERM_TIP } from '@/auth'
 import type { OrderItem } from '@/components/SalesOrderDialog.vue'
 import type { RsItem } from '@/types'
 
@@ -189,7 +189,7 @@ async function onSaleSubmit(payload: { fields: OrderFields; items: { assetId: nu
     await refresh(true)
     router.push(`/sales/projects/${p.id}/detail`)
   } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : '下单失败')
+    showError(e, '下单失败')
     await refresh(true)
   } finally {
     saleLoading.value = false
@@ -248,7 +248,7 @@ async function singleAddToCart(a: Asset) {
     await addToCart(a.id, 1)
     ElMessage.success(`「${a.name}」已加入购物车`)
   } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : '加入购物车失败')
+    showError(e, '加入购物车失败')
   }
 }
 
@@ -277,7 +277,7 @@ async function batchAddToCart() {
     clearSelection()
     list.value.filter((a) => rsIds.has(a.id)).forEach((a) => tableRef.value?.toggleRowSelection(a))
   } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : '加入购物车失败')
+    showError(e, '加入购物车失败')
   }
 }
 
@@ -303,11 +303,10 @@ const dProjects = computed(() =>
 )
 
 /** 列表「销售单价」列（口径与抽屉「销售单价」一致）：
- *  遥感容器按明细定价显示「-」；amount 模式为参考值（元/万Token）紧凑显示；
- *  unit 模式金额直显（repeatSale 带 /unit）。定宽 120 + 居中 + 溢出省略 hover 显示全文。 */
+ *  遥感容器按明细定价显示「-」；包量定价（amount 模式）单价与普通产品一致（元/份，ADR-017，2026-10-20）；
+ *  金额直显（repeatSale 带 /unit）。定宽 120 + 居中 + 溢出省略 hover 显示全文。 */
 function salePriceText(a: Asset): string {
   if (a.type === '遥感数据' || !a.salePrice) return '-'
-  if (isAmountMode(a)) return `¥${a.salePrice}/万Token`
   return a.repeatSale ? `${formatMoney(a.salePrice)}/${a.unit || '份'}` : formatMoney(a.salePrice)
 }
 
@@ -419,7 +418,7 @@ const boardMeta = computed(() => {
         <div class="desc">{{ boardMeta.desc }}</div>
       </div>
       <div class="head-actions">
-        <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="bottom">
+        <el-tooltip :content="NO_PERM_TIP" :disabled="canWrite" placement="bottom">
           <span>
             <el-button type="primary" :icon="Plus" :disabled="!canWrite" @click="goCreate">
               登记产品
@@ -552,7 +551,7 @@ const boardMeta = computed(() => {
                 加入购物车
               </el-button>
             </span>
-            <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="top">
+            <el-tooltip :content="NO_PERM_TIP" :disabled="canWrite" placement="top">
               <span class="op-tip" @click.stop>
                 <el-button link type="primary" size="small" :disabled="!canWrite" @click.stop="goEdit(row)">
                   编辑
@@ -629,7 +628,7 @@ const boardMeta = computed(() => {
           </div>
           <div v-else class="contract-empty muted">
             未上传产品清单
-            <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="top">
+            <el-tooltip :content="NO_PERM_TIP" :disabled="canWrite" placement="top">
               <el-link
                 type="primary"
                 underline="never"
@@ -651,10 +650,7 @@ const boardMeta = computed(() => {
               <span class="il">销售单价</span>
               <!-- 遥感容器：按明细定价（明细单价为权威口径） -->
               <span v-if="isRemote" class="iv iv-weak">按明细定价</span>
-              <!-- ADR-008：包量定价产品单价为参考口径（元/万Token），不参与计价 -->
-              <span v-else-if="isAmountMode(drawerAsset)" class="iv">
-                {{ drawerAsset.salePrice ? `¥${drawerAsset.salePrice}/万Token（参考）` : '-' }}
-              </span>
+              <!-- ADR-017（2026-10-20）：包量定价产品单价与普通产品一致（元/份），删除「元/万Token」特判 -->
               <span v-else class="iv">{{ drawerAsset.salePrice ? formatMoney(drawerAsset.salePrice) : '-' }}<template v-if="drawerAsset.repeatSale"> / {{ drawerAsset.unit }}</template></span>
             </div>
             <div class="info-item">
@@ -769,7 +765,7 @@ const boardMeta = computed(() => {
 
       <template #footer>
         <div class="dr-footer">
-          <el-tooltip :content="READONLY_TIP" :disabled="canWrite" placement="top">
+          <el-tooltip :content="NO_PERM_TIP" :disabled="canWrite" placement="top">
             <el-button v-if="drawerAsset" :disabled="!canWrite" @click="goEdit(drawerAsset)">编辑</el-button>
           </el-tooltip>
           <!-- 登记销售（直接下单对话框）对三角色均可用（含生态人员） -->
