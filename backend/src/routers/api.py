@@ -324,8 +324,9 @@ def change_project_status(project_id: int, data: schemas.StatusInput, db: Sessio
 @router.post("/projects/{project_id}/review")
 def review_project(project_id: int, data: schemas.ReviewInput, db: Session = Depends(get_db),
                    user: models.User = Depends(security.require_editor)):
-    """订单审核（ADR-012，仅商务/管理员）：确认下单（可带行级改价，实际价同步写回平台挂牌价）
-    / 驳回（释放锁定 + 项目终止 + 原因留痕）。生态人员 403（require_editor 拦截）。
+    """订单审核（ADR-012，仅商务/管理员）：确认下单（可带行级改价 + 服务期限；
+    ADR-018 §4 起不再回写平台挂牌价）/ 驳回（释放锁定 + 项目终止 + 原因留痕）。
+    生态人员 403（require_editor 拦截）。
     【核心业务规则 ADR-012 修订 2026-10-19】全部建单入口统一 pending 后，本接口是唯一
     pending→active 出口；仅**商务负责人**（businessOwner 绑定账号）可操作，admin 越过，
     非负责人 400（未接手 → 「该订单尚未被商务接手，请先接手后再操作」）。"""
@@ -377,6 +378,24 @@ def delete_project(project_id: int, db: Session = Depends(get_db),
 # 生命周期：POST /projects（contracts 入参）或 POST /cart/checkout 生成；
 # 状态流转 PATCH /contracts/{id}/status；删除随项目删除级联（无独立删除端点）。
 # ============================================================
+@router.patch("/contracts/{contract_id}", response_model=schemas.ContractOut)
+def patch_contract_fields(contract_id: int, data: schemas.ContractFieldPatch,
+                          db: Session = Depends(get_db),
+                          user: models.User = Depends(security.require_order)):
+    """录入合同时间节点（ADR-019，PRICING-20261020）。
+
+    - signedDate（合同签订时间）：editor/admin（接手人守卫，与审核同口径）；
+      仅合同 active 可录入，录入后自动 active→delivering + 项目重算；录后可改、
+      传 null 清空 → 400「签订时间录入后不可清空」；
+    - scheduledDeliveryDate（预计交付时间）：仅 admin（非 admin 403）；
+      仅合同 delivering 可录/改/清空（null 允许）。
+    viewer 403「只读账号不可执行该操作」（该端点仅 editor/admin 使用）。"""
+    c = services.patch_contract_fields(db, contract_id, data.model_dump(exclude_unset=True), user=user)
+    security.record_audit(db, user, "sale", "录入合同时间节点", "contract", c.code,
+                          f"signedDate={data.signedDate}, scheduledDeliveryDate={data.scheduledDeliveryDate}")
+    return c
+
+
 @router.patch("/contracts/{contract_id}/status")
 def change_contract_status(contract_id: int, data: schemas.StatusInput, db: Session = Depends(get_db),
                            user: models.User = Depends(security.require_order)):
@@ -428,17 +447,22 @@ def add_to_cart_batch(data: schemas.CartBatchInput, db: Session = Depends(get_db
 @router.put("/cart/{cart_id}")
 def set_cart_qty(cart_id: int, request: dict, db: Session = Depends(get_db),
                  user: models.User = Depends(security.require_order)):
-    # ADR-008：可选携带 amount（包量计价合同金额，整数元；unit 模式忽略）
+    # ADR-008/ADR-018 §3：可选携带 amount（unit/遥感行=折扣金额过区间校验；amount 行=整数元权威）
+    # ADR-020：可选携带 serviceStart/serviceEnd（服务期限）
     services.set_cart_qty(db, cart_id, int(request.get("qty", 0)), user_id=str(user.id),
-                          amount=request.get("amount"))
+                          amount=request.get("amount"),
+                          service_start=request.get("serviceStart"),
+                          service_end=request.get("serviceEnd"))
     return {"ok": True}
 
 
 @router.patch("/cart/{cart_id}")
 def patch_cart_item(cart_id: int, data: schemas.CartPatchInput, db: Session = Depends(get_db),
                     user: models.User = Depends(security.require_order)):
-    """修改购物车行级客户（ADR-007）；可选携带合同金额（ADR-008）"""
-    services.patch_cart_item(db, cart_id, data.customer, user_id=str(user.id), amount=data.amount)
+    """修改购物车行级客户（ADR-007）；可选携带合同金额（ADR-008/ADR-018 §3）
+    与服务期限（ADR-020，PRICING-20261020）"""
+    services.patch_cart_item(db, cart_id, data.customer, user_id=str(user.id), amount=data.amount,
+                             service_start=data.serviceStart, service_end=data.serviceEnd)
     security.record_audit(db, user, "sale", "修改购物车客户", "cart", str(cart_id), f"customer={data.customer}")
     return {"ok": True}
 
@@ -474,7 +498,9 @@ def checkout(data: schemas.CheckoutInput, db: Session = Depends(get_db),
 @router.post("/sales/order", response_model=schemas.ProjectOut)
 def create_sale_order(data: schemas.SaleOrderInput, db: Session = Depends(get_db),
                       user: models.User = Depends(security.require_order)):
-    """产品直接下单（任意角色）。
+    """产品直接下单（任意角色）。⚠️ deprecated（ADR-020，PRICING-20261020）：
+    前端已移除「登记销售」入口，购物车为唯一下单链路；本端点保留兼容潜在直调方，
+    折扣金额同样过参考区间校验（防绕过）。
     【核心业务规则 ADR-012 修订 2026-10-19】统一建 **pending（待审核）**（锁定照常），
     商务接手审核（改价确认/驳回）后生效 active——与手动建单/购物车结算同口径。"""
     project = services.create_sale_order(db, data, operator=user.username)

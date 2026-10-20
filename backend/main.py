@@ -139,6 +139,31 @@ def _ensure_migration() -> None:
             conn.execute(text("ALTER TABLE project_items ADD COLUMN itemId INTEGER"))
             conn.execute(text("CREATE INDEX ix_project_items_itemId ON project_items (itemId)"))
         print("[migration] project_items.itemId 列已补充")
+    # 13) PRICING-20261020（ADR-018/019/020）：价格体系 + 时间节点 + 服务期限，4 表 9 列，
+    # 全部可空、存量数据不迁移（旧数据 NULL 即兼容：未设区间=不限制、无原价快照、无期限/签订时间）
+    if "priceMin" not in cols:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE assets ADD COLUMN priceMin FLOAT"))
+            conn.execute(text("ALTER TABLE assets ADD COLUMN priceMax FLOAT"))
+        print("[migration] assets.priceMin/priceMax 列已补充（ADR-018 参考区间）")
+    if "serviceStart" not in cart_cols:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE cart_items ADD COLUMN serviceStart VARCHAR(10)"))
+            conn.execute(text("ALTER TABLE cart_items ADD COLUMN serviceEnd VARCHAR(10)"))
+        print("[migration] cart_items.serviceStart/serviceEnd 列已补充（ADR-020 服务期限）")
+    if "origPrice" not in item_cols:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE project_items ADD COLUMN origPrice FLOAT"))
+            conn.execute(text("ALTER TABLE project_items ADD COLUMN origAmount FLOAT"))
+            conn.execute(text("ALTER TABLE project_items ADD COLUMN serviceStart VARCHAR(10)"))
+            conn.execute(text("ALTER TABLE project_items ADD COLUMN serviceEnd VARCHAR(10)"))
+        print("[migration] project_items.origPrice/origAmount/serviceStart/serviceEnd 列已补充（ADR-018/020）")
+    contract_cols = [c["name"] for c in insp.get_columns("contracts")]
+    if "signedDate" not in contract_cols:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE contracts ADD COLUMN signedDate VARCHAR(10)"))
+            conn.execute(text("ALTER TABLE contracts ADD COLUMN scheduledDeliveryDate VARCHAR(10)"))
+        print("[migration] contracts.signedDate/scheduledDeliveryDate 列已补充（ADR-019 时间节点）")
     # 12) ADR-011 数据清理（幂等一次性）：删除 ADR-010 演示遥感数据产品
     #（type='遥感数据' 且带三维字段值的存量行；ADR-011 新建的父产品容器 4 列恒空，不会被误删）。
     # 删前 assert 无合同/购物车/项目明细引用（当前库应无；有引用则启动失败暴露问题，

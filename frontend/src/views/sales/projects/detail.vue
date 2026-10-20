@@ -8,7 +8,7 @@
  * 项目状态由合同状态自动派生，本页不提供项目级状态变更入口。
  * 「编辑」跳转编辑页（仅基本信息）。
  */
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { ArrowLeft, EditPen, Folder, Tickets } from '@element-plus/icons-vue'
@@ -24,7 +24,7 @@ import {
   tagInfo,
   type Contract,
 } from '@/types'
-import { allUserOptions, changeContractStatus, claimProject, db, getAsset, refresh, showError, type UserOption } from '@/api'
+import { allUserOptions, changeContractStatus, claimProject, db, getAsset, patchContractFields, refresh, showError, type UserOption } from '@/api'
 import TransferDialog from '@/components/TransferDialog.vue'
 import { canWrite, isViewer, isAdmin, currentUser, NO_PERM_TIP } from '@/auth'
 
@@ -199,6 +199,61 @@ async function changeContract(c: Contract, status: 'delivered' | 'terminated') {
     actingContractId.value = null
   }
 }
+
+// ============================================================
+// 合同时间节点录入（ADR-019，PRICING-20261020）：PATCH /contracts/{id}
+// - signedDate（合同签订时间）：商务/管理员；录入即 active→delivering；录后不可清空（后端 400 兜底）
+// - scheduledDeliveryDate（预计交付时间）：仅 admin；仅 delivering 可录/改/清空（null 允许）
+// 403/400 文案由后端 detail 给出，经 showError 统一提示
+// ============================================================
+const dateDialog = reactive({
+  visible: false,
+  contractId: 0,
+  field: 'signedDate' as 'signedDate' | 'scheduledDeliveryDate',
+  value: '',
+})
+const dateSaving = ref(false)
+function openDateDialog(c: Contract, field: 'signedDate' | 'scheduledDeliveryDate') {
+  dateDialog.contractId = c.id
+  dateDialog.field = field
+  dateDialog.value = (field === 'signedDate' ? c.signedDate : c.scheduledDeliveryDate) ?? ''
+  dateDialog.visible = true
+}
+async function submitDateDialog() {
+  if (!dateDialog.value) {
+    // 签订时间不可清空（ADR-019）；预计交付时间允许清空（payload 传 null）
+    if (dateDialog.field === 'signedDate') {
+      ElMessage.warning('请选择签订时间（已录入后不可清空）')
+      return
+    }
+    dateSaving.value = true
+    try {
+      await patchContractFields(dateDialog.contractId, { scheduledDeliveryDate: null })
+      ElMessage.success('预计交付时间已清空')
+      dateDialog.visible = false
+    } catch (e) {
+      showError(e, '更新预计交付时间失败')
+    } finally {
+      dateSaving.value = false
+    }
+    return
+  }
+  dateSaving.value = true
+  try {
+    if (dateDialog.field === 'signedDate') {
+      await patchContractFields(dateDialog.contractId, { signedDate: dateDialog.value })
+      ElMessage.success('签订时间已录入，销售记录转为「交付中」')
+    } else {
+      await patchContractFields(dateDialog.contractId, { scheduledDeliveryDate: dateDialog.value })
+      ElMessage.success('预计交付时间已更新')
+    }
+    dateDialog.visible = false
+  } catch (e) {
+    showError(e, '时间更新失败')
+  } finally {
+    dateSaving.value = false
+  }
+}
 </script>
 
 <template>
@@ -344,7 +399,7 @@ async function changeContract(c: Contract, status: 'delivered' | 'terminated') {
             <div>
               <div class="bh-title">销售记录清单</div>
               <div class="bh-sub">
-                共 {{ contracts.length }} 份销售记录；项目状态由销售记录状态自动派生（待审核→待审核；有进行中→进行中；全部完成→已完成；全部终止→已终止）。
+                共 {{ contracts.length }} 份销售记录；项目状态由销售记录状态自动派生（待审核→待审核；进行中→进行中；交付中→交付中；全部完成→已完成；全部终止→已终止）。
               </div>
             </div>
           </div>
@@ -406,6 +461,63 @@ async function changeContract(c: Contract, status: 'delivered' | 'terminated') {
                         </el-button>
                       </span>
                     </el-tooltip>
+                    <!-- ADR-019（PRICING-20261020）：录入签订时间（商务/管理员）——录入即 active→delivering；
+                         已录过签订时间的合同已转 delivering，active 分支下该按钮恒为「未录入」态 -->
+                    <el-tooltip :content="!canWrite ? '录入签订时间需商务人员/管理员操作' : ''" :disabled="canWrite" placement="top">
+                      <span>
+                        <el-button
+                          type="primary"
+                          plain
+                          size="small"
+                          :disabled="!canWrite"
+                          @click="openDateDialog(c, 'signedDate')"
+                        >
+                          录入签订时间
+                        </el-button>
+                      </span>
+                    </el-tooltip>
+                  </template>
+                  <!-- ADR-019（PRICING-20261020）：交付中（已录签订时间未交付）——
+                       交付/终止沿用 active 分支既有调用；「预计交付时间」仅 admin 可录/改/清空 -->
+                  <template v-else-if="c.status === 'delivering'">
+                    <el-tooltip :content="!canWrite ? '交付需商务人员/管理员操作' : ''" :disabled="canWrite" placement="top">
+                      <span>
+                        <el-button
+                          type="primary"
+                          size="small"
+                          :loading="actingContractId === c.id"
+                          :disabled="!canWrite"
+                          @click="deliverContract(c)"
+                        >
+                          交付
+                        </el-button>
+                      </span>
+                    </el-tooltip>
+                    <el-tooltip :content="NO_PERM_TIP" :disabled="canOwn" placement="top">
+                      <span>
+                        <el-button
+                          type="danger"
+                          plain
+                          size="small"
+                          :loading="actingContractId === c.id"
+                          :disabled="!canOwn"
+                          @click="terminateContract(c)"
+                        >
+                          终止
+                        </el-button>
+                      </span>
+                    </el-tooltip>
+                    <el-tooltip :content="!isAdmin ? '预计交付时间仅管理员可录入' : ''" :disabled="isAdmin" placement="top">
+                      <span>
+                        <el-button
+                          size="small"
+                          :disabled="!isAdmin"
+                          @click="openDateDialog(c, 'scheduledDeliveryDate')"
+                        >
+                          预计交付时间
+                        </el-button>
+                      </span>
+                    </el-tooltip>
                   </template>
                   <el-tooltip v-else-if="c.status === 'delivered'" :content="NO_PERM_TIP" :disabled="canOwn" placement="top">
                     <span>
@@ -431,8 +543,18 @@ async function changeContract(c: Contract, status: 'delivered' | 'terminated') {
                   <b class="ci-amount">{{ formatMoney(c.contractAmount) }}</b>
                 </span>
                 <span class="ci-item" v-if="c.items.some((it) => it.lockedDate)">
-                  <span class="muted">签约/锁定</span>
+                  <!-- 2026-10-20（ADR-019）：原「签约/锁定」改名「下单时间」（锁定即下单时刻；签订时间另列） -->
+                  <span class="muted">下单时间</span>
                   <span>{{ formatDate(c.items.find((it) => it.lockedDate)?.lockedDate) }}</span>
+                </span>
+                <!-- ADR-019（PRICING-20261020）：合同签订时间 / 预计交付时间（存量合同为 null，显示占位文案） -->
+                <span class="ci-item">
+                  <span class="muted">合同签订</span>
+                  <span :class="{ muted: !c.signedDate }">{{ c.signedDate || '未签订' }}</span>
+                </span>
+                <span class="ci-item">
+                  <span class="muted">预计交付</span>
+                  <span :class="{ muted: !c.scheduledDeliveryDate }">{{ c.scheduledDeliveryDate || '未录入' }}</span>
                 </span>
                 <span class="ci-item" v-if="c.items.some((it) => it.shippedDate)">
                   <span class="muted">交付</span>
@@ -468,6 +590,14 @@ async function changeContract(c: Contract, status: 'delivered' | 'terminated') {
                 </el-table-column>
                 <el-table-column label="金额" width="140" align="right">
                   <template #default="{ row }">{{ formatMoney(row.amount) }}</template>
+                </el-table-column>
+                <!-- ADR-020（PRICING-20261020）：服务期限（start ~ end，空显 -；遥感明细行按期数售卖，展示为空即可） -->
+                <el-table-column label="服务期限" width="200" align="center">
+                  <template #default="{ row }">
+                    <span :class="{ muted: !(row.serviceStart || row.serviceEnd) }">
+                      {{ row.serviceStart || row.serviceEnd ? `${row.serviceStart || '-'} ~ ${row.serviceEnd || '-'}` : '-' }}
+                    </span>
+                  </template>
                 </el-table-column>
                 <el-table-column label="交付要求" min-width="160" show-overflow-tooltip>
                   <template #default="{ row }">{{ row.deliveryReq || '-' }}</template>
@@ -512,6 +642,45 @@ async function changeContract(c: Contract, status: 'delivered' | 'terminated') {
         </div>
       </template>
 
+      <!-- ADR-019（PRICING-20261020）：合同时间节点录入（签订时间 / 预计交付时间） -->
+      <el-dialog
+        v-model="dateDialog.visible"
+        :title="dateDialog.field === 'signedDate' ? '录入签订时间' : '预计交付时间'"
+        class="dlg-form"
+        :close-on-click-modal="false"
+      >
+        <el-form label-position="top">
+          <el-form-item :label="dateDialog.field === 'signedDate' ? '合同签订时间' : '预计交付时间'">
+            <el-date-picker
+              v-model="dateDialog.value"
+              type="date"
+              value-format="YYYY-MM-DD"
+              placeholder="选择日期"
+              style="width: 100%;"
+            />
+          </el-form-item>
+          <p class="muted" style="font-size: 12px; margin: 0;">
+            <template v-if="dateDialog.field === 'signedDate'">
+              录入后销售记录转为「交付中」，可执行交付；签订时间录入后不可清空。
+            </template>
+            <template v-else>
+              仅管理员可录入/修改；已有值时可不选日期直接保存以清空。
+            </template>
+          </p>
+        </el-form>
+        <template #footer>
+          <el-button @click="dateDialog.visible = false">取消</el-button>
+          <el-button
+            type="primary"
+            :loading="dateSaving"
+            :plain="dateDialog.field === 'scheduledDeliveryDate' && !dateDialog.value"
+            @click="submitDateDialog"
+          >
+            {{ dateDialog.field === 'scheduledDeliveryDate' && !dateDialog.value ? '清空预计交付时间' : '保存' }}
+          </el-button>
+        </template>
+      </el-dialog>
+
       <!-- ADR-012 §5.1 纯移交制：转交对话框（负责人/admin，下拉选新负责人） -->
       <TransferDialog v-model="transferVisible" :project="transferTarget" />
     </div>
@@ -553,6 +722,10 @@ async function changeContract(c: Contract, status: 'delivered' | 'terminated') {
 }
 .contract-card.contract-active {
   border-left-color: var(--primary-color);
+}
+/* ADR-019（PRICING-20261020）：交付中（已录签订时间未交付）——与状态 tag 同色板（橙） */
+.contract-card.contract-delivering {
+  border-left-color: var(--warning-color, #A86514);
 }
 .contract-card.contract-delivered {
   border-left-color: var(--success-color, #0c7b51);

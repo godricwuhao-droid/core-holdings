@@ -209,6 +209,9 @@ export interface AssetInput {
   quantity: number
   repeatSale: boolean
   salePrice: number
+  // 参考价格区间（ADR-018，PRICING-20261020）：元/份，选填（可单边）；两者都有时后端校验 min ≤ max
+  priceMin?: number | null
+  priceMax?: number | null
   status: AssetStatus
   inboundDate: string
   expiryDate: string
@@ -237,6 +240,9 @@ export interface ProjectItemInput {
   amount: number
   deliveryReq: string
   itemId?: number // ADR-011：遥感明细行（重新提交预填时携带；qty 恒 1）
+  // 服务期限（ADR-020，PRICING-20261020）：YYYY-MM-DD，start ≤ end 否则 400；遥感行不填
+  serviceStart?: string | null
+  serviceEnd?: string | null
 }
 
 /** 合同入参（ADR-007）：POST /projects 的 contracts[] 元素（2026-10-20 ADR-013：「合同内同一产品主体」限制已移除，允许混合主体明细） */
@@ -514,6 +520,21 @@ export async function changeContractStatus(
 }
 
 /**
+ * 合同时间节点录入（ADR-019，PRICING-20261020）：PATCH /contracts/{id}
+ * - signedDate（合同签订时间）：editor/admin（接手人守卫，与审核同口径）；仅 active/delivering 可录/改；
+ *   录入即 active→delivering；录后**不可清空**（传 null/空 → 400）；
+ * - scheduledDeliveryDate（预计交付时间）：仅 admin；仅 delivering 可录/改/清空（null 允许）。
+ * 403/400 文案由后端 detail 给出，经拦截器统一 toast。
+ */
+export async function patchContractFields(
+  id: number,
+  payload: { signedDate?: string; scheduledDeliveryDate?: string | null },
+): Promise<void> {
+  await http.patch(`/contracts/${id}`, payload)
+  await afterWrite()
+}
+
+/**
  * 项目级状态批量快捷（PATCH /projects/{id}/status）：
  * 对名下全部 **active** 合同批量执行该状态动作（delivered=全部交付 / terminated=全部终止），
  * 主入口仍是合同级 changeContractStatus；项目列表抽屉的「交付 / 终止」用本函数。
@@ -530,8 +551,9 @@ export async function changeProjectStatus(
 
 /**
  * 订单审核（ADR-012，仅商务/管理员；生态人员 403）：
- * - confirm = 确认下单（items 可带行级改价：unit 行传 price 实际单价、amount 行传 amount 实际合同金额，
- *   整数元；遥感明细行不接受改价；确认后实际价同步写回平台挂牌价）；
+ * - confirm = 确认下单（items 可带行级改价：unit 行传 price 实际单价、amount/遥感行传 amount 实际合同金额，
+ *   整数元；ADR-018 §4：改价只写 ProjectItem，**不再回写平台挂牌价**；
+ *   ADR-020 PRICING-20261020：行级可改服务期限 serviceStart/serviceEnd，不传 = 保持原值）；
  * - reject = 驳回（reason 必填，释放锁定、项目终止并留痕）。
  */
 export async function reviewProject(
@@ -539,7 +561,13 @@ export async function reviewProject(
   payload: {
     action: 'confirm' | 'reject'
     reason?: string
-    items?: { itemId: number; price?: number; amount?: number }[]
+    items?: {
+      itemId: number
+      price?: number
+      amount?: number
+      serviceStart?: string | null
+      serviceEnd?: string | null
+    }[]
   },
 ): Promise<void> {
   await http.post(`/projects/${id}/review`, payload)
@@ -715,11 +743,27 @@ export async function setCartQty(id: number, qty: number): Promise<void> {
 }
 
 /**
- * 修改购物车行合同金额（ADR-008，仅包量定价产品行）：整数元，后端校验 int > 0。
- * ⚠️ 后端 PUT /cart/{id} 对 qty<=0 执行删行，必须同时回传该行当前 qty（缺省=0 会误删行）。
+ * 修改购物车行销售金额（ADR-008/ADR-018 §3，PRICING-20261020）：整数元。
+ * - amount 模式行：权威输入，后端校验 int > 0；
+ * - unit/遥感明细行：折扣金额，过产品参考区间校验（超区间 400，文案由后端给出）。
+ * ⚠️ 必须同时回传该行当前 qty（后端 PUT 对 qty<=0 直接 400，且区间校验按新 qty 重算）。
  */
 export async function setCartAmount(id: number, qty: number, amount: number): Promise<void> {
   await http.put(`/cart/${id}`, { qty, amount })
+  await afterWrite()
+}
+
+/**
+ * 修改购物车行服务期限（ADR-020，PRICING-20261020）：YYYY-MM-DD，start ≤ end 否则 400。
+ * 同 setCartAmount：必须回传该行当前 qty。
+ */
+export async function setCartService(
+  id: number,
+  qty: number,
+  serviceStart: string | null,
+  serviceEnd: string | null,
+): Promise<void> {
+  await http.put(`/cart/${id}`, { qty, serviceStart, serviceEnd })
   await afterWrite()
 }
 
@@ -741,7 +785,7 @@ export async function clearCart(): Promise<void> {
 
 export interface OrderFields {
   projectName: string
-  /** 直接下单必填；购物车结算不带（后端按行级客户分组，CheckoutInput.customer 可选且不参与分组） */
+  /** 购物车结算不带（后端按行级客户分组，CheckoutInput.customer 可选且不参与分组） */
   customer?: string
   rep?: string
   businessOwner?: string // 商务负责人（可选，默认空）
@@ -752,15 +796,11 @@ export interface OrderFields {
 }
 
 /**
- * 购物车结算入参（ADR-008）：后端 `CheckoutInput` 无 items 字段——
- * 包量定价行的合同金额权威值已由 PUT/PATCH /cart/{id} 持久化到 cart_items.amount，结算不再携带。
+ * 购物车结算入参（ADR-008/ADR-018 §3）：后端 `CheckoutInput` 无 items 字段——
+ * 行级销售金额（包量定价权威值 / unit 与遥感行折扣金额）与服务期限均已由
+ * PUT/PATCH /cart/{id} 持久化到 cart_items，结算不再携带（行级值随 cart_items 透传落库）。
  */
 export type CheckoutInput = OrderFields
-
-export interface SaleOrderInput extends OrderFields {
-  // amount：包量定价行的合同金额（整数元，ADR-008）；itemId：遥感明细行（ADR-011，qty 恒 1，金额后端按 rs_items.price 权威重算）
-  items: { assetId: number; qty: number; amount?: number; itemId?: number }[]
-}
 
 export interface ProjectOut {
   id: number
@@ -770,19 +810,16 @@ export interface ProjectOut {
   contractCount?: number // ADR-007：合同数量（=客户组数）
 }
 
-/** 购物车下单：生成「进行中」销售项目并锁定数量（不自动交付），随后清空购物车 */
+/** 购物车下单（ADR-020，PRICING-20261020：购物车为唯一下单链路）：
+ * 生成「待审核」销售项目并锁定数量（不自动交付），随后清空购物车 */
 export async function checkoutCart(data: CheckoutInput): Promise<ProjectOut> {
   const { data: d } = await http.post<ProjectOut>('/cart/checkout', data)
   await afterWrite()
   return d
 }
 
-/** 产品直接下单：单/多产品生成「进行中」销售项目并锁定数量（与购物车下单同一流程） */
-export async function createSaleOrder(data: SaleOrderInput): Promise<ProjectOut> {
-  const { data: d } = await http.post<ProjectOut>('/sales/order', data)
-  await afterWrite()
-  return d
-}
+// 2026-10-20（ADR-020）：产品「登记销售」直接下单入口已移除，前端不再调用
+// POST /sales/order（后端端点保留并标记 deprecated，兼容潜在直调方），createSaleOrder 一并删除。
 
 // ============================================================
 // 认证 / 账号管理 / 审计日志（2026-10-15 权限体系）

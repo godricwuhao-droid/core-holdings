@@ -22,6 +22,9 @@ class AssetOut(_ORM):
     shippedQty: int
     repeatSale: bool
     salePrice: float  # 元（ADR-006）；pricingMode='amount' 时仅作参考值，不参与金额计算
+    # 参考区间（ADR-018 §1，PRICING-20261020）：元/份，选填；null=未设置（不限制折扣）
+    priceMin: float | None = None
+    priceMax: float | None = None
     soldAmount: float  # 元
     soldCount: int
     status: str
@@ -50,6 +53,10 @@ class AssetInput(BaseModel):
     quantity: int = Field(ge=0)
     repeatSale: bool
     salePrice: float = Field(ge=0)  # 元（ADR-006）；卫星Token（amount 模式）仅作参考值
+    # 参考区间（ADR-018 §1，PRICING-20261020）：元/份，选填（单边允许）；
+    # 两者都有时 min ≤ max，否则 400「参考区间下限不能大于上限」
+    priceMin: float | None = Field(default=None, ge=0)
+    priceMax: float | None = Field(default=None, ge=0)
     status: str
     inboundDate: str
     expiryDate: str
@@ -80,6 +87,9 @@ class AssetUpdate(BaseModel):
     quantity: int | None = Field(default=None, ge=0)
     repeatSale: bool | None = None
     salePrice: float | None = Field(default=None, ge=0)  # 元（ADR-006）
+    # 参考区间（ADR-018 §1，PRICING-20261020）：选填；传 null 清空（恢复不限制）
+    priceMin: float | None = Field(default=None, ge=0)
+    priceMax: float | None = Field(default=None, ge=0)
     status: str | None = None
     inboundDate: str | None = None
     expiryDate: str | None = None
@@ -106,6 +116,10 @@ class ReviewItemInput(BaseModel):
     itemId: int
     price: float | None = None
     amount: float | None = None
+    # 服务期限（ADR-020，PRICING-20261020）：confirm 可改（YYYY-MM-DD，start ≤ end 否则 400）；
+    # 不传 = 保持原值
+    serviceStart: str | None = None
+    serviceEnd: str | None = None
 
 
 class ReviewInput(BaseModel):
@@ -172,6 +186,10 @@ class ProjectItemInput(BaseModel):
     # qty 强制 1（≠1 → 400），amount 后端权威 = 明细 price × 1（忽略前端传值），
     # 明细 repeatSale=true → 不锁数量；false → 按父产品 lockedQty 逻辑（qty=1）
     itemId: int | None = None
+    # 服务期限（ADR-020，PRICING-20261020）：YYYY-MM-DD，start ≤ end 否则 400；
+    # 遥感行不填期限（期数即服务时间）
+    serviceStart: str | None = None
+    serviceEnd: str | None = None
 
 
 class ProjectItemOut(_ORM):
@@ -181,8 +199,14 @@ class ProjectItemOut(_ORM):
     itemId: int | None = None  # 遥感数据明细（ADR-011）；存量/非遥感行为 null
     qty: int
     unit: str
-    price: float
-    amount: float
+    price: float  # 最终价（折扣/终审后，ADR-018）
+    amount: float  # 最终行金额
+    # 原价快照（ADR-018 §2，PRICING-20261020）：下单时快照、永不覆盖；存量订单为 null
+    origPrice: float | None = None
+    origAmount: float | None = None
+    # 服务期限（ADR-020，PRICING-20261020）：YYYY-MM-DD；存量/遥感行为 null
+    serviceStart: str | None = None
+    serviceEnd: str | None = None
     status: str
     deliveryReq: str
     locked: bool  # 下单时刻是否真实加锁（非 repeatSale）；前端展示/判断用
@@ -211,11 +235,26 @@ class ContractOut(_ORM):
     customer: str
     subject: str
     contractAmount: float  # 元（ADR-006）
-    status: str  # active / delivered / terminated
+    status: str  # active / delivering / delivered / terminated（ADR-019 新增 delivering「交付中」）
+    # 时间节点（ADR-019，PRICING-20261020）：YYYY-MM-DD；存量合同为 null
+    signedDate: str | None = None  # 合同签订时间（商务填，录入即 active→delivering，不可清空）
+    scheduledDeliveryDate: str | None = None  # 预计交付时间（仅 admin 填，仅 delivering 可录/改/清空）
     remark: str
     items: list[ProjectItemOut]
     createdAt: str
     updatedAt: str
+
+
+class ContractFieldPatch(BaseModel):
+    """PATCH /contracts/{id} 入参（ADR-019，PRICING-20261020）：两字段均可选，按字段分别校验。
+
+    - signedDate：editor/admin（接手人守卫，与审核同口径）；仅合同 active 可录入，
+      录入后自动 active→delivering；录后可改、传 null 清空 → 400；
+    - scheduledDeliveryDate：仅 admin；仅合同 delivering 可录/改/清空（null 允许）。
+    路由层用 model_dump(exclude_unset=True) 区分「未传」与「传 null」。
+    """
+    signedDate: str | None = None
+    scheduledDeliveryDate: str | None = None
 
 
 class ProjectInput(BaseModel):
@@ -421,9 +460,13 @@ class CartItemOut(_ORM):
     assetId: int
     customer: str = ""  # 行级客户（ADR-007）；结算时按 customer 分组拆合同
     qty: int
-    # 包量计价合同金额（ADR-008，元，整数）：仅 amount 模式产品行非空；unit 模式恒 null
+    # 合同金额（元，整数）：amount 模式行=权威金额；unit/遥感明细行=折扣金额
+    # （ADR-018 §3，PRICING-20261020 起 unit 行放开）；null=原价成交
     amount: float | None = None
     itemId: int | None = None  # 遥感数据明细（ADR-011）；含 itemId 行 qty 恒 1；存量/非遥感行为 null
+    # 服务期限（ADR-020，PRICING-20261020）：YYYY-MM-DD；遥感行不填；存量行为 null
+    serviceStart: str | None = None
+    serviceEnd: str | None = None
     createdAt: str
     updatedAt: str
 
@@ -432,18 +475,29 @@ class CartItemInput(BaseModel):
     assetId: int
     qty: int = Field(default=1, ge=0)
     customer: str = ""  # 行级客户（ADR-007）；(userId, assetId, customer) 相同才合并
-    # 包量计价合同金额（ADR-008，可选，元，整数）：amount 模式产品行结算前必填（缺失 400）；
-    # unit 模式忽略（不采信、不落库）
+    # 合同金额（可选，元，整数）：amount 模式产品行结算前必填（缺失 400）；
+    # unit/遥感明细行=折扣金额（ADR-018 §3，PRICING-20261020 起放开，过参考区间校验）；
+    # 不传 = 原价成交
     amount: float | None = None
     # 遥感数据明细（ADR-011，可选）：非空时校验明细存在且归属 assetId；qty 恒 1（≠1 → 400）；
     # 判重键升级为 (userId, assetId, itemId, customer)（无 itemId 行口径不变）
     itemId: int | None = None
+    # 服务期限（ADR-020，PRICING-20261020）：YYYY-MM-DD，start ≤ end 否则 400；遥感行不填
+    serviceStart: str | None = None
+    serviceEnd: str | None = None
 
 
 class CartPatchInput(BaseModel):
-    """PATCH /cart/{id}：修改购物车行级客户（ADR-007）；可选携带 amount（ADR-008）"""
+    """PATCH /cart/{id}：修改购物车行级客户（ADR-007）；可选携带 amount（ADR-008）
+    与服务期限（ADR-020，PRICING-20261020）。
+
+    amount 语义（ADR-018 §3）：unit/遥感明细行=折扣金额（传入即采信并过参考区间校验，
+    不传保持 NULL=原价成交）；amount 模式行=权威合同金额（整数元，不传保持原值）。
+    """
     customer: str
-    amount: float | None = None  # amount 模式行可改合同金额（整数元）；unit 模式忽略
+    amount: float | None = None
+    serviceStart: str | None = None  # YYYY-MM-DD；start ≤ end 否则 400
+    serviceEnd: str | None = None
 
 
 class CartBatchInput(BaseModel):

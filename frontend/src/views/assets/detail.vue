@@ -37,6 +37,7 @@ import {
   formatAssetQty,
   formatMoney,
   noSellableStock,
+  priceRangeText,
   tagInfo,
   rsItemName,
   type AssetFlow,
@@ -50,7 +51,6 @@ import {
   addAssetDeliverable,
   addRsItem,
   assetFlows,
-  createSaleOrder,
   deleteAsset,
   deleteRsItem,
   getAsset,
@@ -64,13 +64,9 @@ import {
   updateAssetDeliverable,
   updateRsItem,
   db,
-  type OrderFields,
   type RsItemInput,
   type UserOption,
 } from '@/api'
-import SalesOrderDialog from '@/components/SalesOrderDialog.vue'
-import RsItemPicker from '@/components/RsItemPicker.vue'
-import type { OrderItem } from '@/components/SalesOrderDialog.vue'
 import { PROVINCES } from '@/constants'
 import { canWrite, NO_PERM_TIP } from '@/auth'
 
@@ -113,61 +109,8 @@ function isWipBoard() {
 // ============================================================
 // 顶部动作
 // ============================================================
-// ---- 登记销售：admin/editor 走销售模块创建页（原行为）；viewer（生态人员）无销售模块入口，
-//      直接打开下单对话框（与产品列表抽屉「销售」同一表单，单产品 + 数量） ----
-const saleItem = ref<OrderItem | null>(null)
-const saleVisible = ref(false)
-const saleLoading = ref(false)
-/** ADR-011：遥感数据「登记销售」勾选的明细行（订单级客户 + N 行明细，行带 itemId、qty=1） */
-const rsSaleItems = ref<OrderItem[]>([])
-const saleItems = computed<OrderItem[]>(() =>
-  rsSaleItems.value.length ? rsSaleItems.value : saleItem.value ? [saleItem.value] : [],
-)
-
-// ---- ADR-011：遥感数据明细选择弹窗（登记销售入口；加购统一走产品列表）----
-const rsPickerVisible = ref(false)
-
-function onRsPickerConfirm(items: RsItem[]) {
-  const a = asset.value
-  if (!a) return
-  rsSaleItems.value = items.map((it) => ({ asset: a, qty: 1, amount: it.price, itemId: it.id }))
-  saleItem.value = null
-  saleVisible.value = true
-}
-
-function goRegisterSale() {
-  if (!asset.value) return
-  // ADR-011：遥感数据父产品 → 明细选择弹窗（父产品本身不可直接下单，数量校验不适用）
-  if (asset.value.type === '遥感数据') {
-    rsPickerVisible.value = true
-    return
-  }
-  if (noSellableStock(asset.value)) {
-    ElMessage.warning('该产品当前无可用数量（可售数量为 0），无法登记销售。请待数量释放（取消锁定或补充登记）后再操作。')
-    return
-  }
-  // 2026-10-19：原商务/管理员走「跳手动建单页（带 assetId 预填）」——手动建单入口已移除，
-  // 统一改为直接打开下单对话框（与产品列表直接下单、viewer 行为一致）
-  rsSaleItems.value = []
-  saleItem.value = { asset: asset.value, qty: 1 }
-  saleVisible.value = true
-}
-
-async function onSaleSubmit(payload: { fields: OrderFields; items: { assetId: number; qty: number; amount?: number }[] }) {
-  saleLoading.value = true
-  try {
-    const p = await createSaleOrder({ ...payload.fields, items: payload.items })
-    saleVisible.value = false
-    // ADR-012 修订（2026-10-19）：所有角色下单统一进「待审核」，商务接手审核后生效
-    ElMessage.success(`下单成功，销售项目 ${p.code} 待审核，商务接手确认后生效`)
-    await refresh(true)
-  } catch (e) {
-    showError(e, '下单失败')
-    await refresh(true)
-  } finally {
-    saleLoading.value = false
-  }
-}
+// 2026-10-20（ADR-020，PRICING-20261020）：「登记销售」直接下单入口已移除，
+// 下单统一走购物车（SalesOrderDialog 仅保留购物车结算确认模式）。
 
 /** 编辑产品：无可用数量时提示（不阻止，允许补登记） */
 function goEditAsset() {
@@ -497,8 +440,7 @@ function operatorText(f: AssetFlow): string {
                 </el-button>
               </span>
             </el-tooltip>
-            <!-- 登记销售对三角色均可用（含生态人员；viewer 打开直接下单对话框） -->
-            <el-button plain :icon="Link" @click="goRegisterSale">登记销售</el-button>
+            <!-- ADR-020（PRICING-20261020）：「登记销售」入口已移除，下单统一走购物车 -->
             <el-dropdown trigger="click">
               <span class="more-btn">
                 更多
@@ -580,7 +522,11 @@ function operatorText(f: AssetFlow): string {
                   <div class="info-item">
                     <span class="il">销售单价</span>
                     <!-- ADR-017（2026-10-20）：包量定价产品单价与普通产品一致（元/份），删除「元/万Token」特判 -->
-                    <span class="iv">{{ asset.salePrice ? formatMoney(asset.salePrice) : '-' }}<template v-if="asset.repeatSale"> / {{ asset.unit }}</template></span>
+                    <!-- ADR-018（PRICING-20261020）：有参考区间时追加区间提示（与列表列同口径） -->
+                    <span class="iv">
+                      {{ asset.salePrice ? formatMoney(asset.salePrice) : '-' }}<template v-if="asset.repeatSale"> / {{ asset.unit }}</template>
+                      <template v-if="priceRangeText(asset)">（参考区间 {{ priceRangeText(asset) }}）</template>
+                    </span>
                   </div>
                   <div class="info-item">
                     <span class="il">登记时间</span>
@@ -791,7 +737,8 @@ function operatorText(f: AssetFlow): string {
               <div class="card-head">
                 <div>
                   <div class="card-title">关联销售项目</div>
-                  <div class="card-desc">登记销售时按明细锁定数量或记录售卖；项目「交付完成」后自动扣减并生成交付记录。</div>
+                  <!-- ADR-020（PRICING-20261020）：下单入口统一购物车，文案同步 -->
+                  <div class="card-desc">购物车下单时按明细锁定数量或记录售卖；项目「交付完成」后自动扣减并生成交付记录。</div>
                 </div>
                 <span class="muted" style="font-size: 12px;">共 {{ salesLinks.length }} 条</span>
               </div>
@@ -830,10 +777,8 @@ function operatorText(f: AssetFlow): string {
               <div v-else class="empty-compact">
                 <el-icon class="empty-icon" aria-hidden="true"><Link /></el-icon>
                 <div class="empty-title">暂无销售关联</div>
-                <div class="empty-desc muted">登记销售项目后，关联产品会在这里显示，并自动更新锁定数量和销售金额。</div>
-                <el-button v-if="!isWipBoard()" type="primary" size="small" @click="goRegisterSale">
-                  登记销售
-                </el-button>
+                <!-- ADR-020（PRICING-20261020）：下单入口统一购物车，空状态仅文字提示 -->
+                <div class="empty-desc muted">暂无关联，请通过购物车下单。下单后关联产品会在这里显示，并自动更新锁定数量和销售金额。</div>
               </div>
             </div>
           </el-tab-pane>
@@ -1002,24 +947,6 @@ function operatorText(f: AssetFlow): string {
           <el-button @click="viewDialog = false">关闭</el-button>
         </template>
       </el-dialog>
-
-      <!-- 登记销售（生态人员直接下单；遥感数据 = 订单级客户 + N 行明细） -->
-      <SalesOrderDialog
-        v-model="saleVisible"
-        title="销售下单"
-        :items="saleItems"
-        :allow-qty-edit="true"
-        :loading="saleLoading"
-        @submit="onSaleSubmit"
-      />
-
-      <!-- ADR-011：遥感数据明细选择弹窗（登记销售入口） -->
-      <RsItemPicker
-        v-if="asset.type === '遥感数据'"
-        v-model="rsPickerVisible"
-        :parent-asset="asset"
-        @confirm="onRsPickerConfirm"
-      />
 
       <!-- ADR-011：新增 / 编辑可售明细 -->
       <el-dialog

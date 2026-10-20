@@ -2,6 +2,33 @@
 
 > 记录 core-holdings 后端（FastAPI + SQLAlchemy + SQLite）的接口与行为变更。
 
+## 2026-10-20 ｜ 新增/修改：PRICING-20261020 价格体系（区间/折扣）+ 时间节点 + 状态机 + 服务期限（分支 feat/pricing-discount-timelines）
+
+> 依据 ADR-018 / ADR-019 / ADR-020，前后端同批上线（契约见 api-contracts.md「PRICING-20261020 批次」）。
+
+| 日期 | 类型 | 变更内容 | 影响文件范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-20 | 新增 | ⚠️ 数据模型 4 表 10 列（全部可空，存量不迁移）：`assets.priceMin/priceMax`（参考区间，ADR-018 §1）、`cart_items.serviceStart/serviceEnd`（ADR-020）、`project_items.origPrice/origAmount`（原价快照，ADR-018 §2）+ `serviceStart/serviceEnd`、`contracts.signedDate/scheduledDeliveryDate`（ADR-019）；`main.py::_ensure_migration` 幂等加列 | `backend/src/models.py`、`backend/main.py` | PRICING-20261020 | 见 database.md 本批次章节 |
+| 2026-10-20 | 新增 | `POST/PUT /assets` 接受 `priceMin/priceMax`（≥0 可空，单边允许）；两者都有时 min ≤ max 否则 400「参考区间下限不能大于上限」（update 按「存量+patch」组合值校验，防分两次编辑造成倒挂）；diff 日志新增「参考区间下限/上限」字段 | `backend/src/schemas.py`、`backend/src/services.py` | PRICING-20261020 | 契约 §2 |
+| 2026-10-20 | 修改 | ⚠️ 购物车金额口径（ADR-018 §3）：unit 行与遥感明细行 `amount` 放开为折扣金额（整数元 ≥0，传入即采信 + 参考区间校验，不传 = NULL 原价成交）；amount 模式行口径不变（整数元权威）。覆盖入口：`POST /cart`、`/cart/batch`、`PUT /cart/{id}`、`PATCH /cart/{id}`、`POST /cart/checkout`、`POST /sales/order`（防直调绕过）。超限 400「折扣单价超出该产品参考区间（{min}~{max} 元/{unit}）」（单边区间按单边校验，未设区间不限制）；折扣单价 = amount÷qty（Decimal 6 位） | `backend/src/services.py`（新增 `_check_discount_range`）、`backend/src/schemas.py` | PRICING-20261020 | 契约 §3 |
+| 2026-10-20 | 新增 | 服务期限（ADR-020）：`CartItemInput/CartPatchInput/ProjectItemInput/ReviewItemInput` 新增 `serviceStart/serviceEnd`（YYYY-MM-DD，start ≤ end 否则 400「服务开始日期不能晚于结束日期」）；购物车行填写 → checkout 透传落 `project_items`；审核 confirm 行级可改（只传一边时与存量另一边组合校验）；遥感行不填期限 | `backend/src/schemas.py`、`backend/src/services.py` | PRICING-20261020 | 契约 §4/§6 |
+| 2026-10-20 | 新增 | 下单落库原价快照（ADR-018 §2）：`_create_project_core` 明细写入 `origPrice/origAmount`——普通行 = asset.salePrice / salePrice×qty（改价前的原始挂牌价），遥感行 = rs_items.price / 同值；**永不覆盖**（审核改价/终审不触碰）；`price/amount` 语义 = 最终价（折扣/终审后） | `backend/src/services.py` | PRICING-20261020 | 存量订单 orig 为 null（展示端按 price/amount 兜底） |
+| 2026-10-20 | 删除 | ⚠️ `review_project` confirm **整体删除**终审改价回写 `assets.salePrice` 的逻辑（含「挂牌价更新」日志与 price_changes_by_asset 装配）——挂牌价/参考区间仅由产品管理维护，改价只写 ProjectItem.price/amount（ADR-018 §4） | `backend/src/services.py` | PRICING-20261020 | 行为变更：终审改价不再污染挂牌价 |
+| 2026-10-20 | 新增 | ⚠️ 新端点 `PATCH /contracts/{id}`（require_order）：录入 `signedDate`（editor/admin，接手人守卫与审核同口径；仅合同 active 可录入，录入即 active→delivering + 项目重算 + 日志「录入合同签订时间」；录后可改、传 null 清空 400「签订时间录入后不可清空」）/ `scheduledDeliveryDate`（**仅 admin**，非 admin 403；仅 delivering 可录/改/清空，null 允许；日志「录入预计交付时间」）；viewer 403「只读账号不可执行该操作」；返回 ContractOut | `backend/src/routers/api.py`、`backend/src/services.py`（新增 `patch_contract_fields`）、`backend/src/schemas.py`（新增 `ContractFieldPatch`） | PRICING-20261020 | 契约 §5；ADR-019 |
+| 2026-10-20 | 修改 | ⚠️ 合同状态机扩展（ADR-019）：`pending → active → delivering（新）→ delivered`，terminated 各阶段可达。`PATCH /contracts/{id}/status` 白名单加 delivering（但直接变更到 delivering 400，仅录签订时间自动触发）；`active→delivered` 新守卫 400「合同尚未录入签订时间，不可交付」（存量 active 合同需商务先补录）；`delivering→delivered` 为交付路径（扣量/流水/Outbound 不变，仍在交付时发生）；`delivered` 撤销交付后合同回 **delivering**（原回 active，signedDate 仍在不能回合同签订中）；delivering 合同终止释放锁定；项目批量交付/删除项目/产品删除守卫同步覆盖 delivering | `backend/src/services.py` | PRICING-20261020 | 契约 §5 |
+| 2026-10-20 | 修改 | ⚠️ `_derive_project_status` 按 ADR-019 §3 重写：全 pending→pending；全 delivered→delivered；含 terminated 且其余全 pending/terminated→terminated；全部合同 ∈ {delivering, delivered}（全部已签）→**delivering（交付中）**；其余→active。项目金额/customer 派生逻辑不动 | `backend/src/services.py` | PRICING-20261020 | 项目/合同 status 新增值 `delivering`（中文「交付中」） |
+| 2026-10-20 | 修改 | bootstrap 快照新字段（均随 schemas 出参自动带出，viewer 过滤为行级、对新字段无影响）：`assets[].priceMin/priceMax`、`cart[].serviceStart/serviceEnd`、`projectItems[].origPrice/origAmount/serviceStart/serviceEnd`、`contracts[].signedDate/scheduledDeliveryDate` | `backend/src/schemas.py` | PRICING-20261020 | 契约 §1 |
+| 2026-10-20 | 修改 | ⚠️ `POST /sales/order` 标记 **deprecated**（ADR-020：前端移除「登记销售」入口，购物车为唯一下单链路）；端点保留兼容潜在直调方，折扣金额同样过区间校验 | `backend/src/routers/api.py` | PRICING-20261020 | 契约 §7 |
+
+### 验证
+
+- `python3 -m compileall -q src main.py` 通过；`import src.services / src.routers.api / src.schemas / src.models / main` 无错。
+- 内存 SQLite 冒烟（不碰真实库）42 项断言全部通过，覆盖：区间校验三态（双边内/超上限/低于下限/单边/无区间）、非整数元 400、unit 行 amount 采信与原价快照、checkout 落 orig+servicePeriod、服务期限 start>end 400、审核改价后 salePrice 不变 + orig 不变 + 服务期限可改、viewer/非接手人 403、录 signedDate→delivering、2 合同 1 签 1 未签→项目 active、全签→delivering、active 未签直接交付 400、scheduledDeliveryDate editor 403 / 非 delivering 400 / admin 可录、清空 signedDate 400、直接变更 status=delivering 400、delivering 交付扣量 + Outbound 关联明细、撤销交付回 delivering + 回退扣量、sales/order 直调超区间 400、产品 min>max 400。
+- 真实库副本迁移验证：副本删 10 新列模拟存量库 → 执行 `_ensure_migration` → 4 表 10 列全部补齐，10 张业务表行数完全不变（assets 28 / cart_items 3 / project_items 16 / contracts 15 / projects 6 / outbounds 0 / flows 162 / logs 507 / users 8 / rs_items 98）；二次执行幂等 no-op。
+- dev server（uvicorn --reload）全链路 curl 实测（admin）：`POST /assets`（min>max）→ 400「参考区间下限不能大于上限」；`POST /projects`（unit 行折扣 23000×2 + 服务期限）→ 200，明细 `origPrice=25000 / origAmount=50000 / amount=46000 / serviceStart=2026-11-01 / serviceEnd=2026-12-01`；`POST /projects/{id}/review`（confirm）→ 200；`PATCH /contracts/{id}`（signedDate=2026-10-20）→ 200 `status=delivering`；`PATCH /contracts/{id}`（signedDate=null）→ 400「签订时间录入后不可清空」；`PATCH /contracts/{id}`（scheduledDeliveryDate=2026-11-15）→ 200；`PATCH /contracts/{id}/status`（delivered）→ 200；`DELETE /projects/{id}` 清理 → 200（产品 shippedQty 回退 0、项目/合同级联删除）；`GET /bootstrap` 响应含全部新字段（存量行值为 null）。
+- 存量数据：当前库无 active 合同（全部 pending/terminated），无需补录；上线后如有 active 合同由商务经新端点补录 signedDate。
+- 未修改 frontend/ 任何文件、未执行构建/部署、未 git commit。
+
 ## 2026-10-20 ｜ 新增：资产 29（CH-SAT-029「遥感数据-2026」）批量录入 96 条遥感售卖明细
 
 | 日期 | 类型 | 变更内容 | 影响文件范围 | 关联任务 | 备注 |

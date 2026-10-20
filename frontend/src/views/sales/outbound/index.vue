@@ -177,7 +177,7 @@ async function handleRevert(o: Outbound) {
   let reason = ''
   try {
     const { value } = await ElMessageBox.prompt(
-      `撤销交付 ${o.code}（${o.assetName} ${formatWan(o.qty)}${o.unit}）将反向更新产品数量${o.contractId ? '，并把销售记录回退到「进行中」（明细重新锁定，可再次交付）' : ''}，请填写撤销原因。`,
+      `撤销交付 ${o.code}（${o.assetName} ${formatWan(o.qty)}${o.unit}）将反向更新产品数量${o.contractId ? '，并把销售记录回退到「交付中」（ADR-019：签订时间保留，可再次交付）' : ''}，请填写撤销原因。`,
       '撤销交付',
       {
         inputPattern: /\S+/,
@@ -191,8 +191,9 @@ async function handleRevert(o: Outbound) {
     return
   }
   await revertOutbound(o.id, reason)
-  // 2026-10-19：撤销合同交付会联动回滚合同到「进行中」（项目状态同步重算），提示中体现
-  ElMessage.success(o.contractId ? '已撤销：产品数量已回退，销售记录已回退「进行中」' : '已撤销并生成调整流水')
+  // 2026-10-19：撤销合同交付会联动回滚合同（项目状态同步重算），提示中体现；
+  // ADR-019（PRICING-20261020）：回退目标由「进行中」改为「交付中」（signedDate 仍在，合同回 delivering）
+  ElMessage.success(o.contractId ? '已撤销：产品数量已回退，销售记录已回退「交付中」' : '已撤销并生成调整流水')
 }
 </script>
 

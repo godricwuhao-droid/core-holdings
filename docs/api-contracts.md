@@ -53,3 +53,40 @@
 1. `GET /bootstrap` 响应**移除 `reps` 字段**；前端 `db.reps` 镜像与 `BaseKind` 中的 `'reps'` 同步删除。
 2. `POST/PUT/DELETE /bases/{kind}` 不再接受 `kind='reps'`（后端对 reps 返回 404 或 400 均可，取 400「该基础资料类型已下线」）；`suppliers` / `customers` 行为不变（暂保留）。
 3. 前端删除：`views/settings/base.vue`、路由 `/settings/reps`、菜单项、「基础设置」菜单若因此变空则整个子菜单移除。
+
+---
+
+## PRICING-20261020 批次：价格体系（区间/折扣）+ 时间节点 + 状态机 + 服务期限
+
+> 依据 ADR-018 / ADR-019 / ADR-020。前后端同批上线。
+
+### 1. /bootstrap 新增字段（均为可空）
+- `assets`：`priceMin` / `priceMax`（number | null，元/份）
+- `cartItems`：`serviceStart` / `serviceEnd`（string 'YYYY-MM-DD' | null）
+- `projectItems`：`origPrice` / `origAmount`（number | null，原价快照）、`serviceStart` / `serviceEnd`
+- `contracts`：`signedDate`（'YYYY-MM-DD' | null）、`scheduledDeliveryDate`（'YYYY-MM-DD' | null）
+- `contracts.status` / 项目 status 新增值 `delivering`（中文「交付中」）
+
+### 2. 产品参考价（POST/PUT /assets）
+- 入参新增 `priceMin` / `priceMax`（number ≥ 0 | null）；后端校验：只填其一允许（视为单边边界），两者都有时 min ≤ max 否则 400。
+
+### 3. 购物车金额与区间校验（PUT /cart/{id}、POST /cart、/cart/batch、/cart/checkout）
+- unit 模式行 `amount` 放开（整数元，≥ 0 可空）；viewer 与商务同口径可输。
+- 后端校验（行更新时 + checkout 时）：`amount` 非空且产品区间已设时，`amount / qty`（保留 6 位小数）须 ∈ [priceMin, priceMax]，否则 **400「折扣单价超出该产品参考区间（{min}~{max} 元/{unit}）」**（单边区间按单边校验）。
+- 不输 amount = 原价成交（unit 行 salePrice×qty；amount 行现状兜底逻辑不变）。
+
+### 4. 下单落库（checkout / 手动建单 POST /projects）
+- `ProjectItem` 写入 `origPrice` / `origAmount`（下单时快照，见 ADR-018 §2）；`serviceStart` / `serviceEnd` 透传（YYYY-MM-DD，start ≤ end 否则 400）。
+
+### 5. 合同字段与状态（新端点）
+- **PATCH /contracts/{id}**（require_order + 归属守卫）：body `{ signedDate?: 'YYYY-MM-DD', scheduledDeliveryDate?: 'YYYY-MM-DD' | null }`
+  - `signedDate`：editor/admin（接手人/admin，与审核同守卫口径）；仅合同 active 可录；录入后合同自动 active→delivering；录后可改、**不可传 null 清空**（400）。
+  - `scheduledDeliveryDate`：**仅 admin**；仅合同 delivering 可录/改；可传 null 清空。
+- `PATCH /contracts/{id}/status`：`active→delivered` 新守卫——合同非 delivering（signedDate 空）时 400「合同尚未录入签订时间，不可交付」；`delivering→delivered` 为交付路径（扣量/流水/Outbound 在此发生）；`delivered→terminated` 撤销后合同回 **delivering**（signedDate 仍在）。
+
+### 6. 审核（POST /projects/{id}/review）
+- confirm 行级入参新增 `serviceStart` / `serviceEnd`（可改服务期限）。
+- **删除**终审改价回写 `assets.salePrice` 的逻辑（ADR-018 §4）；改价只写 ProjectItem。
+
+### 7. 下单入口（ADR-020）
+- 前端删除「登记销售」入口与 SalesOrderDialog 非购物车模式；`POST /sales/order` 后端保留、文档标记 deprecated。

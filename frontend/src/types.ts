@@ -80,6 +80,9 @@ export interface Asset {
   repeatSale: boolean // 可重复售卖
   pricingMode?: 'unit' | 'amount' // 计价模式（ADR-008）：unit=单价×数量（默认）；amount=包量金额权威（卫星 Token），salePrice 仅参考
   salePrice: number // 单价（元/单位）；amount 模式下为参考单价（元/份，ADR-017），不参与计价
+  // 参考价格区间（ADR-018，PRICING-20261020）：元/{unit}，选填（可单边），下单折扣区间校验用
+  priceMin?: number | null
+  priceMax?: number | null
   soldAmount: number // 累计售卖金额（元）
   soldCount: number // 授权/销售次数（可重复售卖）
   status: AssetStatus // 可售 / 全部出售
@@ -135,7 +138,11 @@ export interface CartItem {
   itemId?: number // 遥感数据明细 id（ADR-011，挂 rs_items；含 itemId 行数量恒 1）
   customer?: string // 行级客户（ADR-007）：结算时按 customer 分组拆合同；"" = 未填写
   qty: number
-  amount?: number // 合同金额（元，整数；ADR-008，仅包量定价产品行有值）
+  // 合同金额（元，整数；ADR-008 包量定价行权威输入；ADR-018 §3 PRICING-20261020 起 unit/遥感行=折扣金额，可空=原价成交）
+  amount?: number
+  // 服务期限（ADR-020，PRICING-20261020）：YYYY-MM-DD，购物车行填写、结算透传落 project_items；遥感行不填
+  serviceStart?: string | null
+  serviceEnd?: string | null
   createdAt: string
   updatedAt: string
 }
@@ -169,6 +176,18 @@ export const ASSET_STOCK_STATE: Record<AssetStockState, { label: string; tag: 's
   no_stock: { label: '已售罄', tag: 'danger' },
 }
 
+/**
+ * 参考价格区间展示文本（ADR-018，PRICING-20261020）：
+ * 双边 → 「{min}~{max}」；单边 → 仅展示已设边界；未设 → ''（展示端据此决定是否追加区间后缀）
+ */
+export function priceRangeText(a: Pick<Asset, 'priceMin' | 'priceMax'>): string {
+  const min = a.priceMin
+  const max = a.priceMax
+  if (min == null && max == null) return ''
+  if (min != null && max != null) return `${min}~${max}`
+  return min != null ? `≥${min}` : `≤${max}`
+}
+
 /** 是否无可用数量（非可重复售卖且可售数量≤0）：用于禁止编辑 / 登记销售 */
 export function noSellableStock(a: Asset): boolean {
   return !a.repeatSale && (availableQty(a) ?? 0) <= 0
@@ -191,22 +210,27 @@ export function expiringSoon(a: Asset, days: number, now = Date.now()): boolean 
 // ============================================================
 // 销售项目
 // ============================================================
+// ADR-019（PRICING-20261020）：新增 delivering（交付中）——合同录入签订时间后 active→delivering，
+// 交付动作（扣量/流水/交付记录）在 delivering→delivered 时发生
 export type ProjectStatus =
   | 'pending'
   | 'active'
+  | 'delivering'
   | 'delivered'
   | 'terminated'
 
 export const PROJECT_STATUS: Record<ProjectStatus, { label: string; tag: 'success' | 'info' | 'warning' | 'danger' | 'primary' }> = {
   pending: { label: '待审核', tag: 'warning' },
   active: { label: '进行中', tag: 'primary' },
+  delivering: { label: '交付中', tag: 'warning' }, // 橙（#A86514，与全局 --warning-color 同色板）
   delivered: { label: '已完成', tag: 'success' },
   terminated: { label: '已终止', tag: 'danger' },
 }
 
-/** 状态流转路径（进行中 → 已完成；进行中 / 已完成均可终止；已终止为终点） */
+/** 状态流转路径（进行中 → 交付中 → 已完成；各阶段均可终止；已终止为终点，ADR-019） */
 export const PROJECT_FLOW: ProjectStatus[] = [
   'active',
+  'delivering',
   'delivered',
 ]
 
@@ -228,8 +252,14 @@ export interface ProjectItem {
   itemId?: number // 遥感数据明细 id（ADR-011，挂 rs_items；空 = 非明细行）
   qty: number
   unit: string
-  price: number
-  amount: number
+  price: number // 最终单价（折扣/终审后；ADR-018）
+  amount: number // 最终金额（折扣/终审后；合同总额 = Σ 最终行金额）
+  // 原价快照（ADR-018 §2，PRICING-20261020）：下单时挂牌价快照，永不覆盖；存量订单为空（展示端按 price/amount 兜底）
+  origPrice?: number | null
+  origAmount?: number | null
+  // 服务期限（ADR-020，PRICING-20261020）：YYYY-MM-DD，下单人填、商务审核可改
+  serviceStart?: string | null
+  serviceEnd?: string | null
   status: ItemStatus
   locked?: boolean // 明细下单时刻是否真实加锁（存量数据 false）
   deliveryReq: string // 交付要求
@@ -274,6 +304,11 @@ export interface ContractItem {
   unit: string
   price: number
   amount: number
+  // 原价快照 / 服务期限（ADR-018/ADR-020，PRICING-20261020，与 ProjectItem 同构）
+  origPrice?: number | null
+  origAmount?: number | null
+  serviceStart?: string | null
+  serviceEnd?: string | null
   status: ItemStatus
   locked?: boolean // 下单时刻是否真实加锁
   deliveryReq: string
@@ -289,7 +324,12 @@ export interface Contract {
   customer: string // 合同客户（2026-10-20 ADR-013：「合同内同一产品主体」限制已移除）
   subject: string // 产品主体（由明细带出）
   contractAmount: number // 合同金额（元）
-  status: ProjectStatus // pending / active / delivered / terminated（与项目四态同构；ADR-012 pending=待审核）
+  // pending / active / delivering / delivered / terminated（与项目状态同构；ADR-012 pending=待审核；
+  // ADR-019 PRICING-20261020 新增 delivering=交付中）
+  status: ProjectStatus
+  // 时间节点（ADR-019，PRICING-20261020）：YYYY-MM-DD；存量合同为 null
+  signedDate?: string | null // 合同签订时间（商务填，录入即 active→delivering，不可清空）
+  scheduledDeliveryDate?: string | null // 预计交付时间（仅 admin 填，仅 delivering 可录/改/清空）
   remark: string
   items: ContractItem[]
   createdAt: string

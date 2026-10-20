@@ -12,8 +12,8 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Delete, InfoFilled, Sell, ShoppingCart } from '@element-plus/icons-vue'
-import { availableQty, entityShort, formatMoney, formatTokens, isAmountMode, rsItemName, type Asset, type CartItem, type RsItem } from '@/types'
-import { checkoutCart, clearCart, db, getAsset, patchCartItem, refresh, removeCartItem, rsItemById, setCartAmount, setCartQty, showError, type OrderFields } from '@/api'
+import { availableQty, entityShort, formatMoney, formatTokens, isAmountMode, priceRangeText, rsItemName, type Asset, type CartItem, type RsItem } from '@/types'
+import { checkoutCart, clearCart, db, getAsset, patchCartItem, refresh, removeCartItem, rsItemById, setCartAmount, setCartQty, setCartService, showError, type OrderFields } from '@/api'
 import SalesOrderDialog from '@/components/SalesOrderDialog.vue'
 import type { OrderItem } from '@/components/SalesOrderDialog.vue'
 import { isViewer } from '@/auth'
@@ -39,10 +39,12 @@ const cartRows = computed<CartRow[]>(() =>
       const asset = getAsset(c.assetId)
       const rsItem = c.itemId != null ? rsItemById(c.itemId) : undefined
       const isAmount = !!asset && !rsItem && isAmountMode(asset)
-      // 遥感明细行合计 = 明细单价（qty 恒 1）；amount 模式行 = 行内合同金额；unit 模式 = 单价×数量
-      // ADR-012：生态人员免填金额时，amount 行回退「挂牌价×数量」取整展示（与后端 checkout 回退口径一致）
+      // ADR-018 §3（PRICING-20261020）：行内销售金额（整数元）优先——
+      // amount 模式行 = 权威合同金额；unit/遥感明细行 = 折扣金额；
+      // 未填 = 原价成交：遥感行 = 明细单价（qty 恒 1）、amount 行回退「挂牌价×数量」取整
+      //（与后端 checkout 回退口径一致，ADR-012）、unit 行 = 单价×数量
       const amountFallback = Math.round((asset?.salePrice ?? 0) * c.qty)
-      const subtotal = rsItem ? rsItem.price : isAmount ? (c.amount ?? amountFallback) : (asset?.salePrice ?? 0) * c.qty
+      const subtotal = c.amount ?? (rsItem ? rsItem.price : isAmount ? amountFallback : (asset?.salePrice ?? 0) * c.qty)
       return { cart: c, asset, price: rsItem ? rsItem.price : asset?.salePrice ?? 0, subtotal, isAmount, rsItem }
     })
     .filter((r): r is CartRow => !!r.asset),
@@ -66,19 +68,63 @@ function onAmountInput(row: CartRow, v: string) {
   if (row.cart.amount) amountErrors.delete(row.cart.id)
 }
 
-/** 失焦提交：正整数校验通过后同步后端（400 时回滚到后端值） */
+/** 金额 tooltip 文案：amount 行 = 权威输入（必填/生态可空）；unit/遥感行 = 折扣金额（选填，超区间后端 400） */
+function amountTip(row: CartRow): string {
+  if (row.isAmount) {
+    return row.cart.amount
+      ? '包量定价：销售金额（整数元）为权威输入'
+      : isViewer.value
+        ? '留空按 挂牌价×数量 计价（整数元取整），商务确认订单时可再调整'
+        : '请填写销售金额（整数元）后方可结算'
+  }
+  return '选填：留空按原价成交（挂牌价×数量）；填写即折扣金额（整数元，须落在产品参考区间内）'
+}
+
+/** 金额输入占位：amount 行沿用原口径；unit/遥感行标注「选填」 */
+function amountPlaceholder(row: CartRow): string {
+  if (row.isAmount) return isViewer.value ? '整数元（可留空）' : '整数元'
+  return '整数元（选填）'
+}
+
+/** 失焦提交（ADR-018 §3，PRICING-20261020）：
+ *  - unit/遥感行：选填——留空 = 原价成交（不提交）；填写须为整数元（≥0），超参考区间由后端 400（文案走 showError）
+ *  - amount 行：整数元 > 0（商务必填；生态留空走挂牌价回退）
+ *  400 时回滚到后端值 */
 async function onAmountChange(row: CartRow) {
   const n = row.cart.amount
-  if (!n || !Number.isInteger(n) || n <= 0) {
+  if (n === undefined) {
+    if (row.isAmount && !isViewer.value) amountErrors.add(row.cart.id)
+    else amountErrors.delete(row.cart.id)
+    return
+  }
+  if (!Number.isInteger(n) || (row.isAmount ? n <= 0 : n < 0)) {
     amountErrors.add(row.cart.id)
     return
   }
   amountErrors.delete(row.cart.id)
   try {
-    // 回传该行当前 qty：后端 PUT 对 qty<=0 会删行，金额提交绝不能触发删除
+    // 回传该行当前 qty：后端 PUT 对 qty<=0 直接 400，且区间校验按新 qty 重算
     await setCartAmount(row.cart.id, row.cart.qty, n)
   } catch (e) {
     showError(e, '销售金额更新失败')
+    await refresh(true)
+  }
+}
+
+// ==================== 行级服务期限（ADR-020，PRICING-20261020：普通产品行填写，遥感行不展示） ====================
+/** 服务期限变更：PUT /cart/{id} 提交（回传 qty）；start > end 前端先拦，其余校验（格式/顺序）由后端 400 兜底 */
+async function onServiceChange(row: CartRow) {
+  const s = row.cart.serviceStart || null
+  const e = row.cart.serviceEnd || null
+  if (s && e && s > e) {
+    ElMessage.warning('服务开始日期不能晚于结束日期')
+    await refresh(true) // 回滚到后端值
+    return
+  }
+  try {
+    await setCartService(row.cart.id, row.cart.qty, s, e)
+  } catch (err) {
+    showError(err, '服务期限更新失败')
     await refresh(true)
   }
 }
@@ -87,20 +133,29 @@ async function onAmountChange(row: CartRow) {
  *  2026-10-20（ADR-016）：原按客户单键分组，与后端 checkout 的 (assetId, customer) 分组口径不一致
  *  （同产品多客户被静默合并为一条记录）；改为双键后「将生成 N 份销售记录」提示与落库一致 */
 const previewGroups = computed(() => {
-  const groups: { assetName: string; customer: string; qty: number; amount: number }[] = []
+  const groups: { assetName: string; customer: string; qty: number; amount: number; service?: string }[] = []
   const idx = new Map<string, number>()
+  const svcSets = new Map<number, Set<string>>()
   for (const r of cartRows.value) {
     const customer = (r.cart.customer ?? '').trim()
     if (!customer) continue
     const key = `${r.cart.assetId}::${customer}`
-    const i = idx.get(key)
+    let i = idx.get(key)
     if (i === undefined) {
-      idx.set(key, groups.length)
-      groups.push({ assetName: r.asset.name, customer, qty: r.cart.qty, amount: r.subtotal })
-    } else {
-      groups[i].qty += r.cart.qty
-      groups[i].amount += r.subtotal
+      i = groups.length
+      idx.set(key, i)
+      groups.push({ assetName: r.asset.name, customer, qty: 0, amount: 0 })
+      svcSets.set(i, new Set())
     }
+    groups[i].qty += r.cart.qty
+    groups[i].amount += r.subtotal
+    // ADR-020（PRICING-20261020）：组内行服务期限一致时在预览行简短展示（不影响分组逻辑）
+    if (r.cart.serviceStart || r.cart.serviceEnd) {
+      svcSets.get(i)!.add(`${r.cart.serviceStart || '-'} ~ ${r.cart.serviceEnd || '-'}`)
+    }
+  }
+  for (const [gi, set] of svcSets) {
+    if (set.size === 1) groups[gi].service = [...set][0]
   }
   return groups
 })
@@ -194,10 +249,11 @@ const orderItems = computed<OrderItem[]>(() =>
   cartRows.value.map((r) => ({
     asset: r.asset,
     qty: r.cart.qty,
-    // ADR-008：包量定价行携带行内合同金额（整数元）；ADR-012：生态人员留空时按挂牌价×数量占位展示
-    ...(r.isAmount ? { amount: r.cart.amount ?? Math.round((r.asset?.salePrice ?? 0) * r.cart.qty) } : {}),
+    // ADR-018 §3（PRICING-20261020）：已填销售金额的行（包量定价权威值 / unit 与遥感行折扣金额）携带 amount；
+    // 未填行不带（对话框按 单价×数量 占位展示，结算以后端 cart_items 持久化值为准）
+    ...(r.cart.amount != null ? { amount: r.cart.amount } : {}),
     // ADR-011：遥感明细行携带 itemId（数量恒 1，单价 = 明细 price）
-    ...(r.rsItem ? { itemId: r.rsItem.id, amount: r.rsItem.price } : {}),
+    ...(r.rsItem ? { itemId: r.rsItem.id } : {}),
   })),
 )
 
@@ -269,7 +325,7 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
       <!-- 提示条 -->
       <div class="info-bar">
         <el-icon aria-hidden="true"><InfoFilled /></el-icon>
-        <span>购物车可混装不同主体的产品，数量受产品「可用数量」约束：暂无可用数量的产品不可加入，超出可用数量的数量会被自动拦截；可重复售卖产品不受限。包量定价（Token）产品按包售卖，需为该行填写销售金额（整数元），结算以销售金额为准。点击「下单」前请为每件产品填写客户：下单后每个产品按客户各生成一条销售记录（同一产品卖给多个客户会拆成多条；不同主体的产品可同单混装），销售项目进入「待审核」并锁定数量，商务接手确认（可改价）后生效，再在项目详情页对销售记录执行「交付」即生成交付记录。</span>
+        <span>购物车可混装不同主体的产品，数量受产品「可用数量」约束：暂无可用数量的产品不可加入，超出可用数量的数量会被自动拦截；可重复售卖产品不受限。每行可填销售金额（整数元）：包量定价（Token）产品以销售金额为权威口径（商务必填，生态可留空按挂牌价×数量回退）；其余产品选填，留空按原价成交，填写即折扣金额（产品设了参考区间时须落在区间内）。普通产品行可填服务期限（开始/结束日期）。点击「下单」前请为每件产品填写客户：下单后每个产品按客户各生成一条销售记录（同一产品卖给多个客户会拆成多条；不同主体的产品可同单混装），销售项目进入「待审核」并锁定数量，商务接手确认（可改价）后生效，再在项目详情页对销售记录执行「交付」即生成交付记录。</span>
       </div>
 
       <!-- 表格卡 -->
@@ -337,30 +393,54 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
               <div v-else class="muted cart-qty-hint">可售 {{ availOf(row.asset) }}</div>
             </template>
           </el-table-column>
-          <!-- ADR-008：包量定价行销售金额（整数元，权威输入）；未填时该行结算禁用 -->
-          <el-table-column label="销售金额（元）" width="180" align="center">
+          <!-- ADR-018 §3（PRICING-20261020）：所有行（unit/amount/遥感）均可输销售金额（整数元）——
+               amount 行 = 权威输入（商务必填）；unit/遥感行 = 折扣金额（选填，超参考区间后端 400） -->
+          <el-table-column label="销售金额（元）" width="190" align="center">
             <template #default="{ row }">
-              <template v-if="row.isAmount">
-                <el-tooltip
-                  :content="row.cart.amount
-                    ? '包量定价：销售金额（整数元）为权威输入'
-                    : isViewer
-                      ? '留空按 挂牌价×数量 计价（整数元取整），商务确认订单时可再调整'
-                      : '请填写销售金额（整数元）后方可结算'"
-                  placement="top"
-                >
-                  <el-input
-                    :model-value="row.cart.amount ?? ''"
-                    :placeholder="isViewer ? '整数元（可留空）' : '整数元'"
+              <el-tooltip :content="amountTip(row)" placement="top">
+                <el-input
+                  :model-value="row.cart.amount ?? ''"
+                  :placeholder="amountPlaceholder(row)"
+                  size="small"
+                  :class="{
+                    'cart-amount-empty': row.isAmount && !isViewer && !row.cart.amount,
+                    'cart-customer-error': amountErrors.has(row.cart.id),
+                  }"
+                  @input="onAmountInput(row, $event)"
+                  @change="onAmountChange(row)"
+                />
+              </el-tooltip>
+              <!-- ADR-018：产品设了参考区间时展示区间提示（超区间提交由后端 400，文案走 showError） -->
+              <div v-if="priceRangeText(row.asset)" class="muted cart-amount-range">
+                参考区间 {{ priceRangeText(row.asset) }} 元/{{ row.asset.unit || '单位' }}
+              </div>
+            </template>
+          </el-table-column>
+          <!-- ADR-020（PRICING-20261020）：服务期限——普通产品行填写（变更即 PUT 提交）；
+               遥感明细行按期数售卖（期数即服务时间），不展示期限输入 -->
+          <el-table-column label="服务期限" width="215" align="center">
+            <template #default="{ row }">
+              <template v-if="!row.rsItem">
+                <div class="cart-service-row">
+                  <el-date-picker
+                    v-model="row.cart.serviceStart"
+                    type="date"
+                    value-format="YYYY-MM-DD"
                     size="small"
-                    :class="{
-                      'cart-amount-empty': !isViewer && !row.cart.amount,
-                      'cart-customer-error': amountErrors.has(row.cart.id),
-                    }"
-                    @input="onAmountInput(row, $event)"
-                    @change="onAmountChange(row)"
+                    placeholder="开始"
+                    style="width: 100%;"
+                    @change="onServiceChange(row)"
                   />
-                </el-tooltip>
+                  <el-date-picker
+                    v-model="row.cart.serviceEnd"
+                    type="date"
+                    value-format="YYYY-MM-DD"
+                    size="small"
+                    placeholder="结束"
+                    style="width: 100%;"
+                    @change="onServiceChange(row)"
+                  />
+                </div>
               </template>
               <span v-else class="muted">-</span>
             </template>
@@ -393,14 +473,13 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
       </el-card>
     </template>
 
-    <!-- 下单对话框（共用组件：主体只读 / 无行业 / ¥ 金额；购物车场景带按客户分组的结算预览）
-         cartMode：客户已在行级填写 → 对话框无「客户名称」字段，销售金额只读汇总，项目名称默认「采购订单」 -->
+    <!-- 下单对话框（ADR-020 PRICING-20261020：仅购物车结算确认模式——客户已在行级填写，
+         销售金额只读汇总，项目名称默认「采购订单」，带按（产品, 客户）分组的结算预览） -->
     <SalesOrderDialog
       v-model="orderVisible"
       title="购物车下单"
       :items="orderItems"
       :preview-groups="previewGroups"
-      :cart-mode="true"
       :loading="orderLoading"
       @submit="onOrderSubmit"
     />
@@ -435,6 +514,17 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
 .cart-qty-hint {
   font-size: 12px;
   margin-top: 4px;
+}
+/* ADR-018（PRICING-20261020）：参考区间提示行（金额输入框下方） */
+.cart-amount-range {
+  font-size: 12px;
+  margin-top: 4px;
+}
+/* ADR-020（PRICING-20261020）：服务期限双日期输入（开始/结束） */
+.cart-service-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 /* 空客户校验标红（EP 2.14 独立 el-input 无 validate 态，按 wrapper box-shadow 描边） */
 .cart-customer-error :deep(.el-input__wrapper) {

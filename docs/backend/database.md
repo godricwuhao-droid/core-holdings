@@ -5,6 +5,48 @@
 
 ---
 
+## 2026-10-20 变更（PRICING-20261020：价格体系 + 时间节点 + 服务期限，4 表 9 列，依据 ADR-018/019/020）
+
+### 新增列（全部可空，存量数据不迁移——旧数据 NULL 即兼容）
+
+| 列 | 类型 | 说明 |
+|---|---|---|
+| `assets.priceMin` | FLOAT NULL | 参考区间下限（元/份，ADR-018 §1）。行折扣单价（amount÷qty）须落在 [priceMin, priceMax]；NULL=未设置（不限制），只填其一=单边边界 |
+| `assets.priceMax` | FLOAT NULL | 参考区间上限（元/份）。两者都有时 min ≤ max（服务层校验，400） |
+| `cart_items.serviceStart` | VARCHAR(10) NULL | 服务开始日期 YYYY-MM-DD（ADR-020）。下单人填，checkout 透传落 project_items；遥感行不填；存量 NULL |
+| `cart_items.serviceEnd` | VARCHAR(10) NULL | 服务结束日期 YYYY-MM-DD。start ≤ end（服务层校验，400） |
+| `project_items.origPrice` | FLOAT NULL | 原价快照（元，ADR-018 §2）：下单时快照写入、**永不覆盖**。普通行=asset.salePrice；遥感行=rs_items.price；存量订单 NULL（展示端按 price 兜底） |
+| `project_items.origAmount` | FLOAT NULL | 原金额快照（元）：普通行=salePrice×qty；遥感行=同值。`price/amount` 语义=最终价（折扣/终审后） |
+| `project_items.serviceStart` | VARCHAR(10) NULL | 服务开始日期（ADR-020）。购物车透传 / 手动建单填写 / 审核 confirm 可改 |
+| `project_items.serviceEnd` | VARCHAR(10) NULL | 服务结束日期。start ≤ end |
+| `contracts.signedDate` | VARCHAR(10) NULL | 合同签订时间（ADR-019）：商务填（`PATCH /contracts/{id}`），录入即 active→delivering；录后可改、不可清空；存量 active 合同 NULL（上线后商务补录） |
+| `contracts.scheduledDeliveryDate` | VARCHAR(10) NULL | 预计交付时间（ADR-019）：仅 admin 填，仅 delivering 状态可录/改/清空 |
+
+> 注：本批次共 **10 个新列**（4 表：assets 2 + cart_items 2 + project_items 4 + contracts 2）。
+
+### 迁移语句（幂等，`main.py::_ensure_migration`）
+
+```sql
+ALTER TABLE assets ADD COLUMN priceMin FLOAT;
+ALTER TABLE assets ADD COLUMN priceMax FLOAT;
+ALTER TABLE cart_items ADD COLUMN serviceStart VARCHAR(10);
+ALTER TABLE cart_items ADD COLUMN serviceEnd VARCHAR(10);
+ALTER TABLE project_items ADD COLUMN origPrice FLOAT;
+ALTER TABLE project_items ADD COLUMN origAmount FLOAT;
+ALTER TABLE project_items ADD COLUMN serviceStart VARCHAR(10);
+ALTER TABLE project_items ADD COLUMN serviceEnd VARCHAR(10);
+ALTER TABLE contracts ADD COLUMN signedDate VARCHAR(10);
+ALTER TABLE contracts ADD COLUMN scheduledDeliveryDate VARCHAR(10);
+```
+
+### 迁移说明
+
+沿用 `inspect(engine).get_columns()` 检测 + `ALTER TABLE ADD COLUMN` 模式（SQLite 追加可空列，存量行自动 NULL，不触碰业务数据）；列已存在时 no-op，可重复启动。
+
+- **无数据迁移**：全部新列可空，旧数据 NULL 语义正确（未设区间=不限制、无原价快照=展示端按 price/amount 兜底、无期限/签订时间）；
+- 已在真实库副本验证：加列成功，各业务表行数不变（assets 28 / cart_items 3 / project_items 16 / contracts 15 / projects 6 / outbounds 0 / flows 162 / logs 507 / users 8 / rs_items 98）；
+- 存量 active 合同（如有）不做 signedDate 回填，上线后由商务经 `PATCH /contracts/{id}` 补录（补录前该合同交付入口被新守卫拦截：400「合同尚未录入签订时间，不可交付」）。
+
 ## 2026-10-20 变更（FIX-20261020-#7：outbounds 新增 projectItemId 列）
 
 ### 新增列

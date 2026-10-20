@@ -4,6 +4,103 @@
 
 ---
 
+## 2026-10-20 变更（PRICING-20261020 价格体系 + 时间节点 + 状态机 + 服务期限，⚠️ 部分行为变更）
+
+> 依据 ADR-018 / ADR-019 / ADR-020，前后端同批上线（契约见 api-contracts.md「PRICING-20261020 批次」）。
+
+### 新端点 `PATCH /api/contracts/{id}`（录入合同时间节点，ADR-019）
+
+权限：`require_order`（已认证）+ 服务层守卫——**viewer 直接 403**；`signedDate` 仅该单商务负责人（businessOwner）/admin；`scheduledDeliveryDate` **仅 admin**。
+
+请求：`PATCH /api/contracts/{id}`，body 两字段均可选（按字段分别校验，未传字段不处理）：
+
+```json
+{ "signedDate": "2026-10-20", "scheduledDeliveryDate": "2026-11-15" }
+```
+
+响应（200，更新后的 ContractOut，新增字段见下）：
+
+```json
+{"id": 23, "code": "HT-2026102014420888", "projectId": 7, "customer": "测试客户",
+ "subject": "主体A", "contractAmount": 46000, "status": "delivering",
+ "signedDate": "2026-10-20", "scheduledDeliveryDate": "2026-11-15",
+ "remark": "", "items": [], "createdAt": "2026-10-20", "updatedAt": "2026-10-20"}
+```
+
+关键字段：`status`（新增值 `delivering`「交付中」）、`signedDate`（合同签订时间，录入即 active→delivering）、`scheduledDeliveryDate`（预计交付时间）。
+
+| 场景 | 响应 |
+|---|---|
+| viewer 调用 | 403 `只读账号不可执行该操作` |
+| editor 非该单 businessOwner 录 signedDate | 403 `仅接手的商务负责人（{owner}）可录入合同签订时间，如需处理请先转交` |
+| 非 admin 录 scheduledDeliveryDate | 403 `仅管理员可录入预计交付时间` |
+| 合同非 active/delivering 录/改 signedDate（如 pending/delivered/terminated） | 400 `仅「合同签订中」状态的合同可录入/修改签订时间` |
+| signedDate 传 null/空清空（已有值） | 400 `签订时间录入后不可清空` |
+| 合同非 delivering 录/改/清空 scheduledDeliveryDate | 400 `仅「交付中」状态的合同可录入/修改/清空预计交付时间` |
+| 日期非 YYYY-MM-DD | 400 `合同签订时间格式须为 YYYY-MM-DD` / `预计交付时间格式须为 YYYY-MM-DD` |
+
+行为：录 `signedDate`（合同 active）→ 写入 + 合同 **active→delivering** + 项目重算 + 操作日志「录入合同签订时间」；录 `scheduledDeliveryDate` → 日志「录入预计交付时间」（可传 null 清空，可纠正）。
+
+### `PATCH /api/contracts/{id}/status` 状态机（ADR-019）
+
+合同状态：`pending → active（合同签订中）→ delivering（交付中）→ delivered`，terminated 各阶段可达。
+
+```
+                 录 signedDate                交付（扣量/流水/Outbound）
+  pending ──审核confirm──▶ active ──────────────▶ delivering ──────────────▶ delivered
+     │                        │                      │                          │
+     └────────────────────────┴─────── terminated ◀───┴──────────────────────────┘
+                          （撤销交付：delivered → delivering，signedDate 仍在）
+```
+
+| 场景 | 响应 |
+|---|---|
+| `active → delivered`（未录签订时间） | 400 `合同尚未录入签订时间，不可交付` |
+| 直接变更 `status=delivering` | 400 `「交付中」状态由录入合同签订时间自动触发，不可直接变更` |
+| `delivering → delivered` | 200（交付路径：扣量/流水/Outbound 在此发生，进入 delivering 不扣量） |
+| `delivered → terminated`（撤销交付） | 合同回 **delivering**（原回 active） |
+| `active → terminated` | 不变（释放锁定）；`delivering → terminated` 同样释放锁定 |
+
+项目派生（`_derive_project_status`）：全 pending→pending；全 delivered→delivered；含 terminated 且其余全 pending/terminated→terminated；**全部合同 ∈ {delivering, delivered}（全部已签）→ delivering（交付中）**；其余→active。
+
+### 产品参考价（`POST/PUT /assets`，ADR-018 §1）
+
+- 入参新增 `priceMin` / `priceMax`（number ≥ 0 | null，元/份，选填；只填其一 = 单边边界）。
+- 两者都有时 min ≤ max，否则 **400 `参考区间下限不能大于上限`**（PUT 按「存量值 + 本次 patch」组合值校验）。
+- 未设置区间 = 折扣不限制。
+
+### 购物车金额与区间校验（`PUT /cart/{id}`、`PATCH /cart/{id}`、`POST /cart`、`/cart/batch`、`/cart/checkout`，ADR-018 §3）
+
+- unit 模式行与遥感明细行 `amount` 放开（整数元 ≥ 0，可空）；**传入即采信（折扣）+ 区间校验，不传 = NULL（原价成交：unit 行 salePrice×qty；遥感行明细 price）**；amount 模式行口径不变（整数元权威，viewer 免填兜底不变）。
+- 校验：`amount/qty`（保留 6 位小数）须 ∈ [priceMin, priceMax]，超限 **400 `折扣单价超出该产品参考区间（{min}~{max} 元/{unit}）`**（单边区间按单边校验，文案 `≥{min} 元/{unit}` / `≤{max} 元/{unit}`）；非整数元 400 `销售金额须为非负整数元`。
+- 行更新时 + checkout 时双重校验（防绕过）。
+- 服务期限：上述行级入参新增 `serviceStart` / `serviceEnd`（YYYY-MM-DD，start ≤ end 否则 400 `服务开始日期不能晚于结束日期`）。
+
+### 下单落库（checkout / `POST /projects` / `POST /sales/order`，ADR-018 §2）
+
+- `ProjectItem` 新增 `origPrice` / `origAmount`（下单时原价快照，**永不覆盖**）：普通行 = asset.salePrice / salePrice×qty；遥感行 = rs_items.price / 同值。`price/amount` = 最终价（折扣/终审后）。
+- `ProjectItem` / 购物车行新增 `serviceStart` / `serviceEnd` 透传（手动建单不做区间校验——商务/管理员不受生态折扣约束）。
+
+### 审核（`POST /projects/{id}/review`，ADR-018 §4 + ADR-020）
+
+- confirm 行级入参新增 `serviceStart` / `serviceEnd`（可改服务期限，格式/顺序校验）。
+- ⚠️ **删除**终审改价回写 `assets.salePrice` 的逻辑：改价只写 ProjectItem.price/amount（orig 快照不动），挂牌价仅由产品管理维护。
+
+### `GET /api/bootstrap` 新增字段（均可空，存量数据为 null）
+
+- `assets[]`：`priceMin` / `priceMax`（number | null，元/份）
+- `cart[]`：`serviceStart` / `serviceEnd`（string 'YYYY-MM-DD' | null）
+- `projects[].items[]`：`origPrice` / `origAmount`（number | null）、`serviceStart` / `serviceEnd`
+- `contracts[]`：`signedDate` / `scheduledDeliveryDate`（'YYYY-MM-DD' | null）
+- `contracts[].status` / 项目 `status` 新增值 `delivering`（中文「交付中」）
+- viewer 过滤为行级（项目/合同/交付/流水/日志），对上述新字段无影响。
+
+### ⚠️ `POST /api/sales/order` deprecated（ADR-020）
+
+前端已移除「登记销售」入口，**购物车为唯一下单链路**；本端点保留兼容潜在直调方（折扣金额同样过区间校验），后续版本可能移除，请勿新增调用。
+
+---
+
 ## 2026-10-20 变更（CLEANUP-20261020 移除「生态人员基础资料」，⚠️ 接口下线 + bootstrap 字段移除）
 
 > 生态人员已由 `users` 表 + viewer 角色承载，`base_records`（kind='reps'）为无人消费的遗留数据，整体下线。前后端同批上线（契约见 api-contracts.md「CLEANUP-20261020 批次」）。

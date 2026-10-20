@@ -58,10 +58,17 @@ interface ReviewLine {
   qty: number
   unit: string
   mode: 'unit' | 'amount' | 'rs' // rs=遥感明细行（2026-10-20：金额可改，仅本单生效不回写明细单价）
+  // 原价快照（ADR-018 §2，PRICING-20261020）：下单时挂牌价快照，**只读不可改**；
+  // 存量订单 orig 为空 → 按当前 price/amount 兜底展示（ADR-018 Consequences）
   origPrice: number
   origAmount: number
   price: number | null // unit 模式可编辑（实际单价）
   amount: number | null // amount 模式可编辑（实际合同金额，整数元）
+  // 服务期限（ADR-020，PRICING-20261020）：confirm 可改（start ≤ end 后端 400 兜底）
+  serviceStart: string
+  serviceEnd: string
+  origServiceStart: string // 预填原值（变更检测用）
+  origServiceEnd: string
 }
 const reviewLines = ref<ReviewLine[]>([])
 const reviewBusy = ref(false)
@@ -79,9 +86,16 @@ watch(contracts, (cs) => {
         name: editItemName(it) + (rs ? ` · ${rsItemName(rs)}` : ''),
         qty: it.qty, unit: a?.unit || '',
         mode,
-        origPrice: it.price, origAmount: it.amount,
+        // ADR-018 §2（PRICING-20261020）：原价取下单时快照 origPrice/origAmount（只读）；
+        // 存量订单快照为空 → 按当前 price/amount 兜底（展示口径与 ADR 一致）
+        origPrice: it.origPrice ?? it.price, origAmount: it.origAmount ?? it.amount,
         price: it.price ?? null,
         amount: it.amount ?? null,
+        // ADR-020（PRICING-20261020）：服务期限预填（可改）
+        serviceStart: it.serviceStart ?? '',
+        serviceEnd: it.serviceEnd ?? '',
+        origServiceStart: it.serviceStart ?? '',
+        origServiceEnd: it.serviceEnd ?? '',
       }
     }),
   )
@@ -159,7 +173,7 @@ async function handleClaim() {
   }
 }
 
-/** 确认下单：校验 → 二次确认 → 提交（仅传改过的行；实际价同步写回平台挂牌价） */
+/** 确认下单：校验 → 二次确认 → 提交（仅传改过的行；ADR-018 §4：改价/期限只写本单，不回写平台挂牌价） */
 async function handleConfirm() {
   for (const l of reviewLines.value) {
     if (l.mode === 'unit' && !(l.price && l.price > 0)) {
@@ -180,7 +194,7 @@ async function handleConfirm() {
     await ElMessageBox.confirm(
       `确认项目「${proj.value?.name}」的订单？`
       + (hasPriceChange.value
-        ? '含单价/销售金额修改，确认后销售记录生效，实际价格将同步到平台产品单价。'
+        ? '含单价/销售金额/服务期限修改，确认后销售记录生效（终审价格仅作用于本订单，不回写平台产品单价）。'
         : '确认后销售记录正式生效（数量锁定保持不变）。'),
       '确认下单',
       { type: 'warning', confirmButtonText: '确认下单', cancelButtonText: '再检查一下' },
@@ -190,17 +204,25 @@ async function handleConfirm() {
   }
   reviewBusy.value = true
   try {
-    // 2026-10-20：rs 行（遥感明细）改价一并提交——后端只改本行金额，不回写明细单价
-    const items: { itemId: number; price?: number; amount?: number }[] = reviewLines.value
-      .filter((l) => (l.mode === 'unit' ? l.price !== l.origPrice : l.amount !== l.origAmount))
+    // 2026-10-20：rs 行（遥感明细）改价一并提交——后端只改本行金额，不回写明细单价；
+    // ADR-020（PRICING-20261020）：服务期限变更的行一并提交 serviceStart/serviceEnd（不传 = 保持原值）
+    const items: { itemId: number; price?: number; amount?: number; serviceStart?: string | null; serviceEnd?: string | null }[] = reviewLines.value
+      .filter((l) =>
+        (l.mode === 'unit' ? l.price !== l.origPrice : l.amount !== l.origAmount)
+        || l.serviceStart !== l.origServiceStart
+        || l.serviceEnd !== l.origServiceEnd,
+      )
       .map((l) => {
-        const base: { itemId: number; price?: number; amount?: number } = { itemId: l.id }
+        const base: { itemId: number; price?: number; amount?: number; serviceStart?: string | null; serviceEnd?: string | null } = { itemId: l.id }
         if (l.mode === 'unit') base.price = l.price ?? undefined
         else base.amount = l.amount ?? undefined
+        base.serviceStart = l.serviceStart || null
+        base.serviceEnd = l.serviceEnd || null
         return base
       })
     await reviewProject(projectId.value, { action: 'confirm', items })
-    ElMessage.success('订单已确认：项目转为进行中' + (items.length ? '，实际价格已同步到平台' : ''))
+    // ADR-018 §4（PRICING-20261020）：终审改价只写本单，不再回写平台挂牌价
+    ElMessage.success('订单已确认：项目转为进行中' + (items.length ? '，改价/期限仅作用于本订单' : ''))
     router.push(`/sales/projects/${projectId.value}/detail`)
   } catch (e) {
     showError(e, '确认下单失败')
@@ -299,7 +321,7 @@ const pageReady = computed(() => proj.value != null)
           <h1>订单审核 <span class="rh-name">{{ proj?.name }}</span></h1>
           <div class="desc">
             <span class="mono">{{ proj?.code }}</span>
-            · 待审核（数量已锁定）· 修改实际单价/销售金额后「确认下单」生效，实际价格将同步到平台产品单价；数量不可修改（需改数量请驳回重下）
+            · 待审核（数量已锁定）· 修改实际单价/销售金额/服务期限后「确认下单」生效（终审价格仅作用于本订单，不回写平台产品单价）；数量不可修改（需改数量请驳回重下）
           </div>
         </div>
         <div class="head-actions" v-if="!canReview">
@@ -325,7 +347,7 @@ const pageReady = computed(() => proj.value != null)
             <div>
               <div class="bh-title">订单审核<span class="muted" style="font-weight: 400;">（待审核 → 确认生效）</span></div>
               <div class="bh-sub">
-                修改实际单价 / 销售金额后「确认下单」，实际价格将同步到平台产品单价；
+                修改实际单价 / 销售金额 / 服务期限后「确认下单」（终审价格仅作用于本订单，不回写平台产品单价）；
                 数量不可修改（需改数量请驳回重下）；遥感明细行可改销售金额（仅本单生效，不回写产品「可售明细」单价）。
               </div>
             </div>
@@ -344,21 +366,37 @@ const pageReady = computed(() => proj.value != null)
                   </el-tooltip>
                   <span class="rv-line-qty muted">× {{ l.qty }}{{ l.unit }}</span>
                 </div>
+                <!-- ADR-018 §2（PRICING-20261020）：原价列只读——展示下单时挂牌价快照；
+                     存量订单 orig 为空时数据层已按当前 price/amount 兜底（见 reviewLines 展开逻辑），
+                     故此处恒展示，无需再判空 -->
                 <template v-if="l.mode === 'unit'">
+                  <span class="rv-lbl">原单价（元）</span>
+                  <span class="rv-orig muted">{{ formatMoney(l.origPrice) }}</span>
                   <span class="rv-lbl">实际单价（元）</span>
                   <el-input-number v-model="l.price" :min="0" :precision="2" :controls="false" class="rv-input" />
                   <span class="rv-amt">金额 {{ formatMoney(lineAmount(l)) }}</span>
                 </template>
                 <template v-else-if="l.mode === 'amount'">
+                  <span class="rv-lbl">原金额（元）</span>
+                  <span class="rv-orig muted">{{ formatMoney(l.origAmount) }}</span>
                   <span class="rv-lbl">销售金额（整数元）</span>
                   <el-input-number v-model="l.amount" :min="0" :precision="0" :step="1000" :controls="false" class="rv-input" />
                   <span v-if="l.qty > 0" class="rv-derived muted">参考单价 ≈ {{ (lineAmount(l) / l.qty).toFixed(2) }} 元/{{ l.unit || '个' }}</span>
                 </template>
                 <template v-else>
                   <!-- 2026-10-20：遥感明细行金额放开可改（仅本单生效，不回写产品明细单价） -->
+                  <span class="rv-lbl">原金额（元）</span>
+                  <span class="rv-orig muted">{{ formatMoney(l.origAmount) }}</span>
                   <span class="rv-lbl">销售金额（整数元）</span>
                   <el-input-number v-model="l.amount" :min="0" :precision="0" :step="1000" :controls="false" class="rv-input" />
                   <span v-if="l.qty > 0" class="rv-derived muted">参考单价 ≈ {{ (lineAmount(l) / l.qty).toFixed(2) }} 元/{{ l.unit || '份' }}（明细单价不回写）</span>
+                </template>
+                <!-- ADR-020（PRICING-20261020）：服务期限可改（普通行；遥感明细行按期数售卖不展示） -->
+                <template v-if="l.mode !== 'rs'">
+                  <span class="rv-lbl">服务期限</span>
+                  <el-date-picker v-model="l.serviceStart" type="date" value-format="YYYY-MM-DD" size="small" placeholder="开始" class="rv-date" />
+                  <span class="muted">~</span>
+                  <el-date-picker v-model="l.serviceEnd" type="date" value-format="YYYY-MM-DD" size="small" placeholder="结束" class="rv-date" />
                 </template>
               </div>
             </div>
@@ -514,6 +552,17 @@ const pageReady = computed(() => proj.value != null)
   font-size: 13px;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
+}
+/* ADR-018 §2（PRICING-20261020）：原价只读列（弱于可编辑列） */
+.rv-orig {
+  flex-shrink: 0;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+/* ADR-020（PRICING-20261020）：服务期限日期输入 */
+.rv-date {
+  width: 140px;
+  flex-shrink: 0;
 }
 .rv-derived {
   font-size: 12px;

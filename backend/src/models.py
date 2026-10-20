@@ -28,6 +28,11 @@ class Asset(Base):
     # 业务计算一律用 decimal.Decimal（见 services.py），Decimal↔float 转换收敛在
     # ORM 边界（写入前 float()、读取后按需 Decimal(str(x))），模型层保持 Float 不动。
     salePrice: Mapped[float] = mapped_column(Float, default=0)  # 元
+    # 参考区间（ADR-018 §1，PRICING-20261020）：元/份，商务/管理员在产品页维护（选填）。
+    # 行折扣单价（amount÷qty）须落在 [priceMin, priceMax] 内；未设置 = 不限制，
+    # 只填其一 = 单边边界。存量数据 NULL（即不限制）。
+    priceMin: Mapped[float | None] = mapped_column(Float, nullable=True)
+    priceMax: Mapped[float | None] = mapped_column(Float, nullable=True)
     soldAmount: Mapped[float] = mapped_column(Float, default=0)  # 元
     soldCount: Mapped[int] = mapped_column(Integer, default=0)
     # 计价模式（ADR-008）：'unit'（默认，单价×数量）| 'amount'（包量金额整数元权威）。
@@ -119,7 +124,15 @@ class Contract(Base):
     # 签约主体：建合同时从合同内产品主体推导（合同内强制同主体）
     subject: Mapped[str] = mapped_column(String(128), default="")
     contractAmount: Mapped[float] = mapped_column(Float, default=0)  # 元（ADR-006）
-    status: Mapped[str] = mapped_column(String(32), default="active", index=True)  # active/delivered/terminated
+    # 合同状态（ADR-019 扩展，PRICING-20261020）：
+    # pending（待审核）→ active（合同签订中）→ delivering（交付中，录 signedDate 自动进入）
+    # → delivered（已交付）；terminated 各阶段可达
+    status: Mapped[str] = mapped_column(String(32), default="active", index=True)  # active/delivering/delivered/terminated
+    # 合同签订时间（ADR-019，PRICING-20261020）：商务填（YYYY-MM-DD），录入即 active→delivering；
+    # 录后可改、不可清空；存量 active 合同为 NULL（上线后由商务补录）
+    signedDate: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    # 预计交付时间（ADR-019，PRICING-20261020）：仅 admin 填（YYYY-MM-DD），仅 delivering 可录/改/清空
+    scheduledDeliveryDate: Mapped[str | None] = mapped_column(String(10), nullable=True)
     remark: Mapped[str] = mapped_column(Text, default="")
     createdAt: Mapped[str] = mapped_column(String(32), default="")
     updatedAt: Mapped[str] = mapped_column(String(32), default="")
@@ -141,8 +154,13 @@ class ProjectItem(Base):
     assetId: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     qty: Mapped[int] = mapped_column(Integer, default=0)
     unit: Mapped[str] = mapped_column(String(32), default="")
-    price: Mapped[float] = mapped_column(Float, default=0)  # 元（ADR-006）
-    amount: Mapped[float] = mapped_column(Float, default=0)  # 元（= price × qty，Decimal 重算）
+    price: Mapped[float] = mapped_column(Float, default=0)  # 元（ADR-006）；语义=最终价（折扣/终审后，ADR-018）
+    amount: Mapped[float] = mapped_column(Float, default=0)  # 元（= price × qty，Decimal 重算）；语义=最终行金额
+    # 原价快照（ADR-018 §2，PRICING-20261020）：下单时快照写入、**永不覆盖**——
+    # unit/amount 行 = asset.salePrice / salePrice×qty；遥感行 = rs_items.price / 同值。
+    # 存量订单为 NULL（展示端按 price/amount 兜底显示）。
+    origPrice: Mapped[float | None] = mapped_column(Float, nullable=True)  # 元
+    origAmount: Mapped[float | None] = mapped_column(Float, nullable=True)  # 元
     status: Mapped[str] = mapped_column(String(32), default="pending_asset", index=True)
     deliveryReq: Mapped[str] = mapped_column(Text, default="")
     # 下单时刻该产品是否真实加锁（= 非 repeatSale）。存量数据默认 False（未锁过，语义正确）。
@@ -155,6 +173,10 @@ class ProjectItem(Base):
     # 遥感数据明细（ADR-011）：非空时本行售卖的是 rs_items 明细（qty 恒 1，金额=明细 price 权威）；
     # 存量/非遥感行恒 NULL
     itemId: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    # 服务期限（ADR-020，PRICING-20261020）：YYYY-MM-DD，下单人填、商务审核可改；
+    # 遥感行按期数 saleMonth 售卖不填期限；存量行 NULL
+    serviceStart: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    serviceEnd: Mapped[str | None] = mapped_column(String(10), nullable=True)
 
     project: Mapped["Project"] = relationship(back_populates="items")
     contract: Mapped["Contract | None"] = relationship(back_populates="items")
@@ -347,6 +369,10 @@ class CartItem(Base):
     # DB 兜底：唯一索引 uq_cart_items_key 在 main._ensure_unique_indexes 以
     # COALESCE(itemId, 0) 表达式幂等补建（SQLite 唯一索引不认 NULL 相等；0 为不可能的主键值）。
     itemId: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    # 服务期限（ADR-020，PRICING-20261020）：YYYY-MM-DD，下单人填，checkout 透传落 project_items；
+    # 遥感行不填期限（期数即服务时间）；存量行 NULL
+    serviceStart: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    serviceEnd: Mapped[str | None] = mapped_column(String(10), nullable=True)
     createdAt: Mapped[str] = mapped_column(String(32), default="")
     updatedAt: Mapped[str] = mapped_column(String(32), default="")
 

@@ -2,6 +2,36 @@
 
 > 记录 core-holdings 前端（Vue3 + TS + Element Plus + Vite）的页面/组件/接口封装变更。
 
+## 2026-10-20 ｜ 新增：价格体系（区间/折扣）+ 合同时间节点 + 交付中状态机 + 服务期限（PRICING-20261020）
+
+**关联任务**：PRICING-20261020；契约见 `docs/api-contracts.md`「PRICING-20261020 批次」；决策依据 ADR-018（价格区间/原价快照/终审不回写）、ADR-019（合同签订/预计交付时间 + delivering 状态机）、ADR-020（服务期限 + 下单入口收口购物车）。本章节覆盖上一轮已完成项 + 中断后补做项（11 小项）。
+
+| 日期 | 类型 | 变更内容 | 影响文件范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-20 | 新增 | 类型层：`Asset.priceMin/priceMax`（参考区间，元/份，可单边）+ `priceRangeText` 展示文本；`CartItem/ProjectItem` 新增 `serviceStart/serviceEnd`（YYYY-MM-DD）；`ProjectItem` 新增 `origPrice/origAmount` 原价快照（下单时挂牌价，永不覆盖，存量空）；`Contract` 新增 `signedDate/scheduledDeliveryDate`；`ProjectStatus` 新增 `delivering`（「交付中」，橙 tag）并更新 `PROJECT_STATUS/PROJECT_FLOW` | types.ts | PRICING-20261020 | ADR-018/019/020；bootstrap 新字段均为可空 |
+| 2026-10-20 | 新增 | API 层：`AssetInput` 加 `priceMin/priceMax`（未设 → null 区分）；`ProjectItemInput` 加 `serviceStart/serviceEnd`；新增 `patchContractFields`（PATCH /contracts/{id}：signedDate 商务录后 active→delivering 不可清空；scheduledDeliveryDate 仅 admin、可 null 清空）；`reviewProject` confirm 行级支持 `serviceStart/serviceEnd`；新增 `setCartService`（PUT /cart/{id} 服务期限） | api/index.ts | PRICING-20261020 | 403/400 文案由后端 detail 给出，走 showError 统一提示 |
+| 2026-10-20 | 新增 | 产品创建/编辑页「参考价格区间」双输入（下限 ~ 上限，选填可单边，回显未设留空） | views/assets/create.vue | PRICING-20261020 | ADR-018；min ≤ max 后端 400 兜底 |
+| 2026-10-20 | 修改 | 产品列表/详情单价展示：有参考区间时追加「（参考区间 {min}~{max}）」，无区间维持原展示（列表列与详情同口径） | views/assets/{list,detail}.vue | PRICING-20261020 | ADR-018 |
+| 2026-10-20 | 删除 | 「登记销售」直接下单入口移除：产品详情/列表的登记销售按钮及 SalesOrderDialog 非购物车分支整体删除，`createSaleOrder`（POST /sales/order）前端调用一并删除；下单统一收口购物车 | views/assets/{list,detail}.vue, components/SalesOrderDialog.vue, api/index.ts | PRICING-20261020 | ADR-020；后端端点保留并标记 deprecated |
+| 2026-10-20 | 新增 | 购物车：所有行（unit/amount/遥感）可输销售金额（整数元，失焦提交，空 = 原价成交），金额输入下追加参考区间提示；普通产品行新增服务期限双日期输入（变更即 PUT 提交，遥感行不展示）；结算预览行展示组内一致的服务期限 | views/cart/index.vue, components/SalesOrderDialog.vue | PRICING-20261020 | ADR-018 §3 / ADR-020；区间校验（amount/qty ∈ [min,max]）后端 400 兜底 |
+| 2026-10-20 | 新增 | 建单页：明细表新增「服务期限」列（普通行双日期选填，遥感行不展示）；校验 start ≤ end；payload 随明细提交（空 → null）；重新提交（?copy=）预填带出旧单期限与原价快照（只读展示，不提交）；编辑模式只读概览行展示原价 | views/sales/projects/create.vue | PRICING-20261020 | ADR-018 §2 / ADR-020 |
+| 2026-10-20 | 新增 | 审核页数据层：`ReviewLine` 扩展 `origPrice/origAmount`（下单快照只读，存量空 → 按当前 price/amount 兜底）与 `serviceStart/serviceEnd`（预填可改 + orig 变更检测） | views/sales/projects/review.vue | PRICING-20261020 | 上一轮完成；UI 展示为本次补做 |
+| 2026-10-20 | 新增 | 【补做】审核页四列改价 UI：unit 行加「原单价（只读）」列 + 保留「实际单价（可编辑）」；amount/遥感行加「原金额（只读）」+ 保留「销售金额（可编辑）」；存量订单 orig 为空时数据层已按现值兜底，故恒展示（注释说明） | views/sales/projects/review.vue | PRICING-20261020 | ADR-018 §2 |
+| 2026-10-20 | 新增 | 【补做】审核页服务期限编辑：普通行加开始/结束双日期输入（el-date-picker value-format YYYY-MM-DD），遥感行（itemId 非空）不展示；confirm payload 行级追加 `serviceStart/serviceEnd`（期限变更的行一并提交，不传 = 保持原值） | views/sales/projects/review.vue | PRICING-20261020 | ADR-020；start ≤ end 后端 400 兜底 |
+| 2026-10-20 | 修改 | 【补做】审核页过期文案清理：页头说明/面板说明/确认弹窗/成功 toast 中「实际价格将同步到平台产品单价」「实际价格已同步到平台」全部删除，改为「终审价格仅作用于本订单（不回写平台产品单价）」 | views/sales/projects/review.vue | PRICING-20261020 | ADR-018 §4：终审改价回写 assets.salePrice 的逻辑后端已删除 |
+| 2026-10-20 | 修改 | 【补做】项目详情合同卡时间：「签约/锁定」改名「下单时间」；新增「合同签订」（signedDate，空显「未签订」）与「预计交付」（scheduledDeliveryDate，空显「未录入」）两个展示项（布局沿用 contract-info） | views/sales/projects/detail.vue | PRICING-20261020 | ADR-019 |
+| 2026-10-20 | 新增 | 【补做】项目详情合同卡按钮：active 分支加「录入签订时间」（商务 canWrite 可见，日期小弹窗 .dlg-form → `patchContractFields(id, { signedDate })`，录入即转交付中、不可清空）；新增 `delivering` 分支（置于 v-else 兜底之前，修复原落入「已终止」文案）——「交付」+「终止」沿用既有调用与确认流程，另加 **admin 专属**「预计交付时间」按钮（日期弹窗 → `patchContractFields(id, { scheduledDeliveryDate })`，已有值可不选日期保存以清空，payload 传 null） | views/sales/projects/detail.vue | PRICING-20261020 | ADR-019；delivering 卡片左侧色条补橙（与状态 tag 同色板） |
+| 2026-10-20 | 新增 | 【补做】项目详情合同明细表加「服务期限」列（`serviceStart ~ serviceEnd`，空显 `-`，遥感行展示为空） | views/sales/projects/detail.vue | PRICING-20261020 | ADR-020 |
+| 2026-10-20 | 修改 | 【补做】状态文案同步：详情页销售记录清单派生说明、列表页 info-bar 补「交付中」环节（录入签订时间后转交付中、已交付终止回退交付中）；交付记录页撤销交付回退文案「进行中」→「交付中」（2 处） | views/sales/projects/{detail,index}.vue, views/sales/outbound/index.vue | PRICING-20261020 | ADR-019：撤销后合同回 delivering（signedDate 仍在） |
+| 2026-10-20 | 删除 | 【补做】建单页残留清理：toast「遥感数据请通过产品列表加购或详情页登记销售」删「或详情页登记销售」；`?assetId` 预填死代码（onMounted 块 + 头部注释）删除（已确认 router 无该 query 入口，仅 `?copy=` 保留） | views/sales/projects/create.vue | PRICING-20261020 | ADR-020 |
+
+### 验证
+
+- `npx vue-tsc --noEmit` 0 error（strict + noUnusedLocals）；IDE 诊断 0。
+- `patchContractFields` 前端调用 2 处：signedDate（active 分支「录入签订时间」）+ scheduledDeliveryDate（delivering 分支 admin「预计交付时间」，含 null 清空路径）。
+- 全局 grep：「登记销售」仅剩删除说明性注释（assets/cart/components/api 中标注入口已移除），无可用入口残留；「同步到平台产品单价」/「已同步到平台」文案无残留；`route.query.assetId` 无残留。
+- 未修改 backend/ 下任何文件；未 commit。
+
 ## 2026-10-20 ｜ 修复：viewer「重新提交」被创建按钮禁用拦截（FIX-RESUBMIT）
 
 **关联任务**：FIX-RESUBMIT（FIX-20261020 回归修复）；后端 `POST /projects/{id}/resubmit` 权限口径见 `docs/backend/api.md`（require_order + creator 归属校验）。

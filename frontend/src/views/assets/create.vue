@@ -58,6 +58,9 @@ const form = reactive({
   quantity: 1,
   repeatSale: false,
   salePrice: 0,
+  // 参考价格区间（ADR-018，PRICING-20261020）：选填，可单边；下单折扣区间校验用
+  priceMin: undefined as number | undefined,
+  priceMax: undefined as number | undefined,
   status: 'in_stock' as AssetStatus,
   inboundDate: today(),
   expiryDate: '',
@@ -134,6 +137,9 @@ function loadAsset() {
     quantity: a.quantity,
     repeatSale: a.repeatSale,
     salePrice: a.salePrice,
+    // ADR-018（PRICING-20261020）：参考区间回显（未设为 null → 输入框留空）
+    priceMin: a.priceMin ?? undefined,
+    priceMax: a.priceMax ?? undefined,
     status: a.status,
     inboundDate: a.inboundDate,
     expiryDate: a.expiryDate,
@@ -191,9 +197,11 @@ async function handleSubmit() {
   submitting.value = true
   // ADR-011：遥感容器产品兜底——数量=明细数派生、单价在明细上，后端 AssetIn 对 quantity 有 >0 校验，
   // 故传 quantity:1 / salePrice:0，单位与 constants.ts CATEGORY_UNITS 遥感条目一致；其余类型行为不变
+  // ADR-018（PRICING-20261020）：参考区间 undefined → null（后端可空字段，区分「未设」）
+  const priceRange = { priceMin: form.priceMin ?? null, priceMax: form.priceMax ?? null }
   const payload: AssetInput = isRemote.value
-    ? { ...form, name: form.name, quantity: 1, salePrice: 0, unit: '份（可售明细）' }
-    : { ...form, name: form.name }
+    ? { ...form, ...priceRange, name: form.name, quantity: 1, salePrice: 0, unit: '份（可售明细）' }
+    : { ...form, ...priceRange, name: form.name }
   try {
     if (isEdit.value) {
       await updateAsset(assetId.value, payload)
@@ -328,6 +336,18 @@ onMounted(async () => {
             <el-form-item label="销售单价（元）" prop="salePrice">
               <el-input-number v-model="form.salePrice" :min="0" :precision="2" style="width: 100%;" />
             </el-form-item>
+            <!-- ADR-018（PRICING-20261020）：参考价格区间——元/{unit}，选填（可单边），
+                 下单时行折扣单价（销售金额÷数量）须落在区间内，超区间后端 400 -->
+            <el-form-item label="参考价格区间（元）">
+              <div class="price-range-row">
+                <el-input-number v-model="form.priceMin" :min="0" :precision="2" :controls="false" placeholder="下限（选填）" style="width: 100%;" />
+                <span class="muted price-range-sep">~</span>
+                <el-input-number v-model="form.priceMax" :min="0" :precision="2" :controls="false" placeholder="上限（选填）" style="width: 100%;" />
+              </div>
+              <div class="muted" style="font-size: 12px; margin-top: 4px;">
+                元/{{ form.unit || '单位' }}，选填（可只填一边）；下单折扣区间校验用，未设置则不限制
+              </div>
+            </el-form-item>
             <!-- ADR-008：包量定价说明（浅蓝提示条） -->
             <div v-if="isAmount" class="info-bar soft">
               Token 产品按包量售卖，下单时以销售金额（整数元）为准，参考单价不参与计价
@@ -442,6 +462,17 @@ onMounted(async () => {
 /* 遥感提示条（ADR-011：位于基本信息 grid 内、产品类型正下方），下边距与表单行距一致 */
 .form-grid .info-bar {
   margin-bottom: 18px;
+}
+
+/* ADR-018（PRICING-20261020）：参考价格区间双输入（下限 ~ 上限） */
+.price-range-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+.price-range-sep {
+  flex-shrink: 0;
 }
 
 /* 可重复售卖警示行：紧跟开关下方，muted 12px */

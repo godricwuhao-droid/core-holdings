@@ -9,7 +9,7 @@
  * 允许一份合同内混合不同主体的产品明细）。
  * 编辑：只改基本信息（合同结构不可改——终止对应合同后重新下单）。
  * 项目状态由合同状态派生，本页不提供状态变更入口。
- * 从产品详情「登记销售」跳转时，自动同步带入 产品 + 单价 + 可售数量。
+ * 2026-10-20（ADR-020）：产品「登记销售」直接下单入口已移除，下单统一走购物车（本页 assetId 预填死代码同步删除）。
  */
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
@@ -99,6 +99,13 @@ interface ContractDraftItem {
   price: number
   amount: number
   deliveryReq: string
+  // 服务期限（ADR-020，PRICING-20261020）：YYYY-MM-DD，普通行填写；遥感行不展示（期数即服务时间）
+  serviceStart: string
+  serviceEnd: string
+  // 原价快照（ADR-018 §2，PRICING-20261020）：仅重新提交预填时带出旧单值用于展示（只读，不提交）；
+  // 手动新建时 orig 尚未落库（为空）
+  origPrice?: number | null
+  origAmount?: number | null
 }
 
 interface ContractDraft {
@@ -112,7 +119,8 @@ interface ContractDraft {
 const contracts = reactive<ContractDraft[]>([])
 
 function newItem(): ContractDraftItem {
-  return { assetId: null, qty: 0, price: 0, amount: 0, deliveryReq: '' }
+  // ADR-020（PRICING-20261020）：服务期限默认空（选填，start ≤ end 由后端 400 兜底）
+  return { assetId: null, qty: 0, price: 0, amount: 0, deliveryReq: '', serviceStart: '', serviceEnd: '' }
 }
 
 function addContract() {
@@ -187,10 +195,10 @@ function contractItemsTotal(c: ContractDraft): number {
  */
 function onItemAssetChange(c: ContractDraft, it: ContractDraftItem) {
   const a = it.assetId ? getAsset(it.assetId) : undefined
-  // ADR-011：遥感数据父产品不可手工加行（明细只经购物车/登记销售进入），toast 拦截并回退选择；
+  // ADR-011：遥感数据父产品不可手工加行（明细只经购物车进入，ADR-020：登记销售入口已移除），toast 拦截并回退选择；
   // 2026-10-20 例外：重新提交预填的遥感明细行（it.itemId 非空）允许保留/改选同产品
   if (a?.type === '遥感数据' && it.itemId == null) {
-    ElMessage.info('遥感数据请通过产品列表加购或详情页登记销售')
+    ElMessage.info('遥感数据请通过产品列表加购')
     it.assetId = null
     it.price = 0
     it.amount = 0
@@ -418,6 +426,11 @@ function validateContracts(): boolean {
         ElMessage.warning('销售金额须为整数元')
         return false
       }
+      // ADR-020（PRICING-20261020）：服务期限 start ≤ end（后端同口径 400，前端先拦）
+      if (it.serviceStart && it.serviceEnd && it.serviceStart > it.serviceEnd) {
+        ElMessage.warning('服务开始日期不能晚于结束日期')
+        return false
+      }
     }
   }
   return true
@@ -437,6 +450,9 @@ function buildContractsPayload(): ContractInput[] {
         amount: it.amount,
         deliveryReq: it.deliveryReq,
         ...(it.itemId != null ? { itemId: it.itemId } : {}), // 2026-10-20：重新提交预填的遥感明细行
+        // ADR-020（PRICING-20261020）：服务期限随明细提交（空 → null；start ≤ end 后端校验）
+        serviceStart: it.serviceStart || null,
+        serviceEnd: it.serviceEnd || null,
       })),
   }))
 }
@@ -465,7 +481,7 @@ function buildPayload(withContracts: boolean): ProjectInput {
   return base
 }
 
-/** 预填：编辑模式带出项目基本信息；从产品「登记销售」跳转时带 assetId（同步产品+单价+可售数量） */
+/** 预填：编辑模式带出项目基本信息；重新提交模式带出原单合同明细 */
 onMounted(async () => {
   await refresh()
   // 生态人员（viewer）：仅可编辑自己下单的项目；新建仅「重新提交」模式放行（?copy=，
@@ -554,6 +570,12 @@ onMounted(async () => {
           price: it.price,
           amount: it.amount,
           deliveryReq: it.deliveryReq ?? '',
+          // ADR-020（PRICING-20261020）：服务期限带出旧值可改
+          serviceStart: it.serviceStart ?? '',
+          serviceEnd: it.serviceEnd ?? '',
+          // ADR-018 §2：原价快照带出旧单值（仅展示，不提交；新单 orig 由后端下单时重新快照）
+          origPrice: it.origPrice ?? null,
+          origAmount: it.origAmount ?? null,
         })),
       }
       contracts.push(draft)
@@ -577,21 +599,8 @@ onMounted(async () => {
     contracts[0].customer = preCustomer
     form.name = preCustomer
   }
-  const assetId = Number(route.query.assetId)
-  if (assetId) {
-    const a = getAsset(assetId)
-    const it: ContractDraftItem = {
-      assetId,
-      // 可重复售卖 availableQty 为 null，预填默认 1
-      qty: a ? (availableQty(a) ?? 1) : 1,
-      // ADR-008：包量定价产品单价为参考值不预填，合同金额待填（整数元）
-      price: a && isAmountMode(a) ? 0 : a?.salePrice || 0,
-      amount: 0,
-      deliveryReq: '',
-    }
-    contracts[0].items[0] = it
-    calcItemAmount(contracts[0], it)
-  }
+  // 2026-10-20（ADR-020）：原「登记销售」入口的 ?assetId 预填死代码已删除
+  //（产品详情/列表下单入口统一收口购物车，router 已无该 query 入口，无其他调用路径）
 })
 
 /** 保存草稿：仅要求项目名称，后端强制状态为「待审核」（ADR-012 修订：所有角色建单统一 pending） */
@@ -786,6 +795,8 @@ function handleCancel() {
                   </el-tooltip>
                   <span class="ro-ct-qty muted">× {{ it.qty }}</span>
                   <span class="ro-ct-amt">{{ formatMoney(it.amount) }}</span>
+                  <!-- ADR-018 §2（PRICING-20261020）：原价快照（下单时挂牌价，只读；存量订单为空不展示） -->
+                  <span v-if="it.origAmount != null" class="muted ro-ct-orig">原价 {{ formatMoney(it.origAmount) }}</span>
                 </div>
               </div>
             </div>
@@ -980,6 +991,36 @@ function handleCancel() {
                       @change="calcItemAmount(c, row)"
                     />
                     <span v-else class="item-amount">{{ formatMoney(row.amount) }}</span>
+                    <!-- ADR-018 §2（PRICING-20261020）：原价快照——仅重新提交预填（旧单有 orig）时展示；
+                         手动新建时 orig 尚未落库（为空），不展示 -->
+                    <div v-if="row.origAmount != null" class="muted item-orig">原价 {{ formatMoney(row.origAmount) }}</div>
+                  </template>
+                </el-table-column>
+                <!-- ADR-020（PRICING-20261020）：服务期限——普通行填写（选填）；
+                     遥感明细行按期数售卖（期数即服务时间），不展示期限输入 -->
+                <el-table-column label="服务期限" width="220" align="center">
+                  <template #default="{ row }">
+                    <template v-if="row.itemId == null">
+                      <div class="svc-row">
+                        <el-date-picker
+                          v-model="row.serviceStart"
+                          type="date"
+                          value-format="YYYY-MM-DD"
+                          size="small"
+                          placeholder="开始（选填）"
+                          style="width: 100%;"
+                        />
+                        <el-date-picker
+                          v-model="row.serviceEnd"
+                          type="date"
+                          value-format="YYYY-MM-DD"
+                          size="small"
+                          placeholder="结束（选填）"
+                          style="width: 100%;"
+                        />
+                      </div>
+                    </template>
+                    <span v-else class="muted">-</span>
                   </template>
                 </el-table-column>
                 <el-table-column label="" width="60" align="center">
@@ -1255,6 +1296,17 @@ function handleCancel() {
   font-weight: 600;
   color: var(--text-primary);
 }
+/* ADR-018 §2（PRICING-20261020）：原价快照小字（金额列下方，仅重新提交预填展示） */
+.item-orig {
+  font-size: 12px;
+  margin-top: 4px;
+}
+/* ADR-020（PRICING-20261020）：服务期限双日期输入（开始/结束） */
+.svc-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
 
 .total-value {
   font-size: 15px;
@@ -1379,6 +1431,11 @@ function handleCancel() {
   flex-shrink: 0;
   color: var(--text-secondary);
   font-variant-numeric: tabular-nums;
+}
+/* ADR-018 §2（PRICING-20261020）：原价快照小字（只读概览行内） */
+.ro-ct-orig {
+  font-size: 12px;
+  flex-shrink: 0;
 }
 
 /* ============ 订单审核面板（ADR-012，待审核项目） ============ */
