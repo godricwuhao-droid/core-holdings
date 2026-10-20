@@ -11,7 +11,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Close, Delete, InfoFilled, ShoppingCart } from '@element-plus/icons-vue'
+import { Delete, InfoFilled, ShoppingCart } from '@element-plus/icons-vue'
 import { availableQty, entityShort, formatMoney, formatTokens, isAmountMode, priceRangeText, rsItemName, type Asset, type CartItem, type RsItem } from '@/types'
 import { checkoutCart, clearCart, db, getAsset, patchCartItem, refresh, removeCartItem, rsItemById, setCartAmount, setCartQty, setCartService, showError, type OrderFields } from '@/api'
 import SalesOrderDialog from '@/components/SalesOrderDialog.vue'
@@ -400,40 +400,57 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
         <el-table :data="cartRows" stripe>
           <el-table-column label="产品名称" min-width="240" align="left">
             <template #default="{ row }">
-              <!-- 2026-10-22 视觉优化：借鉴 demo 产品图标——名称左侧 42px 渐变圆角图标块（按类型区分字符） -->
-              <div class="cart-product">
-                <div class="cart-product-icon" aria-hidden="true">{{ typeIcon(row.asset.type) }}</div>
-                <div class="cart-product-info">
-                  <!-- ADR-011：遥感明细行两行展示——主行父产品名，次级行明细名（省/市 精度 月份） -->
-                  <a class="cart-asset-name" @click="goAssetDetail(row.asset.id)">{{ row.asset.name }}</a>
-                  <div v-if="row.rsItem" class="muted cart-asset-sub">{{ rsItemName(row.rsItem) }}</div>
-                  <div v-else class="muted cart-asset-sub">{{ row.asset.code }} · {{ row.asset.type }} · {{ entityShort(row.asset.subject) }}</div>
+              <!-- 2026-10-23 修复①：统一单元格结构（主内容区 40px 垂直居中 + 副提示区 18px 占位），
+                   保证所有行等高、各列输入框水平对齐 -->
+              <div class="cart-cell">
+                <div class="cell-main">
+                  <!-- 2026-10-22 视觉优化：借鉴 demo 产品图标——名称左侧 42px 渐变圆角图标块（按类型区分字符） -->
+                  <div class="cart-product">
+                    <div class="cart-product-icon" aria-hidden="true">{{ typeIcon(row.asset.type) }}</div>
+                    <div class="cart-product-info">
+                      <!-- ADR-011：遥感明细行两行展示——主行父产品名，次级行明细名（省/市 精度 月份） -->
+                      <a class="cart-asset-name" @click="goAssetDetail(row.asset.id)">{{ row.asset.name }}</a>
+                      <div v-if="row.rsItem" class="muted cart-asset-sub">{{ rsItemName(row.rsItem) }}</div>
+                      <div v-else class="muted cart-asset-sub">{{ row.asset.code }} · {{ row.asset.type }} · {{ entityShort(row.asset.subject) }}</div>
+                    </div>
+                  </div>
                 </div>
+                <div class="cell-hint" aria-hidden="true"></div>
               </div>
             </template>
           </el-table-column>
           <el-table-column label="客户" width="180" align="left">
             <template #default="{ row }">
-              <!-- 行级客户对三角色均可编辑（含生态人员） -->
-              <el-tooltip content="结算时按「产品 + 客户」分组生成销售记录" placement="top">
-                <el-input
-                  v-model="row.cart.customer"
-                  size="small"
-                  :placeholder="customerErrors.has(row.cart.id) ? '必填' : '填写客户'"
-                  :class="{ 'cart-customer-error': customerErrors.has(row.cart.id) }"
-                  @change="onCustomerChange(row)"
-                />
-              </el-tooltip>
+              <!-- 2026-10-23 修复①：统一单元格结构——客户列无副提示，渲染空占位区保证行高一致 -->
+              <div class="cart-cell">
+                <div class="cell-main">
+                  <!-- 行级客户对三角色均可编辑（含生态人员） -->
+                  <el-tooltip content="结算时按「产品 + 客户」分组生成销售记录" placement="top">
+                    <el-input
+                      v-model="row.cart.customer"
+                      size="small"
+                      :placeholder="customerErrors.has(row.cart.id) ? '必填' : '填写客户'"
+                      :class="{ 'cart-customer-error': customerErrors.has(row.cart.id) }"
+                      @change="onCustomerChange(row)"
+                    />
+                  </el-tooltip>
+                </div>
+                <div class="cell-hint" aria-hidden="true"></div>
+              </div>
             </template>
           </el-table-column>
           <el-table-column label="销售单价" width="150" align="right" header-align="right">
             <template #default="{ row }">
               <!-- 2026-10-22 视觉优化：价格 14px 加粗 + 11px 副文案（单位 + 库存/上限），
                    原数量列「已达上限」红色小字整合进此副文案（警示色沿用 --danger-color） -->
-              <div class="cart-price">
-                <!-- ADR-017（2026-10-20）：包量定价行单价与普通产品一致（元/份，参考口径），删除「元/万Token」特判 -->
-                <span class="cart-price-value" :class="{ muted: row.isAmount }">¥ {{ formatMoney(row.price) }}</span>
-                <div class="cart-price-sub">
+              <!-- 2026-10-23 修复①：统一单元格结构——价格进主内容区，单位 + 可售/上限副文案进 18px 副提示区一行内 -->
+              <div class="cart-cell">
+                <div class="cell-main cart-price">
+                  <!-- ADR-017（2026-10-20）：包量定价行单价与普通产品一致（元/份，参考口径），删除「元/万Token」特判
+                       2026-10-23 修复②：去掉模板里多余的「¥ 」前缀——formatMoney 返回值已含 ¥，原写法渲染成「¥ ¥5,100,000.00」 -->
+                  <span class="cart-price-value" :class="{ muted: row.isAmount }">{{ formatMoney(row.price) }}</span>
+                </div>
+                <div class="cell-hint cart-price-sub">
                   <span>{{ row.rsItem ? '元/份' : `元/${row.asset.unit || '单位'}` }}</span>
                   <span
                     v-if="!row.rsItem && !row.asset.repeatSale"
@@ -450,31 +467,38 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
                上限（min=1 / max=可用上限）与「已达上限」语义保留（上限时 + 号禁用置灰） -->
           <el-table-column label="数量" width="120" align="center">
             <template #default="{ row }">
-              <div class="cart-stepper">
-                <button
-                  type="button"
-                  class="step-btn"
-                  :disabled="!!row.rsItem || row.cart.qty <= 1"
-                  :aria-label="`减少${row.asset.name}数量`"
-                  @click="stepQty(row, -1)"
-                >
-                  −
-                </button>
-                <span class="step-value">{{ row.cart.qty }}</span>
-                <button
-                  type="button"
-                  class="step-btn"
-                  :disabled="!!row.rsItem || (qtyMax(row) != null && row.cart.qty >= qtyMax(row)!)"
-                  :aria-label="`增加${row.asset.name}数量`"
-                  @click="stepQty(row, 1)"
-                >
-                  ＋
-                </button>
+              <!-- 2026-10-23 修复①：统一单元格结构——步进器进主内容区，hint 进 18px 副提示区（无 hint 也渲染空占位） -->
+              <div class="cart-cell">
+                <div class="cell-main cell-main-center">
+                  <div class="cart-stepper">
+                    <button
+                      type="button"
+                      class="step-btn"
+                      :disabled="!!row.rsItem || row.cart.qty <= 1"
+                      :aria-label="`减少${row.asset.name}数量`"
+                      @click="stepQty(row, -1)"
+                    >
+                      −
+                    </button>
+                    <span class="step-value">{{ row.cart.qty }}</span>
+                    <button
+                      type="button"
+                      class="step-btn"
+                      :disabled="!!row.rsItem || (qtyMax(row) != null && row.cart.qty >= qtyMax(row)!)"
+                      :aria-label="`增加${row.asset.name}数量`"
+                      @click="stepQty(row, 1)"
+                    >
+                      ＋
+                    </button>
+                  </div>
+                </div>
+                <!-- ADR-011：遥感明细行数量恒 1（双按钮禁用 + 提示）；「已达上限/可售」信息已移至单价列副文案 -->
+                <div class="cell-hint">
+                  <span v-if="row.rsItem" class="muted">遥感明细数量固定 1</span>
+                  <span v-else-if="row.isAmount" class="muted">{{ formatTokens(row.cart.qty) }} Token</span>
+                  <span v-else-if="row.asset.repeatSale" class="muted">不限</span>
+                </div>
               </div>
-              <!-- ADR-011：遥感明细行数量恒 1（双按钮禁用 + 提示）；「已达上限/可售」信息已移至单价列副文案 -->
-              <div v-if="row.rsItem" class="muted cart-qty-hint">遥感明细数量固定 1</div>
-              <div v-else-if="row.isAmount" class="muted cart-qty-hint">{{ formatTokens(row.cart.qty) }} Token</div>
-              <div v-else-if="row.asset.repeatSale" class="muted cart-qty-hint">不限</div>
             </template>
           </el-table-column>
           <!-- ADR-018 §3（PRICING-20261020）：所有行（unit/amount/遥感）均可输销售金额（整数元）——
@@ -482,28 +506,36 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
           <!-- 2026-10-20 修复：列宽 190→200，保证下方参考区间小字（如「参考区间 5100000~5100000 元/套」）不挤压换行 -->
           <el-table-column label="销售金额（元）" width="200" align="center">
             <template #default="{ row }">
-              <el-tooltip :content="amountTip(row)" placement="top">
-                <el-input
-                  :model-value="row.cart.amount ?? ''"
-                  :placeholder="amountPlaceholder(row)"
-                  size="small"
-                  :class="{
-                    'cart-amount-empty': row.isAmount && !isViewer && !row.cart.amount,
-                    'cart-customer-error': amountErrors.has(row.cart.id),
-                  }"
-                  @input="onAmountInput(row, $event)"
-                  @change="onAmountChange(row)"
-                />
-              </el-tooltip>
-              <!-- ADR-018：产品设了参考区间时展示区间提示（超区间提交由后端 400，文案走 showError）
-                   ADR-021（RSITEM-RANGE-20261020）：遥感明细行改读该明细自身区间，普通行仍读产品区间
-                   2026-10-20 修复：提示可见性——显式辅助色 #71829A（原 .muted #9aa9bf 过淡）、11px；
-                   遥感行单位按 ADR-021 口径展示「份」（父产品 unit 为「份（可售明细）」容器口径，不宜直接展示） -->
-              <div v-if="rowRangeText(row)" class="cart-amount-range">
-                参考区间 {{ rowRangeText(row) }} 元/{{ row.rsItem ? '份' : (row.asset.unit || '单位') }}
+              <!-- 2026-10-23 修复①：统一单元格结构——输入框进主内容区，两行小字合并为 18px 副提示区一行：
+                   金额为空时优先显示参考区间，无区间则显示兜底口径提示；已填金额时显示区间（无区间则留空占位） -->
+              <div class="cart-cell">
+                <div class="cell-main">
+                  <el-tooltip :content="amountTip(row)" placement="top">
+                    <el-input
+                      :model-value="row.cart.amount ?? ''"
+                      :placeholder="amountPlaceholder(row)"
+                      size="small"
+                      :class="{
+                        'cart-amount-empty': row.isAmount && !isViewer && !row.cart.amount,
+                        'cart-customer-error': amountErrors.has(row.cart.id),
+                      }"
+                      @input="onAmountInput(row, $event)"
+                      @change="onAmountChange(row)"
+                    />
+                  </el-tooltip>
+                </div>
+                <div class="cell-hint">
+                  <!-- ADR-018：产品设了参考区间时展示区间提示（超区间提交由后端 400，文案走 showError）
+                       ADR-021（RSITEM-RANGE-20261020）：遥感明细行改读该明细自身区间，普通行仍读产品区间
+                       2026-10-20 修复：提示可见性——显式辅助色 #71829A（原 .muted #9aa9bf 过淡）、11px；
+                       遥感行单位按 ADR-021 口径展示「份」（父产品 unit 为「份（可售明细）」容器口径，不宜直接展示）
+                       2026-10-22 修复⑤ 兜底口径小字并入此行：仅金额留空且无区间时出现 -->
+                  <span v-if="rowRangeText(row)" class="cart-amount-range">
+                    参考区间 {{ rowRangeText(row) }} 元/{{ row.rsItem ? '份' : (row.asset.unit || '单位') }}
+                  </span>
+                  <span v-else-if="!row.cart.amount" class="cart-amount-fallback">{{ amountFallbackHint(row) }}</span>
+                </div>
               </div>
-              <!-- 2026-10-22 修复⑤：金额留空兜底口径小字（遥感行=明细价 / 普通行=挂牌价，一行以内，辅助色） -->
-              <div class="muted cart-amount-fallback">{{ amountFallbackHint(row) }}</div>
             </template>
           </el-table-column>
           <!-- ADR-020（PRICING-20261020）：服务期限——普通产品行填写（变更即 PUT 提交）；
@@ -512,48 +544,61 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
                两个日期输入各设明确宽度 136px（可完整显示 YYYY-MM-DD + 日历图标），中间留 8px 间距 -->
           <el-table-column label="服务期限" width="300" align="center">
             <template #default="{ row }">
-              <template v-if="!row.rsItem">
-                <div class="cart-service-row">
-                  <el-date-picker
-                    v-model="row.cart.serviceStart"
-                    type="date"
-                    value-format="YYYY-MM-DD"
-                    size="small"
-                    placeholder="开始"
-                    style="width: 136px;"
-                    @change="onServiceChange(row)"
-                  />
-                  <el-date-picker
-                    v-model="row.cart.serviceEnd"
-                    type="date"
-                    value-format="YYYY-MM-DD"
-                    size="small"
-                    placeholder="结束"
-                    style="width: 136px;"
-                    @change="onServiceChange(row)"
-                  />
+              <!-- 2026-10-23 修复①：统一单元格结构——双日期（136px 不变）进主内容区，本列无副提示（空占位） -->
+              <div class="cart-cell">
+                <div class="cell-main cell-main-center">
+                  <template v-if="!row.rsItem">
+                    <div class="cart-service-row">
+                      <el-date-picker
+                        v-model="row.cart.serviceStart"
+                        type="date"
+                        value-format="YYYY-MM-DD"
+                        size="small"
+                        placeholder="开始"
+                        style="width: 136px;"
+                        @change="onServiceChange(row)"
+                      />
+                      <el-date-picker
+                        v-model="row.cart.serviceEnd"
+                        type="date"
+                        value-format="YYYY-MM-DD"
+                        size="small"
+                        placeholder="结束"
+                        style="width: 136px;"
+                        @change="onServiceChange(row)"
+                      />
+                    </div>
+                  </template>
+                  <!-- 2026-10-22 修复⑤：遥感行「-」在整列宽度内居中（原裸 span 随单元格左对齐出现半列偏移） -->
+                  <span v-else class="muted cart-service-dash">-</span>
                 </div>
-              </template>
-              <!-- 2026-10-22 修复⑤：遥感行「-」在整列宽度内居中（原裸 span 随单元格左对齐出现半列偏移） -->
-              <span v-else class="muted cart-service-dash">-</span>
+                <div class="cell-hint" aria-hidden="true"></div>
+              </div>
             </template>
           </el-table-column>
           <!-- 2026-10-22 微调：小计列宽 130→110（次要列收窄，缓解横向滚动压力，信息完整保留） -->
           <el-table-column label="小计" width="110" align="right" header-align="right">
             <template #default="{ row }">
-              <span class="cart-subtotal">{{ formatMoney(row.subtotal) }}</span>
+              <!-- 2026-10-23 修复①：统一单元格结构——小计进主内容区（formatMoney 已含 ¥，模板不再叠加前缀），副提示区空占位 -->
+              <div class="cart-cell">
+                <div class="cell-main cell-main-end">
+                  <span class="cart-subtotal">{{ formatMoney(row.subtotal) }}</span>
+                </div>
+                <div class="cell-hint" aria-hidden="true"></div>
+              </div>
             </template>
           </el-table-column>
-          <!-- 2026-10-22 视觉优化：红色「移除」文字改 × 图标按钮（默认辅助色，hover 警示红）；
-               固定右侧保留（列宽合计约 1360px，常见屏宽下溢出横滚，见表格注释） -->
-          <el-table-column label="操作" width="70" align="center" fixed="right">
+          <!-- 2026-10-23 修复③：× 图标不明显，改回文字按钮「删除」（默认辅助色 #71829A，hover 警示红 + 浅红底，13px）；
+               文字已自明，移除 tooltip；fixed="right" 保留（列宽合计约 1360px，常见屏宽下溢出横滚，见表格注释） -->
+          <el-table-column label="操作" width="76" align="center" fixed="right">
             <template #default="{ row }">
-              <!-- 删行对三角色均可用（含生态人员） -->
-              <el-tooltip content="移除" placement="top">
-                <button type="button" class="cart-remove" aria-label="移除" @click="removeRow(row)">
-                  <el-icon><Close /></el-icon>
-                </button>
-              </el-tooltip>
+              <!-- 删行对三角色均可用（含生态人员）；2026-10-23 修复①：统一单元格结构，副提示区空占位 -->
+              <div class="cart-cell">
+                <div class="cell-main cell-main-center">
+                  <button type="button" class="cart-remove" @click="removeRow(row)">删除</button>
+                </div>
+                <div class="cell-hint" aria-hidden="true"></div>
+              </div>
             </template>
           </el-table-column>
         </el-table>
@@ -565,7 +610,8 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
         <div class="co-left">
           <span class="co-selected">已选 {{ totalQty }} 件产品</span>
           <div class="co-total">
-            <small>应付合计</small>¥ {{ formatMoney(totalAmount) }}
+            <!-- 2026-10-23 修复②：去掉多余「¥ 」前缀——formatMoney 返回值已含 ¥（同单价列） -->
+            <small>应付合计</small>{{ formatMoney(totalAmount) }}
           </div>
         </div>
         <!-- 结算下单对三角色均可用（含生态人员）；前置校验（客户/金额必填）仍走 openOrder -->
@@ -600,8 +646,36 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
   font-weight: 700;
   color: var(--text-secondary);
 }
+/* 2026-10-23 修复①：行高由「单元格 padding 26px + 不定高内容」改为「padding 16px + 统一单元格结构
+   （主内容区 40px + 副提示区 18px = 58px）」，行总高 ≈ 90px，任意行任意列输入框水平对齐 */
 :deep(.el-table td.el-table__cell) {
-  padding: 26px 0;
+  padding: 16px 0;
+}
+
+/* 2026-10-23 修复①：统一单元格结构——主内容区固定 40px 垂直居中 + 副提示区固定 18px（允许为空占位），
+   保证每行每列总高度一致、跨行同列输入框上下对齐 */
+.cart-cell {
+  display: flex;
+  flex-direction: column;
+}
+.cell-main {
+  height: 40px;
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+.cell-main-center {
+  justify-content: center;
+}
+.cell-main-end {
+  justify-content: flex-end;
+}
+.cell-hint {
+  height: 18px;
+  font-size: 11px;
+  line-height: 18px;
+  overflow: hidden;
+  white-space: nowrap;
 }
 
 /* 操作列固定右侧——强化左侧分隔阴影，横向滚动时与「小计」列内容清晰分隔、避免视觉粘连 */
@@ -669,9 +743,10 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
   margin-top: 4px;
 }
 
-/* 销售单价列：价格 14px 加粗 + 11px 副文案（单位 + 库存/上限） */
+/* 销售单价列：价格 14px 加粗 + 11px 副文案（单位 + 库存/上限）
+   2026-10-23 修复①：价格进 40px 主内容区（右对齐），副文案进 18px 副提示区一行内（去掉 margin-top） */
 .cart-price {
-  text-align: right;
+  justify-content: flex-end;
 }
 .cart-price-value {
   font-size: 14px;
@@ -683,10 +758,7 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
   display: flex;
   justify-content: flex-end;
   gap: 6px;
-  font-size: 11px;
   color: var(--text-secondary);
-  margin-top: 4px;
-  line-height: 1.4;
 }
 .cart-sellable-max {
   color: var(--danger-color);
@@ -736,23 +808,15 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
   border-left: 1px solid var(--divider-color);
   border-right: 1px solid var(--divider-color);
 }
-.cart-qty-hint {
-  font-size: 12px;
-  margin-top: 6px;
-}
-
-/* 移除：× 图标按钮（默认辅助色，hover 系统警示红） */
+/* 2026-10-23 修复③：× 图标不明显，改回文字按钮「删除」——默认辅助色 #71829A、13px，
+   hover 系统警示红 + 浅红底（沿用系统色板）；原 .cart-qty-hint 样式随数量列 hint 并入 .cell-hint 而删除 */
 .cart-remove {
-  width: 28px;
-  height: 28px;
   border: 0;
-  padding: 0;
+  padding: 4px 10px;
   background: transparent;
-  color: #a3afbf;
-  font-size: 15px;
-  border-radius: 7px;
-  display: grid;
-  place-items: center;
+  color: #71829a;
+  font-size: 13px;
+  border-radius: 6px;
   cursor: pointer;
 }
 .cart-remove:hover {
@@ -824,20 +888,15 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
   color: var(--text-primary);
   font-variant-numeric: tabular-nums;
 }
-/* ADR-018（PRICING-20261020）：参考区间提示行（金额输入框下方）
-   2026-10-20 修复：显式辅助色 #71829A + 11px（原 .muted #9aa9bf 过淡，用户反馈看不到提示） */
+/* ADR-018（PRICING-20261020）：参考区间提示（金额输入框下方副提示区）
+   2026-10-20 修复：显式辅助色 #71829A + 11px（原 .muted #9aa9bf 过淡，用户反馈看不到提示）
+   2026-10-23 修复①：并入 18px 副提示区（去 margin-top，字号/行高由 .cell-hint 统一控制） */
 .cart-amount-range {
-  font-size: 11px;
   color: #71829a;
-  margin-top: 4px;
-  line-height: 1.4;
 }
 /* 2026-10-22 修复⑤：金额留空兜底口径小字——与参考区间提示同款规格（11px + 辅助色 #71829A），不引入新样式体系 */
 .cart-amount-fallback {
-  font-size: 11px;
   color: #71829a;
-  margin-top: 4px;
-  line-height: 1.4;
 }
 /* 2026-10-22 修复⑤：遥感行服务期限「-」整列宽度内居中（block + text-align，覆盖单元格默认左对齐） */
 .cart-service-dash {
