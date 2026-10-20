@@ -375,7 +375,8 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
               <span :class="{ muted: row.isAmount }">{{ formatMoney(row.price) }}</span>
             </template>
           </el-table-column>
-          <el-table-column label="数量" width="160" align="center">
+          <!-- 2026-10-22 微调：数量列宽 160→120、输入框 110→96px（用户反馈输入框过大，与金额列视觉重量协调；保留右侧单侧步进按钮） -->
+          <el-table-column label="数量" width="120" align="center">
             <template #default="{ row }">
               <!-- ADR-011：遥感明细行数量恒 1（禁用输入 + tooltip 提示） -->
               <el-tooltip :content="row.rsItem ? '遥感明细数量固定 1' : ''" :disabled="!row.rsItem" placement="top">
@@ -385,7 +386,7 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
                   :max="row.rsItem ? 1 : qtyMax(row)"
                   :precision="0"
                   controls-position="right"
-                  style="width: 110px;"
+                  style="width: 96px;"
                   :disabled="!!row.rsItem"
                   @change="onQtyChange(row)"
                 />
@@ -457,12 +458,14 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
               <span v-else class="muted">-</span>
             </template>
           </el-table-column>
-          <el-table-column label="小计" width="130" align="right" header-align="right">
+          <!-- 2026-10-22 微调：小计列宽 130→110（次要列收窄，缓解横向滚动压力，信息完整保留） -->
+          <el-table-column label="小计" width="110" align="right" header-align="right">
             <template #default="{ row }">
               <span class="cart-subtotal">{{ formatMoney(row.subtotal) }}</span>
             </template>
           </el-table-column>
-          <el-table-column label="操作" width="70" align="center">
+          <!-- 2026-10-22 微调：操作列固定右侧（列多横向滚动时「移除」始终可见，无需横滚） -->
+          <el-table-column label="操作" width="70" align="center" fixed="right">
             <template #default="{ row }">
               <!-- 删行对三角色均可用（含生态人员） -->
               <el-button link type="danger" size="small" @click="removeRow(row)">
@@ -499,6 +502,10 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
 </template>
 
 <style scoped>
+/* 2026-10-22 微调：操作列固定右侧——强化左侧分隔阴影，横向滚动时与「小计」列内容清晰分隔、避免视觉粘连 */
+:deep(.el-table .el-table-fixed-column--right) {
+  box-shadow: -8px 0 8px -8px rgba(0, 0, 0, 0.12) inset;
+}
 .cart-asset-name {
   color: var(--primary-color);
   cursor: pointer;
