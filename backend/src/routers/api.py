@@ -485,7 +485,8 @@ def checkout(data: schemas.CheckoutInput, db: Session = Depends(get_db),
     """购物车结算：按产品分组 → 每个产品一条销售记录（ADR-013）。
     【核心业务规则 ADR-012 修订 2026-10-19】所有角色结算统一建 **pending（待审核）**
     （数量锁定照常）→ 商务接手审核（改价确认/驳回）后生效；原「仅生态人员进 pending」的角色分叉已废除。
-    is_viewer 现仅用于金额免填（生态人员 amount 模式行可留空回退挂牌价×数量）。"""
+    ADR-022（REQUIRED-20261024）：逐行必填校验（客户/销售金额>0整数元/普通行服务期限起止），
+    缺项 400 一次报全（文案含行标识）；「留空=挂牌价」兜底与 viewer 金额免填口径已作废。"""
     is_viewer = user.role == "viewer"
     project = services.checkout(db, data, user_id=str(user.id), operator=user.username,
                                 viewer=is_viewer)

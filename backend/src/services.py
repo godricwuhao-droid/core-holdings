@@ -8,7 +8,7 @@
 import re
 import uuid
 from datetime import date, datetime
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import Decimal
 
 from fastapi import HTTPException
 from sqlalchemy import select
@@ -2334,48 +2334,71 @@ def checkout(db: Session, data: schemas.CheckoutInput, user_id: str = DEFAULT_US
     → 建项目（pending + 锁定）→ 清空购物车。全部单事务，任一步失败整体回滚（H8）。
     不自动交付。customer 取分组键客户（同客户多产品=同项目多条记录）。
     ADR-012 修订（2026-10-19）：**所有角色**结算 → 项目/记录建 pending（待审核，锁定照常），
-    商务接手后经审核（改价确认/驳回）生效。viewer 的 amount 模式行金额可免填（回退参考价×数量取整）。
+    商务接手后经审核（改价确认/驳回）生效。
+    ADR-022（REQUIRED-20261024）：逐行必填校验——客户非空 / 销售金额 > 0 整数元（所有行类型）/
+    普通产品行服务期限起止均必填且 start ≤ end；缺项 400 一次报全（文案含行标识：产品名/遥感明细名）。
+    取代 ADR-018 §3「留空=挂牌价成交」兜底（viewer 免填金额口径同步作废）；
+    遥感明细行（itemId 非空）服务期限仍豁免（ADR-020：期数即服务时间）。
     ADR-013：不再校验同主体（记录粒度=单资产，天然单主体；同客户多主体=多条记录并列）。"""
     cart = _cart_list(db, user_id)
     if not cart:
         raise HTTPException(400, "购物车为空，请先添加产品")
-    # 按 (产品, 客户) 分组（保持购物车行序）；七元组
-    # (产品, 数量, 权威/折扣 amount, itemId, 行级客户, serviceStart, serviceEnd)
-    # 明细行 qty 恒 1（ADR-011）；amount 模式行在此校验金额（缺失/非整数 400，ADR-008）
-    # ADR-018 §3（PRICING-20261020）：unit/遥感行折扣金额 checkout 时再过一次区间校验
-    #（行更新时已校验，此处防绕过行更新接口直接改库/旧客户端）
-    # ADR-016（FIX-20261020-#3）：分组键由 assetId 单键升级为 (assetId, customer)——
-    # 同产品多客户行不再被静默合并为一条记录（客户归属/金额串账），与前端预览口径一致
-    groups: dict[tuple[int, str], list[tuple[models.Asset, int, Decimal | None, int | None, str, str | None, str | None]]] = {}
+    # ADR-022（REQUIRED-20261024）：逐行必填校验——收集全部缺项一次报全（400），
+    # 文案含行标识（产品名 / 遥感明细名），便于前端逐行标红定位：
+    # - 客户非空（现状保留）；
+    # - 销售金额 > 0 整数元（**所有行类型**：unit/amount/遥感明细行）——
+    #   取代 ADR-018 §3「留空=原价成交」兜底（amount 为空回退 salePrice×qty 的分支已删除）；
+    # - 普通产品行：serviceStart 与 serviceEnd 均必填，且 start ≤ end（格式校验现状保留）；
+    # - 遥感明细行（itemId 非空）服务期限豁免（ADR-020）。
+    missing: list[str] = []
     for c in cart:
         a = get_asset(db, c.assetId)
         if not a:
             raise HTTPException(400, f"购物车中的产品（#{c.assetId}）已删除，请先移除后再下单")
-        customer = (c.customer or "").strip()
-        if not customer:
-            raise HTTPException(400, "请为每件产品填写客户")
+        label = a.name
         if c.itemId is not None:
             rs = db.get(models.RsItem, c.itemId)
             if rs is None or rs.assetId != c.assetId:
                 raise HTTPException(400, "购物车中的遥感数据明细已删除或不属于该产品，请先移除后再下单")
-            # ADR-018 §5：遥感明细行折扣金额可输（过区间校验）；不输 = 明细 price 原价成交
+            label = f"{a.name}·{_rs_item_desc(rs)}"
+        if not (c.customer or "").strip():
+            missing.append(f"{label}：客户")
+        # 销售金额：所有行类型必填（ADR-022），> 0 整数元
+        amt = _dec(c.amount) if c.amount is not None else None
+        if amt is None or amt <= 0 or amt != amt.to_integral_value():
+            missing.append(f"{label}：销售金额（整数元，大于 0）")
+        if c.itemId is None:
+            # 普通产品行：服务期限起止均必填（遥感明细行豁免）；
+            # 均已填时按 ADR-020 口径校验格式与 start ≤ end
+            if not (c.serviceStart or "").strip() or not (c.serviceEnd or "").strip():
+                missing.append(f"{label}：服务期限（开始/结束日期均必填）")
+            else:
+                _validate_service_period(c.serviceStart, c.serviceEnd)
+    if missing:
+        raise HTTPException(400, "购物车存在必填缺项，请补齐后再结算：" + "；".join(missing))
+    # 按 (产品, 客户) 分组（保持购物车行序）；七元组
+    # (产品, 数量, 权威/折扣 amount, itemId, 行级客户, serviceStart, serviceEnd)
+    # 明细行 qty 恒 1（ADR-011）；ADR-022 后 amount 恒非空且为合法整数元（上方必填校验保证）
+    # ADR-018 §3（PRICING-20261020）：unit/遥感行折扣金额 checkout 时再过一次区间校验
+    #（行更新时已校验，此处防绕过行更新接口直接改库/旧客户端）
+    # ADR-016（FIX-20261020-#3）：分组键由 assetId 单键升级为 (assetId, customer)——
+    # 同产品多客户行不再被静默合并为一条记录（客户归属/金额串账），与前端预览口径一致
+    groups: dict[tuple[int, str], list[tuple[models.Asset, int, Decimal, int | None, str, str | None, str | None]]] = {}
+    for c in cart:
+        a = get_asset(db, c.assetId)
+        customer = (c.customer or "").strip()
+        if c.itemId is not None:
+            rs = db.get(models.RsItem, c.itemId)
+            # ADR-018 §5：遥感明细行折扣金额采信（过区间校验）；
             # ADR-021（RSITEM-RANGE-20261020）：区间取该 rs_item 自身（不再取父产品容器区间）
             amt = _check_discount_range(a, 1, c.amount, unit=a.unit, rs=rs)
             groups.setdefault((c.assetId, customer), []).append(
                 (a, 1, amt, c.itemId, customer, c.serviceStart, c.serviceEnd))
             continue
         if _is_amount_mode(a):
-            if viewer and (c.amount is None or _dec(c.amount) <= 0):
-                # ADR-012 生态人员免填金额：回退按参考价×数量四舍五入取整元
-                #（参考价可能非整数，如 Token 服务 33333.33，取整满足 ADR-008 整数元约束）
-                if not a.salePrice or a.salePrice <= 0:
-                    raise HTTPException(400,
-                        f"产品「{a.name}」未登记参考单价，无法免填金额，请填写销售金额或先联系商务登记参考单价")
-                amt = (_dec(a.salePrice) * c.qty).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
-            else:
-                amt = _validate_amount_yuan(c.amount)  # 缺失/非整数元 → 400
+            amt = _validate_amount_yuan(c.amount)  # 整数元校验（必填校验已过，幂等兜底）
         else:
-            # ADR-018 §3：unit 行折扣金额采信（过区间校验）；不输 = 原价成交（salePrice×qty）
+            # ADR-018 §3：unit 行折扣金额采信（过区间校验）
             amt = _check_discount_range(a, c.qty, c.amount, unit=a.unit)
         groups.setdefault((c.assetId, customer), []).append(
             (a, c.qty, amt, None, customer, c.serviceStart, c.serviceEnd))
@@ -2386,22 +2409,10 @@ def checkout(db: Session, data: schemas.CheckoutInput, user_id: str = DEFAULT_US
         items: list[schemas.ProjectItemInput] = []
         total = Decimal("0")
         for a, qty, amt, item_id, _cust, s_start, s_end in rows:
-            rs = db.get(models.RsItem, item_id) if item_id else None
-            if rs is not None:
-                if amt is not None:
-                    # ADR-018 §5（PRICING-20261020）：遥感行折扣金额采信（已过区间校验）
-                    price = _derived_price(amt, 1)
-                    amount = amt.quantize(CENT)
-                else:
-                    # ADR-011：未输折扣 = 明细 price × 1 原价成交（整数元天然成立）
-                    price = float(_dec(rs.price))
-                    amount = _dec(rs.price).quantize(CENT)
-            elif amt is not None:
-                price = _derived_price(amt, qty)  # 派生展示值
-                amount = amt
-            else:
-                price = a.salePrice or 0
-                amount = (_dec(price) * qty).quantize(CENT)  # 元口径，Decimal 精确到分
+            # ADR-022（REQUIRED-20261024）：amt 经上方必填校验恒非空（> 0 整数元）——
+            # 「留空=原价成交」兜底已删除（unit 行 salePrice×qty / 遥感行明细 price 分支作废）
+            price = _derived_price(amt, qty)  # 派生展示值（遥感明细行 qty 恒 1）
+            amount = amt.quantize(CENT)  # 元口径，Decimal 精确到分
             total += amount
             items.append(schemas.ProjectItemInput(
                 assetId=a.id, qty=qty, price=price, amount=float(amount),

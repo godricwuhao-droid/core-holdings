@@ -2,6 +2,33 @@
 
 > 记录 core-holdings 后端（FastAPI + SQLAlchemy + SQLite）的接口与行为变更。
 
+## 2026-10-24 ｜ 修改：REQUIRED-20261024 购物车结算必填口径（分支 feat/pricing-discount-timelines）
+
+> 依据 ADR-022（业务拍板：购物车所有都是必填项），取代 ADR-018 §3「留空按挂牌价成交」兜底。前后端同批上线（契约见 api-contracts.md「REQUIRED-20261024 批次」）。
+
+| 日期 | 类型 | 变更内容 | 影响文件范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-24 | 修改 | ⚠️ `checkout`（POST /cart/checkout）逐行必填校验，缺项 400 **一次报全**（文案含行标识：产品名 / 遥感明细「产品名·明细名」）：① 客户非空（原「请为每件产品填写客户」文案并入统一缺项格式）；② 销售金额 > 0 整数元（**所有行类型**：unit/amount/遥感明细行）；③ 普通产品行 serviceStart/serviceEnd 均必填且 start ≤ end（格式校验现状保留）；④ **遥感明细行（itemId 非空）服务期限豁免**（ADR-020） | `backend/src/services.py`（`checkout`）、`backend/src/routers/api.py`（docstring） | REQUIRED-20261024 | 400 文案：`购物车存在必填缺项，请补齐后再结算：{行标识}：客户 / 销售金额（整数元，大于 0）/ 服务期限（开始/结束日期均必填）`，多缺项以「；」分隔 |
+| 2026-10-24 | 删除 | ⚠️ 删除 amount 为空回退 `salePrice×qty`（unit 行）/ 明细 price（遥感行）的**结算兜底分支**，及 viewer amount 模式行「免填回退 `round(挂牌价×数量)`」分支（ADR-012 免填口径作废）；`ROUND_HALF_UP` 导入随之移除 | `backend/src/services.py`（`checkout`） | REQUIRED-20261024 | ADR-018 §3「留空=原价成交」在结算链路下线；checkout 明细 amount 恒非空，`price` 恒为派生展示值 `round(amount÷qty, 6)` |
+| 2026-10-24 | 不变 | 行更新接口（`PUT/PATCH /cart/{id}`、加购 `POST /cart`、`/cart/batch`）**不加**必填校验——允许暂存缺项（加购后分批补），仅 checkout 强制；区间校验（`_check_discount_range`，ADR-018/021）在 amount 填写时仍生效；手动建单（POST /projects）与 `POST /sales/order`（deprecated）不做本次必填变更（商务路径，不在 ADR-022 范围） | — | REQUIRED-20261024 | 契约 §2 |
+
+### 下游自查（删兜底分支后）
+
+- `_create_project_core`：checkout 传入的 `ProjectItemInput.amount` 恒非空——unit 行 `_item_pricing` 按派生 price×qty 重算（与 PRICING 批次折扣行行为一致）；amount 模式行 `_validate_amount_yuan` 幂等通过；遥感行 amount=明细金额权威（qty 恒 1）。
+- 原价快照（ADR-018 §2）：`origPrice/origAmount` 取下单时刻挂牌价（asset.salePrice / rs.price），与 amount 是否填写无关，不受影响（实测 origAmount=102200 正确）。
+- 合同金额派生：checkout 显式传 `contractAmount=Σ行 amount`，`_normalize_contracts` 直接采信，链路成立。
+
+### 验证（dev server 8000，admin，curl 实测）
+
+- `python3 -m compileall -q src main.py` 通过；`import src.services / src.routers.api / src.schemas / src.models / main` → import ok。
+- 缺金额+缺期限（unit 行，产品 #21）→ 400 `购物车存在必填缺项，请补齐后再结算：区县级优质资源共建共享平台：销售金额（整数元，大于 0）；…：服务期限（开始/结束日期均必填）`（一次报全）。
+- 客户改空 → 400 三项缺项一次报全（客户/销售金额/服务期限）。
+- 补客户+金额（无期限）→ 400 仅缺服务期限；start>end（行更新层先 400 `服务开始日期不能晚于结束日期`；直接改库构造后 checkout 兜底同文案 400）。
+- 补齐（amount=100000 + 2026-11-01~2026-12-31）→ **200**，项目 pending、contractAmount=100000.0；明细 amount=100000.0 / origAmount=102200.0 / 期限落库正确。
+- 遥感明细行（asset #29·明细 #1，无金额无期限）→ 400 **仅**缺销售金额（期限豁免生效，行标识 `遥感数据-2026·河北/石家庄市 1.5m 2026-09`）；补 amount=300000 → **200**（contractAmount=300000.0）。
+- 测试数据已清零：两个测试项目删除（projects 0 行）、购物车行 0 行、产品 #21/#29 lockedQty=0，库恢复现状。
+- 未修改 frontend/ 任何文件、未执行构建/部署、未 git commit。
+
 ## 2026-10-20 ｜ 修改：数据订正——rs_items 删旧留新（「甘肃省」旧行删除 + 「河北省」→「河北」改名收尾，业务确认方案 A）
 
 > 无代码变更，纯数据订正。前置备份 `backend/core_holdings.db.bak-province-cleanup`（保留不入库）。业务确认方案 A：清掉引用旧行的测试草稿购物车行后删旧明细。

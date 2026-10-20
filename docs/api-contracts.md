@@ -101,3 +101,18 @@
 2. `POST /assets/{id}/rs-items`、`PUT /assets/{id}/rs-items/{item_id}` 入参新增 `priceMin` / `priceMax`（number ≥ 0 | null）；两者都有时 min ≤ max 否则 400「参考区间下限不能大于上限」。
 3. 折扣区间校验口径变更：生态下单链路（购物车行更新 / checkout / sales/order）中**遥感明细行（itemId 非空）金额校验改用该 rs_item 自身区间**（不再取父产品容器区间）；普通产品行仍用 assets 区间；未设区间 = 不限制。400 文案口径同 PRICING 批次。
 4. 原价快照不变：遥感行 origPrice/origAmount = 明细 price 快照。
+
+---
+
+## REQUIRED-20261024 批次：购物车结算必填口径（ADR-022）
+
+> 取代 ADR-018 §3「留空按原价成交」兜底。前后端同批上线。
+
+1. `POST /cart/checkout` 逐行必填校验（缺项 400，文案含行标识：产品名/明细名）：
+   - 客户非空（现状保留）；
+   - `amount` > 0 整数元（**所有行类型**，含遥感行）——**删除 amount 为空回退 salePrice×qty 的兜底分支**；
+   - 普通产品行：`serviceStart` / `serviceEnd` 均非空且 start ≤ end（现状格式校验保留）；
+   - **遥感明细行服务期限仍豁免**（ADR-020）。
+2. 行更新（PUT/PATCH /cart/{id}）允许暂存缺项（加购后可分批补），仅结算强制齐全。
+3. 前端：购物车金额 placeholder 改「必填，整数元」；服务期限 placeholder「开始日期/结束日期」且缺项标红；结算按钮前置校验同口径（缺项行标红 + 提示，不弹结算窗）。
+4. 区间校验（ADR-018/021）不受影响：必填金额仍须落在参考区间内。

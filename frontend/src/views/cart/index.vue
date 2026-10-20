@@ -8,7 +8,7 @@
  * 交付（扣数量 + 交付记录）在项目详情页对合同执行「交付」后触发。
  * 数据预留 userId 维度（当前默认 admin），为后续账号权限管控做准备。
  */
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Delete, InfoFilled, ShoppingCart } from '@element-plus/icons-vue'
@@ -16,7 +16,6 @@ import { availableQty, entityShort, formatMoney, formatTokens, isAmountMode, pri
 import { checkoutCart, clearCart, db, getAsset, patchCartItem, refresh, removeCartItem, rsItemById, setCartAmount, setCartQty, setCartService, showError, type OrderFields } from '@/api'
 import SalesOrderDialog from '@/components/SalesOrderDialog.vue'
 import type { OrderItem } from '@/components/SalesOrderDialog.vue'
-import { isViewer } from '@/auth'
 
 const router = useRouter()
 
@@ -54,30 +53,36 @@ const totalQty = computed(() => db.cart.reduce((s, c) => s + c.qty, 0))
 const totalAmount = computed(() => cartRows.value.reduce((s, r) => s + r.subtotal, 0))
 
 // ==================== 行级客户（ADR-007/ADR-016：结算时按（产品, 客户）双键分组拆合同） ====================
-/** 客户校验失败（标红）的购物车行 id 集合 */
-const customerErrors = reactive(new Set<number>())
+// 2026-10-24（ADR-022）：客户/金额/服务期限统一「必填」口径——缺项标红改为值驱动
+//（字段为空即标红，与列头红星同口径），不再维护 error id 集合（原 customerErrors/amountErrors 删除）
 
-// ==================== 行级合同金额（ADR-008：仅包量定价行，整数元权威输入） ====================
-/** 合同金额未填/非法（标红置灰）的购物车行 id 集合 */
-const amountErrors = reactive(new Set<number>())
-
+// ==================== 行级销售金额（ADR-008 包量定价行权威输入；ADR-022 起所有行必填） ====================
 /** 金额输入：仅保留整数位（元口径，禁止小数） */
 function onAmountInput(row: CartRow, v: string) {
   const digits = (v ?? '').replace(/[^\d]/g, '')
   row.cart.amount = digits === '' ? undefined : Number(digits)
-  if (row.cart.amount) amountErrors.delete(row.cart.id)
 }
 
-/** 金额 tooltip 文案：amount 行 = 权威输入（必填/生态可空）；unit/遥感行 = 折扣金额（选填，超区间后端 400） */
+/** 2026-10-24（ADR-022）：金额缺项（空 / 0 / 非整数）→ 标红，与客户列同一「必填缺项」样式 */
+function amountInvalid(row: CartRow): boolean {
+  const n = row.cart.amount
+  return n === undefined || !Number.isInteger(n) || n <= 0
+}
+
+/** 2026-10-24（ADR-022）：服务期限缺项（对应日期为空，或 start > end）→ 标红；
+ *  遥感明细行豁免（ADR-020，模板本就不渲染日期输入） */
+function serviceMissing(row: CartRow, which: 'start' | 'end'): boolean {
+  const s = row.cart.serviceStart
+  const e = row.cart.serviceEnd
+  const orderBad = !!s && !!e && s > e
+  return which === 'start' ? !s || orderBad : !e || orderBad
+}
+
+/** 金额 tooltip 文案（2026-10-24 ADR-022：所有行必填、整数元 > 0；
+ *  旧「选填：留空按原价成交 / 生态可留空」口径随留空兜底一并废弃） */
 function amountTip(row: CartRow): string {
-  if (row.isAmount) {
-    return row.cart.amount
-      ? '包量定价：销售金额（整数元）为权威输入'
-      : isViewer.value
-        ? '留空按 挂牌价×数量 计价（整数元取整），商务确认订单时可再调整'
-        : '请填写销售金额（整数元）后方可结算'
-  }
-  return '选填：留空按原价成交（挂牌价×数量）；填写即折扣金额（整数元，须落在产品参考区间内）'
+  if (row.isAmount) return '包量定价：销售金额（整数元 > 0）为权威输入，必填'
+  return '必填，整数元（> 0）；设参考区间时须落在区间内'
 }
 
 /** 行参考区间文案（ADR-021，RSITEM-RANGE-20261020）：
@@ -86,38 +91,12 @@ function rowRangeText(row: CartRow): string {
   return row.rsItem ? priceRangeText(row.rsItem) : priceRangeText(row.asset)
 }
 
-/** 金额输入占位：amount 行沿用原口径；unit/遥感行标注「选填」 */
-function amountPlaceholder(row: CartRow): string {
-  if (row.isAmount) return isViewer.value ? '整数元（可留空）' : '整数元'
-  return '整数元（选填）'
-}
-
-/** 金额留空兜底口径提示（2026-10-22 修复⑤：金额下方 11px 小字，一行以内，复用 .muted 辅助色，不新增样式体系）：
- *  - 遥感行留空 = 按明细价结算（qty 恒 1）
- *  - amount 行留空 = 挂牌价×数量（viewer 可留空；商务必填，提示「必填」）
- *  - unit 行留空 = 挂牌价×数量 */
-function amountFallbackHint(row: CartRow): string {
-  if (row.rsItem) return '留空按明细价结算'
-  if (row.isAmount) return isViewer.value ? '留空按 挂牌价×数量 结算' : '必填，整数元'
-  return '留空按挂牌价结算'
-}
-
-/** 失焦提交（ADR-018 §3，PRICING-20261020）：
- *  - unit/遥感行：选填——留空 = 原价成交（不提交）；填写须为整数元（≥0），超参考区间由后端 400（文案走 showError）
- *  - amount 行：整数元 > 0（商务必填；生态留空走挂牌价回退）
- *  400 时回滚到后端值 */
+/** 失焦提交（ADR-018 §3，PRICING-20261020；2026-10-24 ADR-022 改必填口径）：
+ *  - 所有行（unit/amount/遥感）：整数元 > 0 才提交；缺项（空/0/非整数）不提交，输入框值驱动标红
+ *  - 超参考区间由后端 400（文案走 showError），400 时回滚到后端值 */
 async function onAmountChange(row: CartRow) {
   const n = row.cart.amount
-  if (n === undefined) {
-    if (row.isAmount && !isViewer.value) amountErrors.add(row.cart.id)
-    else amountErrors.delete(row.cart.id)
-    return
-  }
-  if (!Number.isInteger(n) || (row.isAmount ? n <= 0 : n < 0)) {
-    amountErrors.add(row.cart.id)
-    return
-  }
-  amountErrors.delete(row.cart.id)
+  if (n === undefined || !Number.isInteger(n) || n <= 0) return // 缺项不提交（标红由值驱动）
   try {
     // 回传该行当前 qty：后端 PUT 对 qty<=0 直接 400，且区间校验按新 qty 重算
     await setCartAmount(row.cart.id, row.cart.qty, n)
@@ -180,7 +159,7 @@ const previewGroups = computed(() => {
 async function onCustomerChange(row: CartRow) {
   const id = row.cart.id
   const next = (row.cart.customer ?? '').trim()
-  if (next) customerErrors.delete(id)
+  // 2026-10-24（ADR-022）：缺项标红为值驱动（空即红），无需维护 error 集合
   try {
     await patchCartItem(id, next)
   } catch (e) {
@@ -308,25 +287,24 @@ const orderItems = computed<OrderItem[]>(() =>
   })),
 )
 
+/** 结算前置校验（2026-10-24 ADR-022：三必填项逐行校验，与后端 checkout 400 同口径）：
+ *  客户非空 / 金额整数元 > 0（所有行类型，含遥感行）/ 普通行服务期限两日期齐全且 start ≤ end
+ *  （遥感明细行期限豁免，ADR-020）；有缺项不弹结算窗——提示点明缺项类别，
+ *  缺项输入框本身已值驱动标红（amountInvalid / serviceMissing / 客户空值），用户可直接定位 */
 function openOrder() {
   if (!db.cart.length) return
-  // 结算前置校验：任一行为空客户 → 不发请求，标红输入框（validate=error）
-  const missing = cartRows.value.filter((r) => !(r.cart.customer ?? '').trim())
-  if (missing.length) {
-    missing.forEach((r) => customerErrors.add(r.cart.id))
-    ElMessage.warning('请为每件产品填写客户')
-    return
-  }
-  // ADR-008：包量定价行未填合同金额（整数元）→ 该行结算禁用，标红提示
-  // ADR-012：生态人员免填金额——留空时后端回退「挂牌价×数量」取整，商务审核订单时可再调整；商务保持必填
-  const missingAmount = isViewer.value
-    ? []
-    : cartRows.value.filter(
-        (r) => r.isAmount && !(r.cart.amount && Number.isInteger(r.cart.amount) && r.cart.amount > 0),
-      )
-  if (missingAmount.length) {
-    missingAmount.forEach((r) => amountErrors.add(r.cart.id))
-    ElMessage.warning('请为包量定价产品填写销售金额（整数元）')
+  const missingCustomer = cartRows.value.filter((r) => !(r.cart.customer ?? '').trim())
+  const missingAmount = cartRows.value.filter((r) => amountInvalid(r))
+  const missingService = cartRows.value.filter(
+    (r) => !r.rsItem && (!r.cart.serviceStart || !r.cart.serviceEnd || r.cart.serviceStart > r.cart.serviceEnd),
+  )
+  const missingCount = missingCustomer.length + missingAmount.length + missingService.length
+  if (missingCount) {
+    const parts: string[] = []
+    if (missingCustomer.length) parts.push('客户')
+    if (missingAmount.length) parts.push('销售金额（整数元）')
+    if (missingService.length) parts.push('服务期限（遥感明细行豁免）')
+    ElMessage.warning(`${missingCount} 行信息未填齐：请填写${parts.join('、')}`)
     return
   }
   orderVisible.value = true
@@ -379,7 +357,9 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
         <el-icon aria-hidden="true"><InfoFilled /></el-icon>
         <div>
           <b>下单前请完善关键信息</b>
-          <span>每件产品必填客户；销售金额按整数元填写——包量定价产品必填（生态可留空按挂牌价×数量回退），其余选填、填写即折扣金额（设参考区间时须落在区间内）；数量受产品可用数量约束（可重复售卖不受限），普通产品行可填服务期限。下单后按「产品 + 客户」分组各生成一条销售记录，销售项目进入「待审核」并锁定数量，商务确认（可改价）后生效，再执行「交付」生成交付记录。</span>
+          <!-- 2026-10-24（ADR-022）：必填口径——客户/销售金额/服务期限三必填（遥感明细行期限豁免），
+               原「生态可留空回退 / 其余选填」表述废弃 -->
+          <span>每件产品必填客户、销售金额（整数元 &gt; 0）与服务期限（开始/结束日期，遥感明细行豁免期限）；设参考区间时金额须落在区间内；数量受产品可用数量约束（可重复售卖不受限）。下单后按「产品 + 客户」分组各生成一条销售记录，销售项目进入「待审核」并锁定数量，商务确认（可改价）后生效，再执行「交付」生成交付记录。</span>
         </div>
       </div>
 
@@ -429,17 +409,20 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
             </template>
           </el-table-column>
           <el-table-column label="客户" width="180" align="left">
+            <!-- 2026-10-24（ADR-022）：列头必填红星（警示红，轻量） -->
+            <template #header><span>客户<i class="req-star">*</i></span></template>
             <template #default="{ row }">
               <!-- 2026-10-23 修复①：统一单元格结构——客户列无副提示，渲染空占位区保证行高一致 -->
               <div class="cart-cell">
                 <div class="cell-main">
-                  <!-- 行级客户对三角色均可编辑（含生态人员） -->
+                  <!-- 行级客户对三角色均可编辑（含生态人员）；
+                       2026-10-24（ADR-022）：空值即标红（值驱动，与列头红星同口径） -->
                   <el-tooltip content="结算时按「产品 + 客户」分组生成销售记录" placement="top">
                     <el-input
                       v-model="row.cart.customer"
                       size="small"
-                      :placeholder="customerErrors.has(row.cart.id) ? '必填' : '填写客户'"
-                      :class="{ 'cart-customer-error': customerErrors.has(row.cart.id) }"
+                      :placeholder="(row.cart.customer ?? '').trim() ? '填写客户' : '必填'"
+                      :class="{ 'cart-customer-error': !(row.cart.customer ?? '').trim() }"
                       @change="onCustomerChange(row)"
                     />
                   </el-tooltip>
@@ -510,24 +493,25 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
               </div>
             </template>
           </el-table-column>
-          <!-- ADR-018 §3（PRICING-20261020）：所有行（unit/amount/遥感）均可输销售金额（整数元）——
-               amount 行 = 权威输入（商务必填）；unit/遥感行 = 折扣金额（选填，超参考区间后端 400） -->
+          <!-- ADR-018 §3（PRICING-20261020）：所有行（unit/amount/遥感）均可输销售金额（整数元）；
+               2026-10-24（ADR-022）：所有行必填（整数元 > 0）——amount 行 = 权威输入，
+               unit/遥感行 = 折扣金额（超参考区间后端 400）；原「选填 / 留空回退」口径废弃 -->
           <!-- 2026-10-20 修复：列宽 190→200，保证下方参考区间小字（如「参考区间 5100000~5100000 元/套」）不挤压换行 -->
           <el-table-column label="销售金额（元）" width="200" align="center">
+            <!-- 2026-10-24（ADR-022）：列头必填红星（警示红，轻量） -->
+            <template #header><span>销售金额（元）<i class="req-star">*</i></span></template>
             <template #default="{ row }">
-              <!-- 2026-10-23 修复①：统一单元格结构——输入框进主内容区，两行小字合并为 18px 副提示区一行：
-                   金额为空时优先显示参考区间，无区间则显示兜底口径提示；已填金额时显示区间（无区间则留空占位） -->
+              <!-- 2026-10-23 修复①：统一单元格结构——输入框进主内容区，参考区间小字进 18px 副提示区
+                   2026-10-24（ADR-022）：placeholder 统一「必填，整数元」；缺项（空/0/非整数）值驱动标红
+                   （复用 .cart-customer-error 同一「必填缺项」样式）；原留空兜底口径小字整体移除 -->
               <div class="cart-cell">
                 <div class="cell-main">
                   <el-tooltip :content="amountTip(row)" placement="top">
                     <el-input
                       :model-value="row.cart.amount ?? ''"
-                      :placeholder="amountPlaceholder(row)"
+                      placeholder="必填，整数元"
                       size="small"
-                      :class="{
-                        'cart-amount-empty': row.isAmount && !isViewer && !row.cart.amount,
-                        'cart-customer-error': amountErrors.has(row.cart.id),
-                      }"
+                      :class="{ 'cart-customer-error': amountInvalid(row) }"
                       @input="onAmountInput(row, $event)"
                       @change="onAmountChange(row)"
                     />
@@ -537,12 +521,10 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
                   <!-- ADR-018：产品设了参考区间时展示区间提示（超区间提交由后端 400，文案走 showError）
                        ADR-021（RSITEM-RANGE-20261020）：遥感明细行改读该明细自身区间，普通行仍读产品区间
                        2026-10-20 修复：提示可见性——显式辅助色 #71829A（原 .muted #9aa9bf 过淡）、11px；
-                       遥感行单位按 ADR-021 口径展示「份」（父产品 unit 为「份（可售明细）」容器口径，不宜直接展示）
-                       2026-10-22 修复⑤ 兜底口径小字并入此行：仅金额留空且无区间时出现 -->
+                       遥感行单位按 ADR-021 口径展示「份」（父产品 unit 为「份（可售明细）」容器口径，不宜直接展示） -->
                   <span v-if="rowRangeText(row)" class="cart-amount-range">
                     参考区间 {{ rowRangeText(row) }} 元/{{ row.rsItem ? '份' : (row.asset.unit || '单位') }}
                   </span>
-                  <span v-else-if="!row.cart.amount" class="cart-amount-fallback">{{ amountFallbackHint(row) }}</span>
                 </div>
               </div>
             </template>
@@ -552,8 +534,16 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
           <!-- 2026-10-20 修复：列宽 215→300（原列宽下每个日期输入仅约 94px，YYYY-MM-DD 被截断成「2026-10-2…」）；
                两个日期输入各设明确宽度 136px（可完整显示 YYYY-MM-DD + 日历图标），中间留 8px 间距 -->
           <el-table-column label="服务期限" width="300" align="center">
+            <!-- 2026-10-24（ADR-022）：列头必填红星 + tooltip 说明遥感明细行豁免 -->
+            <template #header>
+              <el-tooltip content="必填（遥感明细行按期数售卖，豁免期限）" placement="top">
+                <span>服务期限<i class="req-star">*</i></span>
+              </el-tooltip>
+            </template>
             <template #default="{ row }">
-              <!-- 2026-10-23 修复①：统一单元格结构——双日期（136px 不变）进主内容区，本列无副提示（空占位） -->
+              <!-- 2026-10-23 修复①：统一单元格结构——双日期（136px 不变）进主内容区，本列无副提示（空占位）
+                   2026-10-24（ADR-022）：placeholder 改「开始日期/结束日期」（修正语义）；
+                   任一日期为空（或 start > end）对应输入框标红（与输入框标红同色系）；遥感行仍豁免 -->
               <div class="cart-cell">
                 <div class="cell-main cell-main-center">
                   <template v-if="!row.rsItem">
@@ -563,8 +553,9 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
                         type="date"
                         value-format="YYYY-MM-DD"
                         size="small"
-                        placeholder="开始"
+                        placeholder="开始日期"
                         style="width: 136px;"
+                        :class="{ 'cart-service-error': serviceMissing(row, 'start') }"
                         @change="onServiceChange(row)"
                       />
                       <el-date-picker
@@ -572,8 +563,9 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
                         type="date"
                         value-format="YYYY-MM-DD"
                         size="small"
-                        placeholder="结束"
+                        placeholder="结束日期"
                         style="width: 136px;"
+                        :class="{ 'cart-service-error': serviceMissing(row, 'end') }"
                         @change="onServiceChange(row)"
                       />
                     </div>
@@ -623,7 +615,7 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
             <small>应付合计</small>{{ formatMoney(totalAmount) }}
           </div>
         </div>
-        <!-- 结算下单对三角色均可用（含生态人员）；前置校验（客户/金额必填）仍走 openOrder -->
+        <!-- 结算下单对三角色均可用（含生态人员）；前置校验（2026-10-24 ADR-022：客户/金额/服务期限三必填）仍走 openOrder -->
         <el-button class="co-btn" type="primary" :disabled="!db.cart.length" @click="openOrder">
           结算下单 →
         </el-button>
@@ -833,20 +825,22 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
   border-left: 1px solid var(--divider-color);
   border-right: 1px solid var(--divider-color);
 }
-/* 2026-10-23 修复③：× 图标不明显，改回文字按钮「删除」——默认辅助色 #71829A、13px，
-   hover 系统警示红 + 浅红底（沿用系统色板）；原 .cart-qty-hint 样式随数量列 hint 并入 .cell-hint 而删除 */
+/* 2026-10-23 修复③：× 图标不明显，改回文字按钮「删除」；
+   2026-10-24（ADR-022 批次）：默认即系统警示红 + 浅红底（danger-light-9，沿用系统色板），
+   hover 加深（danger-dark-2 + danger-light-8）——破坏性操作一眼可见 */
 .cart-remove {
   border: 0;
   padding: 4px 10px;
-  background: transparent;
-  color: #71829a;
+  background: var(--el-color-danger-light-9);
+  color: var(--danger-color);
   font-size: 13px;
+  font-weight: 500;
   border-radius: 6px;
   cursor: pointer;
 }
 .cart-remove:hover {
-  color: var(--danger-color);
-  background: var(--el-color-danger-light-9);
+  color: var(--el-color-danger-dark-2);
+  background: var(--el-color-danger-light-8);
 }
 
 /* 2026-10-22 修复④：页面底部留白——结算栏 sticky 悬浮（bottom:16px，实际高度约 72px），
@@ -919,10 +913,7 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
 .cart-amount-range {
   color: #71829a;
 }
-/* 2026-10-22 修复⑤：金额留空兜底口径小字——与参考区间提示同款规格（11px + 辅助色 #71829A），不引入新样式体系 */
-.cart-amount-fallback {
-  color: #71829a;
-}
+/* 2026-10-24（ADR-022）：原 .cart-amount-fallback（金额留空兜底口径小字）随留空成交口径下线而删除 */
 /* 2026-10-22 修复⑤：遥感行服务期限「-」整列宽度内居中（block + text-align，覆盖单元格默认左对齐） */
 .cart-service-dash {
   display: block;
@@ -935,13 +926,18 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
   align-items: center;
   gap: 8px;
 }
-/* 空客户校验标红（EP 2.14 独立 el-input 无 validate 态，按 wrapper box-shadow 描边） */
-.cart-customer-error :deep(.el-input__wrapper) {
+/* 必填缺项标红（2026-10-24 ADR-022：客户/金额/服务期限统一同一「必填缺项」样式——
+   EP 2.14 独立 el-input / el-date-picker 无 validate 态，按 wrapper box-shadow 描边，警示红同色系；
+   原 .cart-amount-empty 置灰样式随「viewer 免填」口径一并废弃） */
+.cart-customer-error :deep(.el-input__wrapper),
+.cart-service-error :deep(.el-input__wrapper) {
   box-shadow: 0 0 0 1px var(--danger-color) inset;
 }
-/* ADR-008：合同金额未填时置灰（该行结算禁用，tooltip 提示） */
-.cart-amount-empty :deep(.el-input__wrapper) {
-  opacity: 0.45;
+/* 2026-10-24（ADR-022）：列头必填红星（警示红，轻量——仅颜色 + 2px 间距，继承表头 12px 加粗） */
+.req-star {
+  color: var(--danger-color);
+  font-style: normal;
+  margin-left: 2px;
 }
 .th-right {
   display: flex;

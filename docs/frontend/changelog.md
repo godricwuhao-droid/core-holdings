@@ -2,6 +2,23 @@
 
 > 记录 core-holdings 前端（Vue3 + TS + Element Plus + Vite）的页面/组件/接口封装变更。
 
+## 2026-10-24 ｜ 修改：购物车结算必填口径（客户/金额/服务期限）+ 删除按钮默认红色（ADR-022）
+
+**关联任务**：REQUIRED-20261024（契约见 docs/api-contracts.md「REQUIRED-20261024 批次」，决策 ADR-022）。后端并行实现 checkout 必填 400，前端按契约先行。
+
+| 日期 | 类型 | 变更内容 | 影响文件范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-24 | 修改 | ① 必填口径（ADR-022：客户/销售金额/服务期限全部必填，遥感明细行期限豁免）：金额 placeholder 统一「必填，整数元」（viewer/商务旧口径文案废弃）；`amountFallbackHint` 兜底提示（留空按挂牌价/明细价结算）与 `.cart-amount-fallback` 样式整体移除；缺项标红改为**值驱动**——客户空值、金额空/0/非整数（新增 `amountInvalid`）、普通行任一日期为空或 start>end（新增 `serviceMissing`）即红边框，三者统一同一「必填缺项」样式（`.cart-customer-error` / `.cart-service-error` 共用 `--danger-color` inset 描边），原 `customerErrors`/`amountErrors` 集合与 `.cart-amount-empty` 置灰样式删除；`onAmountChange` 改所有行整数元 >0 才提交（viewer 免填/选填分支废弃，`isViewer` 导入随之移除）；`openOrder` 结算前置校验改三必填项逐行校验（客户/金额/普通行两日期齐全且 start≤end，遥感行期限豁免），缺项不弹结算窗并提示「N 行信息未填齐：请填写客户、销售金额（整数元）、服务期限（遥感明细行豁免）」（按实际缺项类别拼接） | views/cart/index.vue | REQUIRED-20261024（ADR-022） | 提交链路（PUT /cart/{id} 回滚口径）、结算预览 previewGroups、下单 onOrderSubmit 函数体零改动 |
+| 2026-10-24 | 修改 | ② 服务期限 placeholder 语义修正：「开始/结束」→「开始日期/结束日期」；遥感行维持「-」占位豁免不标红 | views/cart/index.vue | REQUIRED-20261024（ADR-022） | — |
+| 2026-10-24 | 修改 | ③ 列头必填红星 + 文案口径：客户/销售金额（元）/服务期限三列头加警示红 `*`（新增 `.req-star`，轻量——仅颜色 + 2px 间距），服务期限红星带 tooltip「必填（遥感明细行按期数售卖，豁免期限）」；notice 条与金额 tooltip（`amountTip`）「选填/留空回退」表述同步改为必填口径 | views/cart/index.vue | REQUIRED-20261024（ADR-022） | grep「选填」「留空按」代码零残留（仅注释说明保留） |
+| 2026-10-24 | 修改 | ④ 删除按钮默认红色：`.cart-remove` 由默认灰 #71829A（hover 才红）改为默认系统警示红 `--danger-color` + 浅红底 `--el-color-danger-light-9`，hover 加深（`--el-color-danger-dark-2` + `--el-color-danger-light-8`），破坏性操作一眼可见 | views/cart/index.vue | REQUIRED-20261024（ADR-022） | 色值全部走系统色板变量；删行仍走 removeRow，三角色可用口径不变 |
+
+### 验证
+
+- `npx vue-tsc --noEmit` 0 error（strict）；IDE 诊断 0。
+- 场景自查：普通产品行（客户/金额/两日期空值即标红，填齐解除）、遥感明细行（金额必填标红、服务期限「-」豁免不校验不标红、数量恒 1）、包量行（金额必填权威口径）、缺项结算拦截（提示点明缺项类别 + 缺项输入框保持标红可定位、不弹结算窗）、空购物车（el-empty 分支，结算按钮禁用）均正常。
+- 未修改 backend/ 下任何文件；未执行构建/部署；未 commit。
+
 ## 2026-10-24 ｜ 修复：购物车产品列长名称换行被遮挡（单行省略 + tooltip，行高不变）
 
 **关联任务**：用户截图反馈——2026-10-23 行等高改造后，产品名较长（如「青牛企业大数据分析平台V1.0」）换行成 2 行 + meta 行 1 行共 3 行，超出 40px 主区，名称首行被行分隔线/单元格边界盖住（截图中仅「V1.0」与 meta 行可见）。
