@@ -409,9 +409,18 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
                     <div class="cart-product-icon" aria-hidden="true">{{ typeIcon(row.asset.type) }}</div>
                     <div class="cart-product-info">
                       <!-- ADR-011：遥感明细行两行展示——主行父产品名，次级行明细名（省/市 精度 月份） -->
-                      <a class="cart-asset-name" @click="goAssetDetail(row.asset.id)">{{ row.asset.name }}</a>
-                      <div v-if="row.rsItem" class="muted cart-asset-sub">{{ rsItemName(row.rsItem) }}</div>
-                      <div v-else class="muted cart-asset-sub">{{ row.asset.code }} · {{ row.asset.type }} · {{ entityShort(row.asset.subject) }}</div>
+                      <!-- 2026-10-24 修复：长产品名换行后超出 40px 主区、首行被行分隔线盖住——
+                           名称/meta 均改单行省略（CSS ellipsis），el-tooltip hover 显示全文
+                           （与本页客户/金额列 tooltip 同款做法），行高保持 ~90px 不变 -->
+                      <el-tooltip :content="row.asset.name" placement="top">
+                        <a class="cart-asset-name" @click="goAssetDetail(row.asset.id)">{{ row.asset.name }}</a>
+                      </el-tooltip>
+                      <el-tooltip v-if="row.rsItem" :content="rsItemName(row.rsItem)" placement="top">
+                        <div class="muted cart-asset-sub">{{ rsItemName(row.rsItem) }}</div>
+                      </el-tooltip>
+                      <el-tooltip v-else :content="`${row.asset.code} · ${row.asset.type} · ${entityShort(row.asset.subject)}`" placement="top">
+                        <div class="muted cart-asset-sub">{{ row.asset.code }} · {{ row.asset.type }} · {{ entityShort(row.asset.subject) }}</div>
+                      </el-tooltip>
                     </div>
                   </div>
                 </div>
@@ -730,16 +739,32 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
   min-width: 0;
 }
 .cart-asset-name {
+  /* 2026-10-24 修复：长名称（如「青牛企业大数据分析平台V1.0」）原换行 2 行 + meta 1 行共 3 行，
+     超出 40px 主区导致首行被行分隔线盖住——改单行省略，全文由 el-tooltip hover 展示，行高不变 */
+  display: block;
+  max-width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   color: var(--primary-color);
   cursor: pointer;
   font-weight: 600;
   font-size: 14px;
+  /* 2026-10-24 修复：显式行高 20px（名称 20 + margin 4 + meta 16 = 40px），
+     保证「名称 + meta」两行恰好落在 40px 主区内，不撑高行、不压副提示区 */
+  line-height: 20px;
 }
 .cart-asset-name:hover {
   text-decoration: underline;
 }
 .cart-asset-sub {
+  /* 2026-10-24 修复：meta 行（编号·类型·主体 / 遥感明细名）同样可能过长——
+     统一单行省略（与名称行同规格），全文由 el-tooltip hover 展示，保证行高统一 */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   font-size: 12px;
+  line-height: 16px; /* 2026-10-24 修复：与名称行高配合，两行合计 40px 不超出主区 */
   margin-top: 4px;
 }
 
