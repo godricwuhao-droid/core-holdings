@@ -5,6 +5,26 @@
 
 ---
 
+## 2026-10-20 变更（RSITEM-RANGE-20261020：遥感售卖明细参考区间，rs_items 2 列，依据 ADR-021）
+
+### 新增列（可空，存量 98 条明细不迁移——NULL 即不限制，行为同现状）
+
+| 列 | 类型 | 说明 |
+|---|---|---|
+| `rs_items.priceMin` | FLOAT NULL | 参考区间下限（元/份，ADR-021）。生态下单遥感明细行折扣单价（amount÷qty）须落在 [priceMin, priceMax]；NULL=未设置（不限制），只填其一=单边边界 |
+| `rs_items.priceMax` | FLOAT NULL | 参考区间上限（元/份）。两者都有时 min ≤ max（服务层校验，400「参考区间下限不能大于上限」） |
+
+> 注：遥感明细行折扣校验口径切换——区间来源由父产品容器 `assets.priceMin/priceMax` 改为**该明细自身**（ADR-021 §2，取代 ADR-018 §5「遥感行不限制」推断口径）；普通产品行仍用 assets 区间。
+
+### 迁移语句（幂等，`main.py::_ensure_migration`）
+
+```sql
+ALTER TABLE rs_items ADD COLUMN priceMin FLOAT;
+ALTER TABLE rs_items ADD COLUMN priceMax FLOAT;
+```
+
+---
+
 ## 2026-10-20 变更（PRICING-20261020：价格体系 + 时间节点 + 服务期限，4 表 9 列，依据 ADR-018/019/020）
 
 ### 新增列（全部可空，存量数据不迁移——旧数据 NULL 即兼容）

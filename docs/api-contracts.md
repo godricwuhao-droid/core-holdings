@@ -90,3 +90,14 @@
 
 ### 7. 下单入口（ADR-020）
 - 前端删除「登记销售」入口与 SalesOrderDialog 非购物车模式；`POST /sales/order` 后端保留、文档标记 deprecated。
+
+---
+
+## RSITEM-RANGE-20261020 批次：遥感售卖明细参考区间（ADR-021）
+
+> 取代 ADR-018 §5「遥感行不限制」口径。前后端同批上线。
+
+1. `/bootstrap` 的 `rsItems`：每行新增 `priceMin` / `priceMax`（number | null，元/份）。
+2. `POST /assets/{id}/rs-items`、`PUT /assets/{id}/rs-items/{item_id}` 入参新增 `priceMin` / `priceMax`（number ≥ 0 | null）；两者都有时 min ≤ max 否则 400「参考区间下限不能大于上限」。
+3. 折扣区间校验口径变更：生态下单链路（购物车行更新 / checkout / sales/order）中**遥感明细行（itemId 非空）金额校验改用该 rs_item 自身区间**（不再取父产品容器区间）；普通产品行仍用 assets 区间；未设区间 = 不限制。400 文案口径同 PRICING 批次。
+4. 原价快照不变：遥感行 origPrice/origAmount = 明细 price 快照。

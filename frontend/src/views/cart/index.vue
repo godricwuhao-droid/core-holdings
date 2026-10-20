@@ -80,6 +80,12 @@ function amountTip(row: CartRow): string {
   return '选填：留空按原价成交（挂牌价×数量）；填写即折扣金额（整数元，须落在产品参考区间内）'
 }
 
+/** 行参考区间文案（ADR-021，RSITEM-RANGE-20261020）：
+ *  遥感明细行（rsItem 非空）读该明细自身区间（不再取父产品容器区间）；普通行读产品区间；未设返回空串不显示 */
+function rowRangeText(row: CartRow): string {
+  return row.rsItem ? priceRangeText(row.rsItem) : priceRangeText(row.asset)
+}
+
 /** 金额输入占位：amount 行沿用原口径；unit/遥感行标注「选填」 */
 function amountPlaceholder(row: CartRow): string {
   if (row.isAmount) return isViewer.value ? '整数元（可留空）' : '整数元'
@@ -410,9 +416,10 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
                   @change="onAmountChange(row)"
                 />
               </el-tooltip>
-              <!-- ADR-018：产品设了参考区间时展示区间提示（超区间提交由后端 400，文案走 showError） -->
-              <div v-if="priceRangeText(row.asset)" class="muted cart-amount-range">
-                参考区间 {{ priceRangeText(row.asset) }} 元/{{ row.asset.unit || '单位' }}
+              <!-- ADR-018：产品设了参考区间时展示区间提示（超区间提交由后端 400，文案走 showError）
+                   ADR-021（RSITEM-RANGE-20261020）：遥感明细行改读该明细自身区间，普通行仍读产品区间 -->
+              <div v-if="rowRangeText(row)" class="muted cart-amount-range">
+                参考区间 {{ rowRangeText(row) }} 元/{{ row.asset.unit || '单位' }}
               </div>
             </template>
           </el-table-column>

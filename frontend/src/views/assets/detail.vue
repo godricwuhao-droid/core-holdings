@@ -293,6 +293,9 @@ const rsForm = reactive({
   resolution: undefined as number | undefined,
   saleMonth: '',
   price: undefined as number | undefined,
+  // 参考价格区间（ADR-021，RSITEM-RANGE-20261020）：选填（可单边），与产品区间同口径
+  priceMin: undefined as number | undefined,
+  priceMax: undefined as number | undefined,
 })
 
 function openRsCreate() {
@@ -302,6 +305,8 @@ function openRsCreate() {
   rsForm.resolution = undefined
   rsForm.saleMonth = ''
   rsForm.price = undefined
+  rsForm.priceMin = undefined
+  rsForm.priceMax = undefined
   rsForm.visible = true
 }
 
@@ -312,6 +317,9 @@ function openRsEdit(it: RsItem) {
   rsForm.resolution = it.resolution
   rsForm.saleMonth = it.saleMonth
   rsForm.price = it.price
+  // ADR-021（RSITEM-RANGE-20261020）：参考区间回显（未设为 null → 输入框留空）
+  rsForm.priceMin = it.priceMin ?? undefined
+  rsForm.priceMax = it.priceMax ?? undefined
   rsForm.visible = true
 }
 
@@ -339,6 +347,9 @@ async function saveRsItem() {
     resolution: rsForm.resolution,
     saleMonth: rsForm.saleMonth,
     price: rsForm.price,
+    // ADR-021（RSITEM-RANGE-20261020）：参考区间 undefined → null（区分「未设」，含清空场景）
+    priceMin: rsForm.priceMin ?? null,
+    priceMax: rsForm.priceMax ?? null,
     // 编辑沿用既有可重复售卖设置；新增默认 true（只计次不扣量）
     repeatSale: rsForm.editing ? rsForm.editing.repeatSale : true,
   }
@@ -573,8 +584,11 @@ function operatorText(f: AssetFlow): string {
                   <template #default="{ row }">{{ row.resolution }}m</template>
                 </el-table-column>
                 <el-table-column label="月份" width="110" align="center" prop="saleMonth" />
-                <el-table-column label="单价" width="110" align="center">
-                  <template #default="{ row }">{{ formatMoney(row.price) }}</template>
+                <el-table-column label="单价" width="150" align="center" show-overflow-tooltip>
+                  <!-- ADR-021（RSITEM-RANGE-20261020）：有参考区间时追加「（参考区间 {min}~{max}）」，无区间维持原展示（与产品价同口径） -->
+                  <template #default="{ row }">
+                    {{ formatMoney(row.price) }}<template v-if="priceRangeText(row)">（参考区间 {{ priceRangeText(row) }}）</template>
+                  </template>
                 </el-table-column>
                 <el-table-column label="可重复售卖" width="110" align="center">
                   <template #default="{ row }">
@@ -989,6 +1003,18 @@ function operatorText(f: AssetFlow): string {
               style="width: 100%;"
             />
             <div class="dlg-hint">整数元/份，须大于 0</div>
+          </el-form-item>
+          <!-- ADR-021（RSITEM-RANGE-20261020）：参考价格区间——元/份，选填（可单边），
+               下单时行折扣单价须落在区间内，超区间后端 400；交互/样式与产品区间一致 -->
+          <el-form-item label="参考价格区间（元）">
+            <div class="price-range-row">
+              <el-input-number v-model="rsForm.priceMin" :min="0" :precision="2" :controls="false" placeholder="下限（选填）" style="width: 100%;" />
+              <span class="muted price-range-sep">~</span>
+              <el-input-number v-model="rsForm.priceMax" :min="0" :precision="2" :controls="false" placeholder="上限（选填）" style="width: 100%;" />
+            </div>
+            <div class="muted" style="font-size: 12px; margin-top: 4px;">
+              元/份，选填（可只填一边）；下单折扣区间校验用，未设置则不限制
+            </div>
           </el-form-item>
         </el-form>
         <template #footer>
@@ -1535,6 +1561,17 @@ function operatorText(f: AssetFlow): string {
   flex-direction: column;
   align-items: flex-start;
   gap: 10px;
+}
+
+/* ADR-021（RSITEM-RANGE-20261020）：参考价格区间双输入（下限 ~ 上限），与产品表单同款 */
+.price-range-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+.price-range-sep {
+  flex-shrink: 0;
 }
 
 </style>

@@ -2,6 +2,27 @@
 
 > 记录 core-holdings 后端（FastAPI + SQLAlchemy + SQLite）的接口与行为变更。
 
+## 2026-10-20 ｜ 新增/修改：RSITEM-RANGE-20261020 遥感售卖明细（rs_items）参考价区间（分支 feat/pricing-discount-timelines）
+
+> 依据 ADR-021（取代 ADR-018 §5「遥感行不限制」口径），前后端同批上线（契约见 api-contracts.md「RSITEM-RANGE-20261020 批次」）。
+
+| 日期 | 类型 | 变更内容 | 影响文件范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-20 | 新增 | ⚠️ 数据模型：`rs_items.priceMin/priceMax`（参考区间，元/份，可空=不限制，同 ADR-018 产品区间口径）；`main.py::_ensure_migration` 幂等加列（inspector + ALTER TABLE，沿用现有模式） | `backend/src/models.py`、`backend/main.py` | RSITEM-RANGE-20261020 | 存量 98 条明细区间 NULL=不限制（行为同现状）；见 database.md 本批次章节 |
+| 2026-10-20 | 新增 | `POST /assets/{id}/rs-items`、`PUT /rs-items/{id}` 入参新增 `priceMin/priceMax`（≥0 可空，单边允许；传 null 清空）；两者都有时 min ≤ max 否则 400「参考区间下限不能大于上限」（复用 `_validate_price_range`，与产品区间同口径）；出参 `RsItemOut` 同步带出 | `backend/src/schemas.py`、`backend/src/services.py` | RSITEM-RANGE-20261020 | 契约 §2 |
+| 2026-10-20 | 修改 | ⚠️ 折扣校验口径切换（ADR-021 §2）：`_check_discount_range` 新增 `rs` 参数——遥感明细行（itemId 非空）区间取**该 rs_item 自身** priceMin/priceMax（不再取父产品容器 assets 区间）；普通产品行行为完全不变；未设区间=不限制。覆盖全部 5 个调用点：加购 `_cart_add_inner`（POST /cart、/cart/batch 共用）、行更新 `update_cart_item`（PUT /cart/{id}）、行改客户 `patch_cart_item`（PATCH /cart/{id}）、直接下单 `_create_project_core`（POST /sales/order）、checkout `checkout`（POST /cart/checkout） | `backend/src/services.py` | RSITEM-RANGE-20261020 | 契约 §3；400 文案口径同 PRICING 批次 |
+| 2026-10-20 | 修改 | bootstrap 快照：`rsItems[]` 每行带出 `priceMin/priceMax`（RsItemOut 出参自动带出） | `backend/src/schemas.py` | RSITEM-RANGE-20261020 | 契约 §1 |
+
+### 验证
+
+- `python3 -m compileall -q src main.py` 通过；`import src.services / src.routers.api / src.schemas / src.models / main` → import ok。
+- 迁移：dev server 重启触发 `_ensure_migration`，`rs_items` 表 PRAGMA 确认 `priceMin/priceMax` 列已补；98 条存量明细区间全 NULL（不限制，行为同现状）。
+- dev server（uvicorn --reload）全链路 curl 实测（admin）：`PUT /api/rs-items/1`（priceMin=200000/priceMax=400000）→ 200 出参含新字段；`PUT /api/rs-items/1`（min=500000 > max=200000）→ 400「参考区间下限不能大于上限」；`GET /api/bootstrap` rsItems 全行含 priceMin/priceMax 键（存量 null）。
+- 校验口径实测：明细 #1 设区间 200000~400000 后——`POST /api/cart`（itemId=1, amount=100000 低于下限）→ 400「折扣单价超出该产品参考区间（200000~400000 元/份（可售明细））」（父产品容器区间为 NULL，证明取的是明细自身区间）；amount=250000 区间内 → 200；`PUT /api/cart/{id}`（amount=500000 超上限）→ 400；checkout 路径 Python 直调干跑（临时行 amount=900000）→ 400 同文案，回滚无残留；区间改回 null 后任意金额（amount=1）→ 200（不限制，现状行为保持）。
+- 原价快照自查：`_create_project_core` 遥感行 `origPrice=rs.price` 分支未触碰，不受影响。
+- 测试数据已还原：明细 #1 区间改回 null（rs_items 非空区间行数 0）、临时购物车行全部删除（残留 0）。
+- 未修改 frontend/ 任何文件、未执行构建/部署、未 git commit。
+
 ## 2026-10-20 ｜ 新增/修改：PRICING-20261020 价格体系（区间/折扣）+ 时间节点 + 状态机 + 服务期限（分支 feat/pricing-discount-timelines）
 
 > 依据 ADR-018 / ADR-019 / ADR-020，前后端同批上线（契约见 api-contracts.md「PRICING-20261020 批次」）。

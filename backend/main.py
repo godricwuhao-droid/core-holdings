@@ -146,6 +146,13 @@ def _ensure_migration() -> None:
             conn.execute(text("ALTER TABLE assets ADD COLUMN priceMin FLOAT"))
             conn.execute(text("ALTER TABLE assets ADD COLUMN priceMax FLOAT"))
         print("[migration] assets.priceMin/priceMax 列已补充（ADR-018 参考区间）")
+    # RSITEM-RANGE-20261020（ADR-021）：遥感售卖明细参考价区间，可空、存量 96 条明细 NULL=不限制
+    rs_cols = [c["name"] for c in insp.get_columns("rs_items")]
+    if "priceMin" not in rs_cols:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE rs_items ADD COLUMN priceMin FLOAT"))
+            conn.execute(text("ALTER TABLE rs_items ADD COLUMN priceMax FLOAT"))
+        print("[migration] rs_items.priceMin/priceMax 列已补充（ADR-021 参考区间）")
     if "serviceStart" not in cart_cols:
         with engine.begin() as conn:
             conn.execute(text("ALTER TABLE cart_items ADD COLUMN serviceStart VARCHAR(10)"))

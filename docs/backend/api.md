@@ -4,6 +4,44 @@
 
 ---
 
+## 2026-10-20 变更（RSITEM-RANGE-20261020 遥感售卖明细参考区间，⚠️ 折扣校验口径变更，依据 ADR-021）
+
+> 取代 ADR-018 §5「遥感行不限制」口径（契约见 api-contracts.md「RSITEM-RANGE-20261020 批次」）。
+
+### `POST /api/assets/{id}/rs-items`、`PUT /api/rs-items/{item_id}` 入参新增字段
+
+`RsItemInput` 新增 `priceMin` / `priceMax`（number ≥ 0 | null，元/份，选填，单边允许；PUT 传 null 清空）。两者都有时 min ≤ max，否则 400「参考区间下限不能大于上限」（与产品区间同口径）。出参 `RsItemOut` 同步带出两字段。
+
+请求：`PUT /api/rs-items/1`
+
+```json
+{"province":"河北省","city":"石家庄市","resolution":1.5,"saleMonth":"2026-09","price":330000,"priceMin":200000,"priceMax":400000,"repeatSale":true}
+```
+
+响应（200，RsItemOut）：
+
+```json
+{"id":1,"assetId":29,"province":"河北省","city":"石家庄市","resolution":1.5,"saleMonth":"2026-09","price":330000.0,"priceMin":200000.0,"priceMax":400000.0,"repeatSale":true,"createdAt":"2026-10-16 11:41","updatedAt":"2026-10-20 15:53"}
+```
+
+关键字段：`priceMin`/`priceMax`（number | null，null=不限制）。min>max → 400 `参考区间下限不能大于上限`。
+
+### `GET /api/bootstrap`
+
+`rsItems[]` 每行新增 `priceMin` / `priceMax`（number | null，元/份）；存量明细为 null（不限制）。
+
+### ⚠️ 折扣区间校验口径变更（生态下单链路）
+
+`POST /cart`、`POST /cart/batch`、`PUT /cart/{id}`、`PATCH /cart/{id}`、`POST /cart/checkout`、`POST /sales/order` 中**遥感明细行（itemId 非空）**的金额区间校验改用**该 rs_item 自身的 priceMin/priceMax**（不再取父产品容器 assets 的区间）；普通产品行仍用 assets 区间，行为完全不变；未设区间 = 不限制。超限 400 文案口径同 PRICING 批次：
+
+```json
+{"detail":"折扣单价超出该产品参考区间（200000~400000 元/份（可售明细））"}
+```
+
+原价快照不变：遥感行 origPrice/origAmount = 明细 price 快照（ADR-018 §2）。
+
+---
+
 ## 2026-10-20 变更（PRICING-20261020 价格体系 + 时间节点 + 状态机 + 服务期限，⚠️ 部分行为变更）
 
 > 依据 ADR-018 / ADR-019 / ADR-020，前后端同批上线（契约见 api-contracts.md「PRICING-20261020 批次」）。

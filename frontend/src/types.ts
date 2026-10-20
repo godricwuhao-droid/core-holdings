@@ -106,6 +106,9 @@ export interface RsItem {
   resolution: number // 精度（米），如 1.5
   saleMonth: string // YYYY-MM
   price: number // 单价（整数元/份）
+  // 参考价格区间（ADR-021，RSITEM-RANGE-20261020）：元/份，选填（可单边）；下单折扣区间校验用
+  priceMin?: number | null
+  priceMax?: number | null
   repeatSale: boolean // 可重复售卖（默认 true，只计次不扣量）
   createdAt: string
   updatedAt: string

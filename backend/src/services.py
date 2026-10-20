@@ -211,28 +211,38 @@ def _validate_price_range(price_min: float | None, price_max: float | None) -> N
 
 
 def _check_discount_range(asset: models.Asset | None, qty: int, amount,
-                          unit: str = "") -> Decimal | None:
+                          unit: str = "",
+                          rs: models.RsItem | None = None) -> Decimal | None:
     """ADR-018 §1/§3（PRICING-20261020）：折扣金额校验 + 参考区间校验。
     购物车行更新 / 加购 / checkout / 直接下单（sales/order）各入口共用，不信任前端。
 
     - amount 为 None → 原价成交，返回 None（unit 行 salePrice×qty / 遥感行明细 price）；
     - amount 须为非负整数元，否则 400；
-    - 折扣单价 = amount ÷ qty（Decimal 保留 6 位）须落在产品参考区间 [priceMin, priceMax] 内：
-      产品未设置区间 = 不限制；单边区间按单边校验；超限 400
+    - 折扣单价 = amount ÷ qty（Decimal 保留 6 位）须落在参考区间 [priceMin, priceMax] 内：
+      未设置区间 = 不限制；单边区间按单边校验；超限 400
       「折扣单价超出该产品参考区间（{min}~{max} 元/{unit}）」（契约 §3 文案）。
+    - ADR-021（RSITEM-RANGE-20261020）：遥感明细行（rs 非空）区间取该 rs_item 自身的
+      priceMin/priceMax（不再取父产品容器 assets 的区间）；普通产品行行为不变。
     返回 Decimal 金额（元）。"""
     if amount is None:
         return None
     amt = _dec(amount)
     if amt < 0 or amt != amt.to_integral_value():
         raise HTTPException(400, "销售金额须为非负整数元")
-    if asset is None or qty <= 0:
+    if qty <= 0:
         return amt
-    lo, hi = asset.priceMin, asset.priceMax
+    # ADR-021（RSITEM-RANGE-20261020）：区间来源按行类型区分——
+    # 遥感明细行用明细自身区间；普通产品行用产品（assets）区间
+    if rs is not None:
+        lo, hi = rs.priceMin, rs.priceMax
+    elif asset is not None:
+        lo, hi = asset.priceMin, asset.priceMax
+    else:
+        return amt
     if lo is None and hi is None:
-        return amt  # 未设置区间 = 不限制（ADR-018 §1）
+        return amt  # 未设置区间 = 不限制（ADR-018 §1 / ADR-021）
     unit_price = (amt / qty).quantize(Decimal("0.000001"))
-    u = unit or (asset.unit or "")
+    u = unit or (asset.unit if asset else "")
     if lo is not None and hi is not None:
         rng = f"{lo:g}~{hi:g} 元/{u}"
     elif lo is not None:
@@ -596,11 +606,14 @@ def create_rs_item(db: Session, asset_id: int, data: schemas.RsItemInput,
     if a.type != "遥感数据":
         raise HTTPException(400, "仅遥感数据产品可维护可售明细")
     province, city, resolution, sale_month, price = _rs_item_fields(data)
+    # ADR-021（RSITEM-RANGE-20261020）：参考区间校验（与产品区间同口径，两者都有时 min ≤ max）
+    _validate_price_range(data.priceMin, data.priceMax)
     if _rs_item_dup(db, asset_id, province, city, resolution, sale_month):
         raise HTTPException(400, "该父产品下已存在相同 省/市 + 精度 + 月份 的明细")
     it = models.RsItem(
         assetId=asset_id, province=province, city=city, resolution=resolution,
         saleMonth=sale_month, price=price, repeatSale=data.repeatSale,
+        priceMin=data.priceMin, priceMax=data.priceMax,  # ADR-021：参考区间（可空=不限制）
         createdAt=now_str(), updatedAt=now_str(),
     )
     db.add(it)
@@ -624,6 +637,9 @@ def update_rs_item(db: Session, item_id: int, data: schemas.RsItemInput,
         raise HTTPException(400, "该父产品下已存在相同 省/市 + 精度 + 月份 的明细")
     it.province, it.city, it.resolution = province, city, resolution
     it.saleMonth, it.price, it.repeatSale = sale_month, price, data.repeatSale
+    # ADR-021（RSITEM-RANGE-20261020）：参考区间（与产品区间同口径；传 null 清空=不限制）
+    _validate_price_range(data.priceMin, data.priceMax)
+    it.priceMin, it.priceMax = data.priceMin, data.priceMax
     it.updatedAt = now_str()
     add_log(db, "asset", a.name, "编辑可售明细",
             f"明细 #{it.id} 更新为：{_rs_item_desc(it)}，单价 {_fmt_amount_yuan(price)}",
@@ -2004,7 +2020,8 @@ def _cart_add_inner(db: Session, data: schemas.CartItemInput, user_id: str = DEF
     if _is_amount_mode(a):
         amount = _cart_amount(a, data.amount)
     else:
-        amt = _check_discount_range(a, qty, data.amount, unit=a.unit)
+        # ADR-021（RSITEM-RANGE-20261020）：遥感明细行传 rs，区间取明细自身 priceMin/priceMax
+        amt = _check_discount_range(a, qty, data.amount, unit=a.unit, rs=rs)
         amount = float(amt) if amt is not None else None
     # ADR-020（PRICING-20261020）：服务期限校验（YYYY-MM-DD + start ≤ end，否则 400）
     service_start, service_end = _validate_service_period(data.serviceStart, data.serviceEnd)
@@ -2063,10 +2080,12 @@ def patch_cart_item(db: Session, cart_id: int, customer: str, user_id: str = DEF
         raise HTTPException(404, "购物车项不存在")
     a = get_asset(db, c.assetId)
     is_discount_row = c.itemId is not None or (a is not None and not _is_amount_mode(a))
+    # ADR-021（RSITEM-RANGE-20261020）：遥感明细行区间取该 rs_item 自身（不再取父产品容器区间）
+    rs = db.get(models.RsItem, c.itemId) if c.itemId is not None else None
     # 行级金额（ADR-008 / ADR-018 §3）
     if amount is not None:
         if is_discount_row:
-            amt = _check_discount_range(a, c.qty, amount, unit=a.unit if a else "")
+            amt = _check_discount_range(a, c.qty, amount, unit=a.unit if a else "", rs=rs)
             c.amount = float(amt)
         else:
             amt = _cart_amount(a, amount)
@@ -2175,9 +2194,11 @@ def set_cart_qty(db: Session, cart_id: int, qty: int, user_id: str = DEFAULT_USE
     c.qty = int(qty)
     # 行级金额（ADR-008 / ADR-018 §3，PRICING-20261020）：改数量后按新 qty 重做区间校验
     is_discount_row = c.itemId is not None or (a is not None and not _is_amount_mode(a))
+    # ADR-021（RSITEM-RANGE-20261020）：遥感明细行区间取该 rs_item 自身（不再取父产品容器区间）
+    rs = db.get(models.RsItem, c.itemId) if c.itemId is not None else None
     if amount is not None:
         if is_discount_row:
-            amt = _check_discount_range(a, c.qty, amount, unit=a.unit if a else "")
+            amt = _check_discount_range(a, c.qty, amount, unit=a.unit if a else "", rs=rs)
             c.amount = float(amt)
         else:
             amt = _cart_amount(a, amount)
@@ -2252,7 +2273,8 @@ def _order_core(
                 if in_amount is not None:
                     # ADR-018 §5（PRICING-20261020）：遥感行折扣金额可输（过区间校验，
                     # 防直调绕过购物车校验）；不输 = 明细 price 原价
-                    amt = _check_discount_range(a, 1, in_amount, unit=a.unit)
+                    # ADR-021（RSITEM-RANGE-20261020）：区间取该 rs_item 自身（不再取父产品容器区间）
+                    amt = _check_discount_range(a, 1, in_amount, unit=a.unit, rs=rs)
                     price = _derived_price(amt, 1)
                     amount = amt.quantize(CENT)
                 else:
@@ -2337,7 +2359,8 @@ def checkout(db: Session, data: schemas.CheckoutInput, user_id: str = DEFAULT_US
             if rs is None or rs.assetId != c.assetId:
                 raise HTTPException(400, "购物车中的遥感数据明细已删除或不属于该产品，请先移除后再下单")
             # ADR-018 §5：遥感明细行折扣金额可输（过区间校验）；不输 = 明细 price 原价成交
-            amt = _check_discount_range(a, 1, c.amount, unit=a.unit)
+            # ADR-021（RSITEM-RANGE-20261020）：区间取该 rs_item 自身（不再取父产品容器区间）
+            amt = _check_discount_range(a, 1, c.amount, unit=a.unit, rs=rs)
             groups.setdefault((c.assetId, customer), []).append(
                 (a, 1, amt, c.itemId, customer, c.serviceStart, c.serviceEnd))
             continue

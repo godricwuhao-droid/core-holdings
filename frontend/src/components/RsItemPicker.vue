@@ -10,7 +10,7 @@
  */
 import { computed, ref, watch } from 'vue'
 import { InfoFilled } from '@element-plus/icons-vue'
-import { formatMoney, type Asset, type RsItem } from '@/types'
+import { formatMoney, priceRangeText, type Asset, type RsItem } from '@/types'
 import { db } from '@/api'
 
 interface TreeNode {
@@ -57,12 +57,16 @@ const treeData = computed<TreeNode[]>(() => {
       label: `${res}m`,
       children: list
         .sort((a, b) => a.saleMonth.localeCompare(b.saleMonth))
-        .map((it) => ({
-          id: it.id,
-          label: `${it.saleMonth} · ${formatMoney(it.price)}`,
-          leaf: true,
-          item: it,
-        })),
+        .map((it) => {
+          // ADR-021（RSITEM-RANGE-20261020）：叶子带单价，有参考区间时顺带展示（无则维持原样）
+          const range = priceRangeText(it)
+          return {
+            id: it.id,
+            label: `${it.saleMonth} · ${formatMoney(it.price)}${range ? `（参考区间 ${range}）` : ''}`,
+            leaf: true,
+            item: it,
+          }
+        }),
     })),
   }))
 })

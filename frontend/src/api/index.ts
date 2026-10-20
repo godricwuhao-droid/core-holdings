@@ -230,6 +230,9 @@ export interface RsItemInput {
   resolution: number // 米
   saleMonth: string // YYYY-MM
   price: number // 整数元/份
+  // 参考价格区间（ADR-021，RSITEM-RANGE-20261020）：元/份，选填（可单边）；未设为 null
+  priceMin?: number | null
+  priceMax?: number | null
   repeatSale?: boolean // 默认 true
 }
 

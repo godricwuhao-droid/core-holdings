@@ -2,6 +2,24 @@
 
 > 记录 core-holdings 前端（Vue3 + TS + Element Plus + Vite）的页面/组件/接口封装变更。
 
+## 2026-10-20 ｜ 新增：遥感售卖明细参考区间（RSITEM-RANGE-20261020）
+
+**关联任务**：RSITEM-RANGE-20261020；契约见 `docs/api-contracts.md`「RSITEM-RANGE-20261020 批次」；决策依据 ADR-021（rs_items 参考区间，取代 ADR-018 §5「遥感行不限制」口径）。
+
+| 日期 | 类型 | 变更内容 | 影响文件范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-20 | 新增 | 类型层：`RsItem` 新增 `priceMin/priceMax`（参考区间，元/份，可单边，可空）；API 层 `RsItemInput` 同步加 `priceMin/priceMax`（未设 → null） | types.ts, api/index.ts | RSITEM-RANGE-20261020 | ADR-021；bootstrap rsItems 每行已带两字段 |
+| 2026-10-20 | 新增 | 遥感明细新增/编辑弹窗「单价（元）」下方加「参考价格区间」双输入（下限 ~ 上限，选填可单边，回显未设留空），交互/样式复用产品表单口径（el-input-number :controls=false min=0 precision=2）；提交 payload 带 `priceMin/priceMax`（空 → null，含清空场景） | views/assets/detail.vue | RSITEM-RANGE-20261020 | ADR-021；min ≤ max 后端 400「参考区间下限不能大于上限」走 showError |
+| 2026-10-20 | 修改 | 遥感明细列表「单价」列：有参考区间时展示 `¥{price}（参考区间 {min}~{max}）`，无区间维持原展示（与产品价展示同口径，复用 `priceRangeText`） | views/assets/detail.vue | RSITEM-RANGE-20261020 | ADR-021 §4 |
+| 2026-10-20 | 修改 | 购物车遥感行（rsItem 非空）参考区间提示改读该行售卖明细自身区间（`rowRangeText` 区分行类型），普通行仍读产品区间；未设不显示（现状行为） | views/cart/index.vue | RSITEM-RANGE-20261020 | ADR-021 §2；取代 ADR-018 §5 遥感行不限制口径 |
+| 2026-10-20 | 修改 | 加购选择器（RsItemPicker）叶子 label 顺带展示参考区间（有则显示，无则维持原样，不强制） | components/RsItemPicker.vue | RSITEM-RANGE-20261020 | ADR-021 §4 |
+
+### 验证
+
+- `npx vue-tsc --noEmit` 0 error（strict）；IDE 诊断 0。
+- 提交 payload 自查：`saveRsItem` 的 `RsItemInput` 恒带 `priceMin/priceMax`，`undefined → null`（`?? null`），覆盖「未设」与「编辑清空」两种场景。
+- 未修改 backend/ 下任何文件；未执行构建/部署；未 commit。
+
 ## 2026-10-20 ｜ 新增：价格体系（区间/折扣）+ 合同时间节点 + 交付中状态机 + 服务期限（PRICING-20261020）
 
 **关联任务**：PRICING-20261020；契约见 `docs/api-contracts.md`「PRICING-20261020 批次」；决策依据 ADR-018（价格区间/原价快照/终审不回写）、ADR-019（合同签订/预计交付时间 + delivering 状态机）、ADR-020（服务期限 + 下单入口收口购物车）。本章节覆盖上一轮已完成项 + 中断后补做项（11 小项）。

@@ -30,7 +30,7 @@
 | **金额口径** | **全程"元"**（库内/接口/展示，前端 ¥+千分位+两位小数）。禁止"万"字、禁止 ×10000 桥接。`amount = price × qty`（Decimal）后端权威重算 |
 | **包量定价（ADR-008）** | `Asset.pricingMode`：`'unit'`（默认）/ `'amount'`（卫星 Token 登记自动置）。amount 模式：销售明细**合同金额（整数元）为权威输入**（后端校验 int>0，否则 400），跳过 price×qty 重算，price 仅作派生展示（元/万Token 参考，2026-10-16 起不带"约"）；购物车 amount 模式行需填合同金额（`cart_items.amount`，经 `PUT /cart/{id}` **必须带 qty** 提交，缺 qty=0 会删行）；checkout 不再传 items，金额已在 cart_items 持久化 |
 | 销售记录结构（ADR-007 → ADR-013 → ADR-016） | 项目内**每个产品（×客户）一条销售记录**（ADR-016：同产品多客户拆多条）（HT-xxxx，界面名「销售记录」；代码/表名/路由仍为 contracts），**允许多主体**（记录主体=各行主体全一致→该值，混合→空）；项目状态/金额由销售记录派生；状态变更走 `PATCH /contracts/{id}/status` |
-| 状态机 | 项目状态只走 PATCH 状态接口（待审核项目例外：只走 `POST /projects/{id}/review`，ADR-012）；生态人员购物车结算建「待审核」（锁定照常），商务确认（可改价、实际价写回平台挂牌价）或驳回；已完成/已终止不可编辑 |
+| 状态机 | 项目状态只走 PATCH 状态接口（待审核项目例外：只走 `POST /projects/{id}/review`，ADR-012）；生态人员购物车结算建「待审核」（锁定照常），商务确认（可终审改价，**不回写挂牌价**，ADR-018）或驳回；录签订时间进「交付中」（ADR-019）；已完成/已终止不可编辑 |
 | 一致性 | 写操作单事务；数量前置校验（同产品多行合计防超卖）；被引用产品禁删 |
 | **生态人员可见性（2026-10-16）** | viewer 仅见**自己下单**的销售项目：`Project.creator`（登录 username，三建单入口自动写入）== 自己；存量 creator 为空回退 `rep in (自己姓名, username)`。`bootstrap` 过滤 projects/contracts，前端全视角（列表/详情/产品「销售关联」）天然过滤；viewer 可编辑自己项目基本信息（rep 恒忽略）+ 终止（含撤销 delivered 交付），交付/删除/新建空项目仍仅商务/管理员 |
 
@@ -90,6 +90,10 @@
 | ADR-015 | Accepted | 手动补录交付不触碰 lockedQty（仅 shippedQty += qty）+ 归属/状态/遥感容器校验 |
 | ADR-016 | Accepted | 购物车结算分组键 (assetId, customer)，前端预览同口径 |
 | ADR-017 | Accepted | Token 产品数量/单价口径与普通产品统一（数量=份数，单价=元/份，无 1e4 换算） |
+| ADR-018 | Accepted | 价格体系：产品参考价区间 + 原价快照（origPrice/origAmount 永不覆盖）+ 生态下单金额可输区间校验 + 删除审核改价回写挂牌价 |
+| ADR-019 | Accepted | 关键时间节点与状态机：合同 signedDate（录即 active→delivering，不可清空）/scheduledDeliveryDate（仅 admin）；交付前置签订时间；撤销交付回 delivering；项目派生新增「交付中」 |
+| ADR-020 | Accepted | 销售明细服务期限（购物车填写、审核可改、遥感行不填）+ 下单入口统一收口购物车（移除「登记销售」，sales/order 端点保留标废弃） |
+| ADR-021 | Accepted | 遥感售卖明细（rs_items）参考价区间（取代 ADR-018 §5「遥感行不限制」口径）：区间挂明细级，遥感行折扣校验取该明细自身区间 |
 
 ## 8. 文档地图与变更流程
 

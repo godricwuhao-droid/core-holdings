@@ -148,6 +148,10 @@ class RsItemInput(BaseModel):
     resolution: float = Field(gt=0)  # 精度，单位米（如 1.5）
     saleMonth: str = Field(pattern=r"^\d{4}-\d{2}$")  # 售卖月份 YYYY-MM
     price: float = Field(gt=0)  # 单价，整数元/份
+    # 参考区间（ADR-021，RSITEM-RANGE-20261020）：元/份，选填（单边允许）；
+    # 两者都有时 min ≤ max，否则 400「参考区间下限不能大于上限」（与产品区间同口径）
+    priceMin: float | None = Field(default=None, ge=0)
+    priceMax: float | None = Field(default=None, ge=0)
     repeatSale: bool = True  # 可重复售卖（默认 true，可关闭）
 
 
@@ -159,6 +163,9 @@ class RsItemOut(_ORM):
     resolution: float
     saleMonth: str
     price: float  # 元（整数元/份）
+    # 参考区间（ADR-021，RSITEM-RANGE-20261020）：元/份，null=不限制
+    priceMin: float | None
+    priceMax: float | None
     repeatSale: bool
     createdAt: str
     updatedAt: str

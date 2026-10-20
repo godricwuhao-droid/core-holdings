@@ -399,6 +399,10 @@ class RsItem(Base):
     resolution: Mapped[float] = mapped_column(Float, default=0)  # 精度，单位米（如 1.5）
     saleMonth: Mapped[str] = mapped_column(String(7), default="")  # 售卖月份 YYYY-MM
     price: Mapped[float] = mapped_column(Float, default=0)  # 单价，整数元/份（元口径，ADR-006）
+    # 参考区间（ADR-021，RSITEM-RANGE-20261020）：元/份，可空=不限制（同 ADR-018 产品区间口径）；
+    # 生态下单遥感行折扣金额校验改用本明细自身区间（不再取父产品容器区间）
+    priceMin: Mapped[float | None] = mapped_column(Float, nullable=True)
+    priceMax: Mapped[float | None] = mapped_column(Float, nullable=True)
     repeatSale: Mapped[bool] = mapped_column(Boolean, default=True)  # 可重复售卖（只计次不扣量）
     createdAt: Mapped[str] = mapped_column(String(32), default="")
     updatedAt: Mapped[str] = mapped_column(String(32), default="")
