@@ -2,6 +2,27 @@
 
 > 记录 core-holdings 前端（Vue3 + TS + Element Plus + Vite）的页面/组件/接口封装变更。
 
+## 2026-10-22 ｜ 修改：购物车页视觉优化（借鉴 cart-ui-demo.html，不重构布局）
+
+**关联任务**：用户对购物车页视觉不满意，提供参考 demo（`cart-ui-demo.html`）；**仅借鉴其视觉/交互优点，不照抄**——保留现有 el-table 布局与全部业务逻辑（结算分组/预览、金额校验提交、服务期限提交、viewer 免填兜底、参考区间提示、清空购物车均未改动），色值全部走系统体系（禁用 demo 的 #2a81ff/#db4d58 等非系统色）。
+
+| 日期 | 类型 | 变更内容 | 影响文件范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-22 | 修改 | ① 数量列改自定义步进器 `[−] 数值 [+]`（96px 圆角 8px 边框容器、28px 灰底 #F7F9FC 按钮、数值居中只读），替代上一批 96px el-input-number 写法；± 点击经新增 `stepQty`（±1 边界拦截）复用现有 `onQtyChange` PUT 提交链路（上限拦截/400 回滚口径不变）；min=1 / max=可用上限保留，达上限时 + 号禁用置灰；遥感行双按钮禁用 + 「数量固定 1」提示保留 | views/cart/index.vue | 购物车视觉优化（借鉴 demo） | 业务逻辑零变更 |
+| 2026-10-22 | 修改 | ② 底部结算区替换为深色结算栏：`position: sticky; bottom: 16px` 固定内容区底部（滚动容器 el-main），深蓝底 #112d54、圆角 14px、白字、内边距 15/20px；左侧「已选 N 件产品 + 应付合计 ¥xxx（22px 加粗）」，右侧主蓝 #1769D4 按钮「结算下单 →」（蓝色投影）；原浅蓝 .cart-settle 样式删除 | views/cart/index.vue | 购物车视觉优化（借鉴 demo） | 「将生成 N 份销售记录」结算预览完整保留在 SalesOrderDialog 内；前置校验仍走 openOrder |
+| 2026-10-22 | 修改 | ③ 产品信息列：名称左侧加 42px 渐变圆角图标块（linear-gradient 135deg，系统色 --primary-light→--info-purple-bg，图标字符 var(--primary-color)），按现有类型集合映射字符（软件◈/平台软件◫/数采设备·硬件集群▣/算力服务器⚡/卫星Token◉/卫星数据✦/遥感数据▦/默认◆，新增 `typeIcon`）；meta 行「编号 · 类型 · 主体」维持不变 | views/cart/index.vue | 购物车视觉优化（借鉴 demo） | 名称字号 13→14px、字重 600 |
+| 2026-10-22 | 修改 | ④ 单价列层级：¥价格 14px 加粗 + 下方 11px 辅助色（#71829A）副文案（单位 + 库存/上限）；原数量列「已达上限 N」红色小字整合进此副文案（警示色沿用 --danger-color），「可售 N」同移；遥感行副文案仅「元/份」，可重复售卖行仅单位 | views/cart/index.vue | 购物车视觉优化（借鉴 demo） | 列宽 140→150 |
+| 2026-10-22 | 修改 | ⑤ 顶部大段说明文字压缩重做为 notice 条（浅蓝底 #F0F6FF、边框 #E0ECFF、圆角 12px、左侧 ⓘ 图标）：「加粗标题 + 正文 2 行要点」，关键规则语义全保留（客户必填、金额整数元/区间折扣、数量上限、服务期限、按产品+客户分组生成销售记录、待审核流程） | views/cart/index.vue | 购物车视觉优化（借鉴 demo） | 原 .info-bar 全局样式未动（其他页面仍用） |
+| 2026-10-22 | 修改 | ⑥ 移除操作：红色「移除」文字改 × 图标按钮（Close 图标，默认 #A3AFBF 辅助色，hover 系统警示红 + danger-light-9 底，带 tooltip「移除」）；操作列 `fixed="right"` **保留**——列宽合计约 1360px，1440 屏宽（内容区约 1150px）下溢出横滚，按任务口径「溢出则保留 fixed」 | views/cart/index.vue | 购物车视觉优化（借鉴 demo） | 删行仍走 removeRow，三角色可用口径不变 |
+| 2026-10-22 | 修改 | ⑦ 行距/表头：表格去 `border`（无竖线，UI 规范），保留 stripe 与行 hover；表头 12px 灰字（#71829A）加粗，行单元格上下 padding 26px（行高 ~96px 舒展感，输入组件垂直居中沿用 EP 默认） | views/cart/index.vue | 购物车视觉优化（借鉴 demo） | 固定列分隔阴影样式保留 |
+
+### 验证
+
+- `npx vue-tsc --noEmit` 0 error（strict）；IDE 诊断 0。
+- 业务逻辑自查：`onQtyChange/onAmountInput/onAmountChange/onServiceChange/onCustomerChange/previewGroups/openOrder/onOrderSubmit/removeRow/clearAll/rowRangeText` 函数体零改动；仅新增 `typeIcon`、`stepQty`（复用 onQtyChange）。
+- 场景自查：上限场景 + 号禁用置灰（`qtyMax` 判定）；空购物车走 el-empty 分支（notice/结算栏不渲染）；viewer 场景无新增只读逻辑（viewer 免填金额口径不变）。
+- 未修改 backend/ 下任何文件；未执行构建/部署；未 commit。
+
 ## 2026-10-22 ｜ 修改：购物车操作列固定右侧 + 数量输入框收窄
 
 **关联任务**：用户截图反馈购物车页 2 处 UI 微调（操作列被挤到边缘需横滚、数量输入框过大）。

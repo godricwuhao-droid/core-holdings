@@ -11,7 +11,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Delete, InfoFilled, Sell, ShoppingCart } from '@element-plus/icons-vue'
+import { Close, Delete, InfoFilled, ShoppingCart } from '@element-plus/icons-vue'
 import { availableQty, entityShort, formatMoney, formatTokens, isAmountMode, priceRangeText, rsItemName, type Asset, type CartItem, type RsItem } from '@/types'
 import { checkoutCart, clearCart, db, getAsset, patchCartItem, refresh, removeCartItem, rsItemById, setCartAmount, setCartQty, setCartService, showError, type OrderFields } from '@/api'
 import SalesOrderDialog from '@/components/SalesOrderDialog.vue'
@@ -197,6 +197,29 @@ function goAssetDetail(assetId: number) {
   router.push(`/assets/${assetId}/detail`)
 }
 
+/** 产品类型 → 图标块字符（2026-10-22 视觉优化：借鉴 cart-ui-demo.html 产品图标，按现有类型集合映射） */
+function typeIcon(type: string): string {
+  switch (type) {
+    case '软件':
+      return '◈'
+    case '平台软件':
+      return '◫'
+    case '数采设备':
+    case '硬件集群':
+      return '▣'
+    case '算力服务器':
+      return '⚡'
+    case '卫星Token':
+      return '◉'
+    case '卫星数据':
+      return '✦'
+    case '遥感数据':
+      return '▦'
+    default:
+      return '◆'
+  }
+}
+
 async function onQtyChange(row: CartRow) {
   // ADR-011：遥感明细行数量恒 1（输入禁用，双保险拦截）
   if (row.rsItem) return
@@ -213,6 +236,18 @@ async function onQtyChange(row: CartRow) {
     row.cart.qty = avail ?? row.cart.qty
     await refresh(true)
   }
+}
+
+/** 步进器 ±1（2026-10-22 视觉优化：替代 el-input-number）：
+ *  改数量后复用现有 onQtyChange 的 PUT 提交链路（含上限拦截 / 400 回滚），业务逻辑零变更 */
+function stepQty(row: CartRow, delta: number) {
+  if (row.rsItem) return // ADR-011：遥感明细行数量恒 1
+  const next = row.cart.qty + delta
+  if (next < 1) return
+  const max = qtyMax(row)
+  if (max != null && next > max) return // 已达可用上限，+ 号本就禁用（双保险）
+  row.cart.qty = next
+  void onQtyChange(row)
 }
 
 async function removeRow(row: CartRow) {
@@ -328,10 +363,13 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
     </el-card>
 
     <template v-else>
-      <!-- 提示条 -->
-      <div class="info-bar">
+      <!-- 规则提示条（2026-10-22 视觉优化：借鉴 cart-ui-demo.html notice 条，压缩为「标题 + 要点」，关键规则语义全保留） -->
+      <div class="cart-notice">
         <el-icon aria-hidden="true"><InfoFilled /></el-icon>
-        <span>购物车可混装不同主体的产品，数量受产品「可用数量」约束：暂无可用数量的产品不可加入，超出可用数量的数量会被自动拦截；可重复售卖产品不受限。每行可填销售金额（整数元）：包量定价（Token）产品以销售金额为权威口径（商务必填，生态可留空按挂牌价×数量回退）；其余产品选填，留空按原价成交，填写即折扣金额（产品设了参考区间时须落在区间内）。普通产品行可填服务期限（开始/结束日期）。点击「下单」前请为每件产品填写客户：下单后每个产品按客户各生成一条销售记录（同一产品卖给多个客户会拆成多条；不同主体的产品可同单混装），销售项目进入「待审核」并锁定数量，商务接手确认（可改价）后生效，再在项目详情页对销售记录执行「交付」即生成交付记录。</span>
+        <div>
+          <b>下单前请完善关键信息</b>
+          <span>每件产品必填客户；销售金额按整数元填写——包量定价产品必填（生态可留空按挂牌价×数量回退），其余选填、填写即折扣金额（设参考区间时须落在区间内）；数量受产品可用数量约束（可重复售卖不受限），普通产品行可填服务期限。下单后按「产品 + 客户」分组各生成一条销售记录，销售项目进入「待审核」并锁定数量，商务确认（可改价）后生效，再执行「交付」生成交付记录。</span>
+        </div>
       </div>
 
       <!-- 表格卡 -->
@@ -346,13 +384,21 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
             </el-button>
           </div>
         </div>
-        <el-table :data="cartRows" border stripe>
-          <el-table-column label="产品名称" min-width="220" align="left">
+        <!-- 2026-10-22 视觉优化：去 border（表格无竖线，UI 规范），保留 stripe 与行 hover；
+             操作列仍 fixed="right"——列宽合计约 1360px，1440 屏宽（内容区约 1150px）下会溢出横滚 -->
+        <el-table :data="cartRows" stripe>
+          <el-table-column label="产品名称" min-width="240" align="left">
             <template #default="{ row }">
-              <!-- ADR-011：遥感明细行两行展示——主行父产品名，次级行明细名（省/市 精度 月份） -->
-              <a class="cart-asset-name" @click="goAssetDetail(row.asset.id)">{{ row.asset.name }}</a>
-              <div v-if="row.rsItem" class="muted cart-asset-sub">{{ rsItemName(row.rsItem) }}</div>
-              <div v-else class="muted cart-asset-sub">{{ row.asset.code }} · {{ row.asset.type }} · {{ entityShort(row.asset.subject) }}</div>
+              <!-- 2026-10-22 视觉优化：借鉴 demo 产品图标——名称左侧 42px 渐变圆角图标块（按类型区分字符） -->
+              <div class="cart-product">
+                <div class="cart-product-icon" aria-hidden="true">{{ typeIcon(row.asset.type) }}</div>
+                <div class="cart-product-info">
+                  <!-- ADR-011：遥感明细行两行展示——主行父产品名，次级行明细名（省/市 精度 月份） -->
+                  <a class="cart-asset-name" @click="goAssetDetail(row.asset.id)">{{ row.asset.name }}</a>
+                  <div v-if="row.rsItem" class="muted cart-asset-sub">{{ rsItemName(row.rsItem) }}</div>
+                  <div v-else class="muted cart-asset-sub">{{ row.asset.code }} · {{ row.asset.type }} · {{ entityShort(row.asset.subject) }}</div>
+                </div>
+              </div>
             </template>
           </el-table-column>
           <el-table-column label="客户" width="180" align="left">
@@ -369,35 +415,55 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
               </el-tooltip>
             </template>
           </el-table-column>
-          <el-table-column label="销售单价" width="140" align="right" header-align="right">
+          <el-table-column label="销售单价" width="150" align="right" header-align="right">
             <template #default="{ row }">
-              <!-- ADR-017（2026-10-20）：包量定价行单价与普通产品一致（元/份，参考口径），删除「元/万Token」特判 -->
-              <span :class="{ muted: row.isAmount }">{{ formatMoney(row.price) }}</span>
+              <!-- 2026-10-22 视觉优化：价格 14px 加粗 + 11px 副文案（单位 + 库存/上限），
+                   原数量列「已达上限」红色小字整合进此副文案（警示色沿用 --danger-color） -->
+              <div class="cart-price">
+                <!-- ADR-017（2026-10-20）：包量定价行单价与普通产品一致（元/份，参考口径），删除「元/万Token」特判 -->
+                <span class="cart-price-value" :class="{ muted: row.isAmount }">¥ {{ formatMoney(row.price) }}</span>
+                <div class="cart-price-sub">
+                  <span>{{ row.rsItem ? '元/份' : `元/${row.asset.unit || '单位'}` }}</span>
+                  <span
+                    v-if="!row.rsItem && !row.asset.repeatSale"
+                    :class="row.cart.qty >= (availOf(row.asset) ?? 0) ? 'cart-sellable-max' : ''"
+                  >
+                    {{ row.cart.qty >= (availOf(row.asset) ?? 0) ? `已达上限 ${availOf(row.asset)}` : `可售 ${availOf(row.asset)}` }}
+                  </span>
+                </div>
+              </div>
             </template>
           </el-table-column>
-          <!-- 2026-10-22 微调：数量列宽 160→120、输入框 110→96px（用户反馈输入框过大，与金额列视觉重量协调；保留右侧单侧步进按钮） -->
+          <!-- 2026-10-22 视觉优化：数量列改自定义步进器 [−] 数值 [+]（借鉴 cart-ui-demo.html stepper，
+               替代上一批 96px el-input-number 写法）；± 点击走现有 onQtyChange PUT 提交链路，
+               上限（min=1 / max=可用上限）与「已达上限」语义保留（上限时 + 号禁用置灰） -->
           <el-table-column label="数量" width="120" align="center">
             <template #default="{ row }">
-              <!-- ADR-011：遥感明细行数量恒 1（禁用输入 + tooltip 提示） -->
-              <el-tooltip :content="row.rsItem ? '遥感明细数量固定 1' : ''" :disabled="!row.rsItem" placement="top">
-                <el-input-number
-                  v-model="row.cart.qty"
-                  :min="1"
-                  :max="row.rsItem ? 1 : qtyMax(row)"
-                  :precision="0"
-                  controls-position="right"
-                  style="width: 96px;"
-                  :disabled="!!row.rsItem"
-                  @change="onQtyChange(row)"
-                />
-              </el-tooltip>
+              <div class="cart-stepper">
+                <button
+                  type="button"
+                  class="step-btn"
+                  :disabled="!!row.rsItem || row.cart.qty <= 1"
+                  :aria-label="`减少${row.asset.name}数量`"
+                  @click="stepQty(row, -1)"
+                >
+                  −
+                </button>
+                <span class="step-value">{{ row.cart.qty }}</span>
+                <button
+                  type="button"
+                  class="step-btn"
+                  :disabled="!!row.rsItem || (qtyMax(row) != null && row.cart.qty >= qtyMax(row)!)"
+                  :aria-label="`增加${row.asset.name}数量`"
+                  @click="stepQty(row, 1)"
+                >
+                  ＋
+                </button>
+              </div>
+              <!-- ADR-011：遥感明细行数量恒 1（双按钮禁用 + 提示）；「已达上限/可售」信息已移至单价列副文案 -->
               <div v-if="row.rsItem" class="muted cart-qty-hint">遥感明细数量固定 1</div>
               <div v-else-if="row.isAmount" class="muted cart-qty-hint">{{ formatTokens(row.cart.qty) }} Token</div>
               <div v-else-if="row.asset.repeatSale" class="muted cart-qty-hint">不限</div>
-              <div v-else-if="row.cart.qty >= (availOf(row.asset) ?? 0)" class="cart-sellable-max">
-                已达上限 {{ availOf(row.asset) }}
-              </div>
-              <div v-else class="muted cart-qty-hint">可售 {{ availOf(row.asset) }}</div>
             </template>
           </el-table-column>
           <!-- ADR-018 §3（PRICING-20261020）：所有行（unit/amount/遥感）均可输销售金额（整数元）——
@@ -464,28 +530,35 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
               <span class="cart-subtotal">{{ formatMoney(row.subtotal) }}</span>
             </template>
           </el-table-column>
-          <!-- 2026-10-22 微调：操作列固定右侧（列多横向滚动时「移除」始终可见，无需横滚） -->
+          <!-- 2026-10-22 视觉优化：红色「移除」文字改 × 图标按钮（默认辅助色，hover 警示红）；
+               固定右侧保留（列宽合计约 1360px，常见屏宽下溢出横滚，见表格注释） -->
           <el-table-column label="操作" width="70" align="center" fixed="right">
             <template #default="{ row }">
               <!-- 删行对三角色均可用（含生态人员） -->
-              <el-button link type="danger" size="small" @click="removeRow(row)">
-                移除
-              </el-button>
+              <el-tooltip content="移除" placement="top">
+                <button type="button" class="cart-remove" aria-label="移除" @click="removeRow(row)">
+                  <el-icon><Close /></el-icon>
+                </button>
+              </el-tooltip>
             </template>
           </el-table-column>
         </el-table>
-        <!-- 底部结算条：唯一结算入口 -->
-        <div class="cart-settle">
-          <span class="muted cart-settle-qty">合计 {{ totalQty }} 件</span>
-          <div class="cart-settle-right">
-            <span class="cart-total-value">{{ formatMoney(totalAmount) }}</span>
-            <!-- 结算下单对三角色均可用（含生态人员） -->
-            <el-button type="primary" :icon="Sell" :disabled="!db.cart.length" @click="openOrder">
-              下单
-            </el-button>
+      </el-card>
+
+      <!-- 底部深色结算栏（2026-10-22 视觉优化：借鉴 cart-ui-demo.html checkout 栏——
+           sticky 固定内容区底部、深蓝底白字、主蓝按钮；「将生成 N 份销售记录」结算预览保留在结算弹窗内） -->
+      <div class="cart-checkout">
+        <div class="co-left">
+          <span class="co-selected">已选 {{ totalQty }} 件产品</span>
+          <div class="co-total">
+            <small>应付合计</small>¥ {{ formatMoney(totalAmount) }}
           </div>
         </div>
-      </el-card>
+        <!-- 结算下单对三角色均可用（含生态人员）；前置校验（客户/金额必填）仍走 openOrder -->
+        <el-button class="co-btn" type="primary" :disabled="!db.cart.length" @click="openOrder">
+          结算下单 →
+        </el-button>
+      </div>
     </template>
 
     <!-- 下单对话框（ADR-020 PRICING-20261020：仅购物车结算确认模式——客户已在行级填写，
@@ -502,37 +575,233 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
 </template>
 
 <style scoped>
-/* 2026-10-22 微调：操作列固定右侧——强化左侧分隔阴影，横向滚动时与「小计」列内容清晰分隔、避免视觉粘连 */
+/* ============ 2026-10-22 视觉优化（借鉴 cart-ui-demo.html，不重构布局，色值走系统体系） ============ */
+
+/* 表头 12px 灰字加粗 + 行舒展（min-height ~96px 感，输入组件垂直居中沿用 EP 默认 middle） */
+:deep(.el-table th.el-table__cell) {
+  padding: 12px 0;
+}
+:deep(.el-table th .cell) {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-secondary);
+}
+:deep(.el-table td.el-table__cell) {
+  padding: 26px 0;
+}
+
+/* 操作列固定右侧——强化左侧分隔阴影，横向滚动时与「小计」列内容清晰分隔、避免视觉粘连 */
 :deep(.el-table .el-table-fixed-column--right) {
   box-shadow: -8px 0 8px -8px rgba(0, 0, 0, 0.12) inset;
+}
+
+/* 规则提示条：浅蓝底 + 蓝边框 + 圆角 12px + ⓘ 图标，「加粗标题 + 正文要点」 */
+.cart-notice {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  background: #f0f6ff;
+  border: 1px solid #e0ecff;
+  border-radius: 12px;
+  padding: 13px 16px;
+  font-size: 13px;
+  color: var(--text-body);
+  line-height: 1.7;
+}
+.cart-notice .el-icon {
+  color: var(--primary-color);
+  font-size: 16px;
+  margin-top: 3px;
+  flex-shrink: 0;
+}
+.cart-notice b {
+  display: block;
+  color: var(--text-primary);
+  margin-bottom: 2px;
+}
+
+/* 产品信息列：42px 渐变圆角图标块（浅蓝→浅紫，系统色 --primary-light → --info-purple-bg） */
+.cart-product {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+.cart-product-icon {
+  width: 42px;
+  height: 42px;
+  border-radius: 10px;
+  background: linear-gradient(135deg, var(--primary-light), var(--info-purple-bg));
+  color: var(--primary-color);
+  display: grid;
+  place-items: center;
+  font-size: 18px;
+  flex-shrink: 0;
+}
+.cart-product-info {
+  min-width: 0;
 }
 .cart-asset-name {
   color: var(--primary-color);
   cursor: pointer;
-  font-weight: 500;
-  font-size: 13px;
+  font-weight: 600;
+  font-size: 14px;
 }
 .cart-asset-name:hover {
   text-decoration: underline;
 }
 .cart-asset-sub {
   font-size: 12px;
-  margin-top: 2px;
+  margin-top: 4px;
 }
-.cart-subtotal {
-  font-weight: 600;
+
+/* 销售单价列：价格 14px 加粗 + 11px 副文案（单位 + 库存/上限） */
+.cart-price {
+  text-align: right;
+}
+.cart-price-value {
+  font-size: 14px;
+  font-weight: 700;
   color: var(--text-primary);
   font-variant-numeric: tabular-nums;
+}
+.cart-price-sub {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-top: 4px;
+  line-height: 1.4;
 }
 .cart-sellable-max {
   color: var(--danger-color);
   font-weight: 600;
-  font-size: 12px;
-  margin-top: 4px;
+}
+
+/* 数量步进器 [−] 数值 [+]：圆角 8px 边框容器、按钮 28px 灰底、数值居中只读 */
+.cart-stepper {
+  display: inline-flex;
+  align-items: center;
+  width: 96px;
+  border: 1px solid var(--input-border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: #fff;
+}
+.step-btn {
+  width: 28px;
+  height: 30px;
+  border: 0;
+  padding: 0;
+  background: #f7f9fc;
+  color: var(--text-body);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+}
+.step-btn:hover:not(:disabled) {
+  color: var(--primary-color);
+  background: var(--primary-light);
+}
+.step-btn:disabled {
+  color: #c3cddb;
+  cursor: not-allowed;
+}
+.step-value {
+  flex: 1;
+  min-width: 40px;
+  text-align: center;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+  border-left: 1px solid var(--divider-color);
+  border-right: 1px solid var(--divider-color);
 }
 .cart-qty-hint {
   font-size: 12px;
-  margin-top: 4px;
+  margin-top: 6px;
+}
+
+/* 移除：× 图标按钮（默认辅助色，hover 系统警示红） */
+.cart-remove {
+  width: 28px;
+  height: 28px;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: #a3afbf;
+  font-size: 15px;
+  border-radius: 7px;
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+}
+.cart-remove:hover {
+  color: var(--danger-color);
+  background: var(--el-color-danger-light-9);
+}
+
+/* 底部深色结算栏：sticky 固定内容区底部（滚动容器为 el-main），深蓝底白字 + 主蓝按钮 */
+.cart-checkout {
+  position: sticky;
+  bottom: 16px;
+  z-index: 10;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  background: #112d54;
+  color: #fff;
+  border-radius: 14px;
+  padding: 15px 20px;
+  box-shadow: 0 14px 35px rgba(16, 35, 63, 0.24);
+}
+.co-left {
+  display: flex;
+  align-items: center;
+  gap: 22px;
+  flex-wrap: wrap;
+}
+.co-selected {
+  color: rgba(255, 255, 255, 0.72);
+  font-size: 13px;
+}
+.co-total {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 22px;
+  font-weight: 700;
+  color: #fff;
+  font-variant-numeric: tabular-nums;
+}
+.co-total small {
+  font-size: 12px;
+  font-weight: 400;
+  color: rgba(255, 255, 255, 0.72);
+}
+.co-btn {
+  background: var(--primary-color);
+  border-color: var(--primary-color);
+  padding: 11px 22px;
+  font-weight: 600;
+  box-shadow: 0 5px 13px rgba(23, 105, 212, 0.35);
+}
+.co-btn:hover,
+.co-btn:focus {
+  background: var(--primary-hover);
+  border-color: var(--primary-hover);
+}
+
+.cart-subtotal {
+  font-weight: 600;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
 }
 /* ADR-018（PRICING-20261020）：参考区间提示行（金额输入框下方）
    2026-10-20 修复：显式辅助色 #71829A + 11px（原 .muted #9aa9bf 过淡，用户反馈看不到提示） */
@@ -562,32 +831,7 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
   align-items: center;
   gap: 12px;
 }
-/* 底部结算条：浅蓝底（与 info-bar 同款）+ 两端对齐 */
-.cart-settle {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 12px;
-  margin-top: 14px;
-  padding: 14px 16px;
-  background: #f0f6ff;
-  border-radius: 8px;
-  flex-wrap: wrap;
-}
-.cart-settle-qty {
-  font-size: 13px;
-}
-.cart-settle-right {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-.cart-total-value {
-  font-size: 18px;
-  font-weight: 700;
-  color: var(--primary-color);
-  font-variant-numeric: tabular-nums;
-}
+/* 2026-10-22 视觉优化：原浅蓝 .cart-settle 结算条已由 .cart-checkout 深色结算栏取代，旧样式删除 */
 .cart-order-summary {
   padding: 10px 14px;
   margin-bottom: 16px;
