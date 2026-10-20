@@ -401,7 +401,8 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
           </el-table-column>
           <!-- ADR-018 §3（PRICING-20261020）：所有行（unit/amount/遥感）均可输销售金额（整数元）——
                amount 行 = 权威输入（商务必填）；unit/遥感行 = 折扣金额（选填，超参考区间后端 400） -->
-          <el-table-column label="销售金额（元）" width="190" align="center">
+          <!-- 2026-10-20 修复：列宽 190→200，保证下方参考区间小字（如「参考区间 5100000~5100000 元/套」）不挤压换行 -->
+          <el-table-column label="销售金额（元）" width="200" align="center">
             <template #default="{ row }">
               <el-tooltip :content="amountTip(row)" placement="top">
                 <el-input
@@ -417,15 +418,19 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
                 />
               </el-tooltip>
               <!-- ADR-018：产品设了参考区间时展示区间提示（超区间提交由后端 400，文案走 showError）
-                   ADR-021（RSITEM-RANGE-20261020）：遥感明细行改读该明细自身区间，普通行仍读产品区间 -->
-              <div v-if="rowRangeText(row)" class="muted cart-amount-range">
-                参考区间 {{ rowRangeText(row) }} 元/{{ row.asset.unit || '单位' }}
+                   ADR-021（RSITEM-RANGE-20261020）：遥感明细行改读该明细自身区间，普通行仍读产品区间
+                   2026-10-20 修复：提示可见性——显式辅助色 #71829A（原 .muted #9aa9bf 过淡）、11px；
+                   遥感行单位按 ADR-021 口径展示「份」（父产品 unit 为「份（可售明细）」容器口径，不宜直接展示） -->
+              <div v-if="rowRangeText(row)" class="cart-amount-range">
+                参考区间 {{ rowRangeText(row) }} 元/{{ row.rsItem ? '份' : (row.asset.unit || '单位') }}
               </div>
             </template>
           </el-table-column>
           <!-- ADR-020（PRICING-20261020）：服务期限——普通产品行填写（变更即 PUT 提交）；
                遥感明细行按期数售卖（期数即服务时间），不展示期限输入 -->
-          <el-table-column label="服务期限" width="215" align="center">
+          <!-- 2026-10-20 修复：列宽 215→300（原列宽下每个日期输入仅约 94px，YYYY-MM-DD 被截断成「2026-10-2…」）；
+               两个日期输入各设明确宽度 136px（可完整显示 YYYY-MM-DD + 日历图标），中间留 8px 间距 -->
+          <el-table-column label="服务期限" width="300" align="center">
             <template #default="{ row }">
               <template v-if="!row.rsItem">
                 <div class="cart-service-row">
@@ -435,7 +440,7 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
                     value-format="YYYY-MM-DD"
                     size="small"
                     placeholder="开始"
-                    style="width: 100%;"
+                    style="width: 136px;"
                     @change="onServiceChange(row)"
                   />
                   <el-date-picker
@@ -444,7 +449,7 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
                     value-format="YYYY-MM-DD"
                     size="small"
                     placeholder="结束"
-                    style="width: 100%;"
+                    style="width: 136px;"
                     @change="onServiceChange(row)"
                   />
                 </div>
@@ -522,16 +527,20 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
   font-size: 12px;
   margin-top: 4px;
 }
-/* ADR-018（PRICING-20261020）：参考区间提示行（金额输入框下方） */
+/* ADR-018（PRICING-20261020）：参考区间提示行（金额输入框下方）
+   2026-10-20 修复：显式辅助色 #71829A + 11px（原 .muted #9aa9bf 过淡，用户反馈看不到提示） */
 .cart-amount-range {
-  font-size: 12px;
+  font-size: 11px;
+  color: #71829a;
   margin-top: 4px;
+  line-height: 1.4;
 }
-/* ADR-020（PRICING-20261020）：服务期限双日期输入（开始/结束） */
+/* ADR-020（PRICING-20261020）：服务期限双日期输入（开始/结束）
+   2026-10-20 修复：间距 6→8px，两输入各 136px 明确宽度（配合列宽 300），避免日期截断 */
 .cart-service-row {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
 }
 /* 空客户校验标红（EP 2.14 独立 el-input 无 validate 态，按 wrapper box-shadow 描边） */
 .cart-customer-error :deep(.el-input__wrapper) {
