@@ -43,3 +43,13 @@
 
 ### 8. 合同金额只读（问题 12d）
 - 建单页 `contractAmount` 改为**只读**（自动 = Σ 明细金额），前端不再发送手改值；后端 `review_project` 保持按 Σ 明细重算。
+
+---
+
+## CLEANUP-20261020 批次：移除「生态人员基础资料」（settings/reps）
+
+> 生态人员已由 users 表 + viewer 角色承载，`base_records`（kind='reps'）为无人消费的遗留数据，整体移除。前后端同批上线。
+
+1. `GET /bootstrap` 响应**移除 `reps` 字段**；前端 `db.reps` 镜像与 `BaseKind` 中的 `'reps'` 同步删除。
+2. `POST/PUT/DELETE /bases/{kind}` 不再接受 `kind='reps'`（后端对 reps 返回 404 或 400 均可，取 400「该基础资料类型已下线」）；`suppliers` / `customers` 行为不变（暂保留）。
+3. 前端删除：`views/settings/base.vue`、路由 `/settings/reps`、菜单项、「基础设置」菜单若因此变空则整个子菜单移除。

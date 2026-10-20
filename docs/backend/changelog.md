@@ -2,6 +2,38 @@
 
 > 记录 core-holdings 后端（FastAPI + SQLAlchemy + SQLite）的接口与行为变更。
 
+## 2026-10-20 ｜ 删除：CLEANUP-20261020 移除「生态人员基础资料」（base_records kind='reps'）
+
+> 生态人员已由 `users` 表 + viewer 角色承载，`base_records`（kind='reps'）为无人消费的遗留数据，整体下线。前后端同批上线（契约见 api-contracts.md「CLEANUP-20261020 批次」）。
+
+| 日期 | 类型 | 变更内容 | 影响文件范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-20 | 修改 | ⚠️ `POST/PUT/DELETE /bases/{kind}` 对 `kind='reps'` 统一返回 400「该基础资料类型已下线」（新增 `_check_base_kind` 守卫）；`suppliers` / `customers` 行为不变 | `backend/src/routers/api.py` | CLEANUP-20261020 | 契约 §2；`_BASE_LABEL` 同步移除 `reps` 项 |
+| 2026-10-20 | 删除 | ⚠️ `GET /bootstrap` 响应**移除 `reps` 字段**（快照组装不再查询 kind='reps'）；`add_base` 日志文案清理（仅保留 suppliers/customers 分支） | `backend/src/services.py` | CLEANUP-20261020 | 契约 §1；bootstrap 为纯 dict 返回，schemas 无对应字段需删；前端并行删除 `db.reps` 镜像 |
+| 2026-10-20 | 修改 | `models.BaseRecord` 注释更新（标注 reps 已下线） | `backend/src/models.py` | CLEANUP-20261020 | 仅注释，无结构变更 |
+| 2026-10-20 | 删除 | 数据清理：`DELETE FROM base_records WHERE kind='reps'`。执行前备份 `core_holdings.db.bak-reps-cleanup`（已被 .gitignore 的 `*.bak*` 规则忽略，未 git add） | `backend/core_holdings.db` | CLEANUP-20261020 | 见下方行数报告 |
+
+### 数据清理行数报告
+
+清理前 / 清理后（`base_records`）：
+
+| kind | 清理前 | 清理后 |
+|---|---|---|
+| reps | 0 | 0 |
+| suppliers | 8 | 8 |
+| customers | 0 | 0 |
+| 合计 | 8 | 8 |
+
+- 执行 `DELETE FROM base_records WHERE kind='reps'` 实际删除 **0 行**（reps 数据此前已无存量，删除为幂等操作）。
+- 其余各表行数清理前后完全一致（assets 28 / projects 4 / outbounds 0 / flows 156 / logs 392 / deliverable_templates 32 / category_units 8 / project_items 10 / asset_deliverables 123 / cart_items 3 / users 8 / audit_logs 633 / file_meta 48 / contracts 9 / rs_items 2），无其他表受影响。
+
+### 验证
+
+- `python3 -m compileall -q src main.py` 通过；`import src.services / src.routers.api / src.schemas / src.models / main` 无错。
+- 全局检索 `reps`（backend/）：仅命中注释说明与 `_check_base_kind` 的 `if kind == "reps"` 守卫，无残留业务逻辑。
+- 实测（dev server --reload，admin 登录）：`POST /api/bases/reps` → 400 `{"detail":"该基础资料类型已下线"}`；`DELETE /api/bases/reps/1` → 400 同文案；`POST /api/bases/suppliers` → 200 `{"ok":true}`；`GET /api/bootstrap` 响应 keys 中**无 `reps`**（suppliers/customers 均在）。
+- 未触碰 frontend/ 任何文件、未执行构建/部署、未 git commit。
+
 ## 2026-10-20 ｜ 修复：FIX-20261020 业务逻辑 13 项修复（分支 fix/business-logic-bugs-20261020）
 
 | 日期 | 类型 | 变更内容 | 影响文件范围 | 关联任务 | 备注 |

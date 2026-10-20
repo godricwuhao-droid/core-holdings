@@ -109,7 +109,6 @@
               <span>基础设置</span>
             </template>
             <el-menu-item index="/settings/deliverables">交付物设置</el-menu-item>
-            <el-menu-item index="/settings/reps">生态人员</el-menu-item>
             <el-menu-item index="/settings/users">账号与审计</el-menu-item>
           </el-sub-menu>
         </el-menu>

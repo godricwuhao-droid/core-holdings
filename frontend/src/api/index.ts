@@ -146,7 +146,6 @@ export const db = reactive({
   cart: [] as CartItem[],
   suppliers: [] as BaseRecord[],
   customers: [] as BaseRecord[],
-  reps: [] as BaseRecord[],
   flows: [] as AssetFlow[],
   logs: [] as OpLog[],
   deliverableTemplates: {} as Record<string, DeliverableTemplateItem[]>,
@@ -170,7 +169,6 @@ export function refresh(force = false): Promise<void> {
       db.cart = data.cart
       db.suppliers = data.suppliers
       db.customers = data.customers
-      db.reps = data.reps
       db.flows = data.flows
       db.logs = data.logs
       db.deliverableTemplates = data.deliverableTemplates
@@ -313,7 +311,7 @@ export interface DashboardData {
   recentLogs: OpLog[]
 }
 
-export type BaseKind = 'suppliers' | 'customers' | 'reps'
+export type BaseKind = 'suppliers' | 'customers'
 
 // ============================================================
 // 同步读取（从 db 镜像计算，视图无需改）

@@ -1591,7 +1591,8 @@ def revert_outbound(db: Session, outbound_id: int, reason: str, operator: str = 
 def add_base(db: Session, kind: str, data: schemas.BaseRecordInput) -> None:
     db.add(models.BaseRecord(kind=kind, name=data.name, contact=data.contact,
                              phone=data.phone, remark=data.remark))
-    label = "供应商" if kind == "suppliers" else ("客户" if kind == "customers" else "生态人员")
+    # CLEANUP-20261020：reps 类型已下线，仅保留 suppliers / customers
+    label = "供应商" if kind == "suppliers" else "客户"
     add_log(db, "setting", data.name, "新增", f"新增{label}")
     db.commit()
 
@@ -2260,7 +2261,8 @@ def bootstrap(db: Session, user_id: str, user: "models.User | None" = None) -> d
         return db.execute(select(models.BaseRecord).where(models.BaseRecord.kind == kind)
                           .order_by(models.BaseRecord.id.asc())).scalars().all()
 
-    suppliers, customers, reps = _bases("suppliers"), _bases("customers"), _bases("reps")
+    # CLEANUP-20261020：移除 reps（生态人员）快照字段
+    suppliers, customers = _bases("suppliers"), _bases("customers")
 
     templates = db.execute(select(models.DeliverableTemplate)).scalars().all()
     tpl_map: dict[str, list] = {}
@@ -2288,7 +2290,6 @@ def bootstrap(db: Session, user_id: str, user: "models.User | None" = None) -> d
         "outbounds": [schemas.OutboundOut.model_validate(o).model_dump() for o in outbounds],
         "suppliers": [schemas.BaseRecordOut.model_validate(x).model_dump() for x in suppliers],
         "customers": [schemas.BaseRecordOut.model_validate(x).model_dump() for x in customers],
-        "reps": [schemas.BaseRecordOut.model_validate(x).model_dump() for x in reps],
         "flows": [schemas.FlowOut.model_validate(f).model_dump() for f in flows],
         "logs": [schemas.LogOut.model_validate(l).model_dump() for l in logs],
         "deliverableTemplates": tpl_map,

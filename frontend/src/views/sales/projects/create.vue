@@ -66,6 +66,11 @@ const isEdit = computed(() => route.path.endsWith('edit'))
 const projectId = computed(() => Number(route.params.id))
 /** 重新提交模式（2026-10-20）：?copy=<已终止项目id> → 预填原单明细（可改）→ 走 /resubmit 新建订单 */
 const copyProjectId = computed(() => Number(route.query.copy) || 0)
+// 2026-10-20 FIX-RESUBMIT：copy 模式预填守卫（viewer 归属 / 项目 terminated）全部通过并预填完成后置 true
+const copyPrefillOk = ref(false)
+// 2026-10-20 FIX-RESUBMIT：可提交口径对齐后端 /projects/{id}/resubmit（require_order + creator 归属校验）——
+// viewer 对自己下单的 terminated 项目可重新提交；普通新建（无 copy）viewer 仍禁用
+const canSubmit = computed(() => canWrite.value || (copyProjectId.value > 0 && copyPrefillOk.value))
 
 const formRef = ref()
 const submitting = ref(false)
@@ -563,6 +568,8 @@ onMounted(async () => {
       lastFollowDate: cp.lastFollowDate,
       remark: '', // 不继承旧备注（驳回原因在旧单合同留痕中）
     })
+    // 2026-10-20 FIX-RESUBMIT：守卫全部通过且预填完成 → 放开提交按钮（校验失败跳回的路径不置位）
+    copyPrefillOk.value = true
   }
   // 从「登记销售」等入口带客户预填时：首份合同客户 = 预填客户，项目名同步跟随
   const preCustomer = typeof route.query.customer === 'string' ? route.query.customer : ''
@@ -1082,15 +1089,17 @@ function handleCancel() {
         <!-- 底部操作区：右对齐，不悬浮 -->
         <div class="bottom-actions">
           <template v-if="!isEdit">
-            <el-tooltip :content="NO_PERM_TIP" :disabled="canWrite" placement="top">
+            <!-- 2026-10-20 FIX-RESUBMIT：copy（重新提交）模式隐藏「保存草稿」——saveDraft 走 createProject 会丢旧单关联与双向留痕，只允许正式重新提交 -->
+            <el-tooltip v-if="!copyProjectId" :content="NO_PERM_TIP" :disabled="canWrite" placement="top">
               <span>
                 <el-button plain :loading="submitting" :disabled="!canWrite" @click="saveDraft">保存草稿</el-button>
               </span>
             </el-tooltip>
-            <el-tooltip :content="NO_PERM_TIP" :disabled="canWrite" placement="top">
+            <!-- 2026-10-20 FIX-RESUBMIT：提交口径用 canSubmit（对齐后端 resubmit 权限）；copy 模式文案改「重新提交」 -->
+            <el-tooltip :content="NO_PERM_TIP" :disabled="canSubmit" placement="top">
               <span>
-                <el-button type="primary" :icon="CircleCheck" :loading="submitting" :disabled="!canWrite" @click="handleSubmit">
-                  创建项目
+                <el-button type="primary" :icon="CircleCheck" :loading="submitting" :disabled="!canSubmit" @click="handleSubmit">
+                  {{ copyProjectId ? '重新提交' : '创建项目' }}
                 </el-button>
               </span>
             </el-tooltip>

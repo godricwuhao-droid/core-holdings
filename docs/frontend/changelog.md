@@ -2,6 +2,34 @@
 
 > 记录 core-holdings 前端（Vue3 + TS + Element Plus + Vite）的页面/组件/接口封装变更。
 
+## 2026-10-20 ｜ 修复：viewer「重新提交」被创建按钮禁用拦截（FIX-RESUBMIT）
+
+**关联任务**：FIX-RESUBMIT（FIX-20261020 回归修复）；后端 `POST /projects/{id}/resubmit` 权限口径见 `docs/backend/api.md`（require_order + creator 归属校验）。
+
+| 日期 | 类型 | 变更内容 | 影响文件范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-20 | 修复 | 建单页新增 `canSubmit` 可提交判定（`canWrite \|\| (copy 模式 && 预填守卫通过)`）：viewer 对自己下单的 terminated 项目走 `?copy=` 重新提交时主按钮放开（对齐后端 resubmit 实际权限，修复 FIX-20261020 回归）；copy 模式主按钮文案改「重新提交」、隐藏「保存草稿」（saveDraft 走 createProject 会丢旧单关联与双向留痕，copy 模式只允许正式重新提交）；普通新建（无 copy）viewer 禁用 + NO_PERM_TIP、路由守卫、编辑模式按钮区均保持不动 | views/sales/projects/create.vue | FIX-RESUBMIT | `copyPrefillOk` 仅在 onMounted copy 守卫（viewer 归属 + terminated）全部通过并预填完成后置 true，校验失败跳回路径不置位；handleSubmit copy 分支已走 `resubmitProject` 无需改动 |
+
+### 验证
+
+- `npx vue-tsc --noEmit` 0 error；IDE 诊断 0。
+- 验收：viewer + `?copy=<terminated 且 creator=自己>` → 主按钮可用、文案「重新提交」、无保存草稿；viewer 无 copy → 主按钮仍禁用 + NO_PERM_TIP；editor/admin 全场景行为不变。
+- 未修改 backend/ 下任何文件；未 commit。
+
+## 2026-10-20 ｜ 删除：移除「生态人员基础资料」页面及 db.reps 镜像（CLEANUP-20261020）
+
+**关联任务**：CLEANUP-20261020；契约见 `docs/api-contracts.md`「CLEANUP-20261020 批次」章节。
+
+| 日期 | 类型 | 变更内容 | 影响文件范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-20 | 删除 | 移除 settings/reps「生态人员基础资料」页面（base.vue）及其路由、路由守卫分支、侧边栏「生态人员」菜单项；删除 api 层 `db.reps` 镜像字段、bootstrap 全量同步中的 `db.reps = data.reps`、`BaseKind` 联合类型中的 `'reps'`。原因：生态人员已由 users 表 + viewer 角色（账号角色体系）承载，base_records（kind='reps'）名册无任何业务消费点（建单下拉/筛选/展示均走 /users/options/all） | views/settings/base.vue（删除）, router/index.ts, layouts/MainLayout.vue, api/index.ts | CLEANUP-20261020 | addBase/updateBase/deleteBase 函数与 suppliers/customers 镜像保留不动（暂保留，前端暂无消费点）；「基础设置」子菜单保留（仍有交付物设置/账号与审计）；后端 bootstrap 的 reps 字段由后端并行移除 |
+
+### 验证
+
+- `npx vue-tsc --noEmit` 0 error。
+- 全局搜索 `db.reps` / `SettingsReps` / `settings/reps` / `/bases/reps`：仅剩 sales/projects 两处历史说明性注释（解释选项源已由 db.reps 迁移至 /users/options/all），语义仍准确，予以保留。
+- 未修改 backend/ 下任何文件；未 commit。
+
 ## 2026-10-20 ｜ 修复：业务逻辑 bug 10 项（FIX-20261020）
 
 **关联任务**：FIX-20261020（问题清单 `docs/business-logic-bugs-20261020.md`）；接口契约以 `docs/api-contracts.md`「FIX-20261020 批次」为准；决策依据 ADR-014 / ADR-016 / ADR-017。

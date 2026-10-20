@@ -483,14 +483,22 @@ def create_sale_order(data: schemas.SaleOrderInput, db: Session = Depends(get_db
 
 
 # ============================================================
-# 基础资料（kind: suppliers / customers / reps）
+# 基础资料（kind: suppliers / customers）
+# CLEANUP-20261020：生态人员（kind='reps'）已由 users 表 + viewer 角色承载，该基础资料类型下线
 # ============================================================
-_BASE_LABEL = {"suppliers": "供应商", "customers": "客户", "reps": "生态人员"}
+_BASE_LABEL = {"suppliers": "供应商", "customers": "客户"}
+
+
+def _check_base_kind(kind: str) -> None:
+    # CLEANUP-20261020：reps 类型已下线，统一返回 400
+    if kind == "reps":
+        raise HTTPException(400, "该基础资料类型已下线")
 
 
 @router.post("/bases/{kind}")
 def add_base(kind: str, data: schemas.BaseRecordInput, db: Session = Depends(get_db),
              user: models.User = Depends(security.require_editor)):
+    _check_base_kind(kind)
     services.add_base(db, kind, data)
     label = _BASE_LABEL.get(kind, kind)
     security.record_audit(db, user, "setting", f"新增{label}", "base", data.name, f"kind={kind}")
@@ -500,6 +508,7 @@ def add_base(kind: str, data: schemas.BaseRecordInput, db: Session = Depends(get
 @router.put("/bases/{kind}/{rec_id}")
 def update_base(kind: str, rec_id: int, data: schemas.BaseRecordInput, db: Session = Depends(get_db),
                 user: models.User = Depends(security.require_editor)):
+    _check_base_kind(kind)
     services.update_base(db, kind, rec_id, data)
     label = _BASE_LABEL.get(kind, kind)
     security.record_audit(db, user, "setting", f"编辑{label}", "base", data.name, f"kind={kind}")
@@ -509,6 +518,7 @@ def update_base(kind: str, rec_id: int, data: schemas.BaseRecordInput, db: Sessi
 @router.delete("/bases/{kind}/{rec_id}")
 def delete_base(kind: str, rec_id: int, db: Session = Depends(get_db),
                 user: models.User = Depends(security.require_editor)):
+    _check_base_kind(kind)
     r = db.get(models.BaseRecord, rec_id)
     name = r.name if r else str(rec_id)
     services.delete_base(db, kind, rec_id)

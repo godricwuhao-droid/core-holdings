@@ -4,6 +4,29 @@
 
 ---
 
+## 2026-10-20 变更（CLEANUP-20261020 移除「生态人员基础资料」，⚠️ 接口下线 + bootstrap 字段移除）
+
+> 生态人员已由 `users` 表 + viewer 角色承载，`base_records`（kind='reps'）为无人消费的遗留数据，整体下线。前后端同批上线（契约见 api-contracts.md「CLEANUP-20261020 批次」）。
+
+### `/bases/{kind}` 接口（⚠️ reps 下线）
+
+`POST /api/bases/{kind}`、`PUT /api/bases/{kind}/{rec_id}`、`DELETE /api/bases/{kind}/{rec_id}`：
+
+- **`kind='reps'` → 400**：`{ "detail": "该基础资料类型已下线" }`（三个方法一致）。
+- `kind='suppliers'` / `kind='customers'` 行为不变（暂保留）。
+
+实测（admin 登录）：`POST /api/bases/reps` → `400 {"detail":"该基础资料类型已下线"}`；`POST /api/bases/suppliers` → `200 {"ok":true}`。
+
+### `GET /api/bootstrap` 响应（⚠️ 移除 `reps` 字段）
+
+- 响应顶层**移除 `reps` 字段**（此前为 `BaseRecordOut[]`，kind='reps' 快照）。
+- `suppliers` / `customers` 字段保留不变。
+- 前端并行删除 `db.reps` 镜像与 `BaseKind` 中的 `'reps'`，同批上线。
+
+实测：`GET /api/bootstrap` 响应 keys 为 `assetDeliverables / assets / cart / categoryUnits / contracts / customers / deliverableTemplates / files / flows / logs / outbounds / projects / rsItems / suppliers`（**无 `reps`**）。
+
+---
+
 ## 2026-10-20 变更（FIX-20261020 业务逻辑 13 项修复，分支 fix/business-logic-bugs-20261020，⚠️ 部分行为变更）
 
 ### 权限与 403 语义（ADR-014，FIX-20261020-#1）
@@ -722,7 +745,7 @@ Content-Disposition: attachment; filename*=UTF-8''%E5%BE%B7%E6%95%B0%E4%BA%A4%E9
 | DELETE | `/api/cart/{cart_id}` / `DELETE /api/cart` | 删除购物车项 / 清空 |
 | POST | `/api/cart/checkout` | 购物车下单（进行中 + 锁定，不自动交付） |
 | POST | `/api/sales/order` | 产品直接下单（进行中 + 锁定，不自动交付） |
-| POST | `/api/bases/{kind}` 等 | 基础资料（suppliers/customers/reps） |
+| POST | `/api/bases/{kind}` 等 | 基础资料（suppliers/customers；**reps 已下线 → 400**，2026-10-20 CLEANUP-20261020） |
 | POST | `/api/deliverable-templates` 等 | 交付物模板 |
 | POST | `/api/assets/{asset_id}/deliverables` 等 | 产品交付物 |
 | POST | `/api/upload` / `GET /api/files/{filename}` / `DELETE /api/upload/{filename}` | 文件上传/访问/删除 |

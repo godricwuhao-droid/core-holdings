@@ -96,11 +96,6 @@ const routes: RouteRecordRaw[] = [
         component: () => import('@/views/settings/deliverables.vue'),
       },
       {
-        path: 'settings/reps',
-        name: 'SettingsReps',
-        component: () => import('@/views/settings/base.vue'),
-      },
-      {
         path: 'settings/users',
         name: 'SettingsUsers',
         component: () => import('@/views/settings/users.vue'),
@@ -149,7 +144,7 @@ function viewerAllowedPath(path: string, query: Record<string, unknown> = {}): b
 //    401 由响应拦截器清态跳登录
 //  - viewer（生态人员）：仅 /assets/**（排除创建/编辑页）与 /cart，
 //    其余路由（看板/销售/交付/基础设置/产品创建编辑）→ 静默重定向 /assets/embodied
-//  - /settings/*（users/deliverables/reps）仅 admin，非 admin 直接访问 → 提示并回 /
+//  - /settings/*（users/deliverables）仅 admin，非 admin 直接访问 → 提示并回 /
 // ============================================================
 router.beforeEach(async (to) => {
   if (to.path === '/login') {
@@ -174,10 +169,7 @@ router.beforeEach(async (to) => {
     ElMessage.warning('仅管理员可访问「账号与审计」')
     return '/'
   }
-  if (
-    (to.path === '/settings/deliverables' || to.path === '/settings/reps') &&
-    currentUser.value?.role !== 'admin'
-  ) {
+  if (to.path === '/settings/deliverables' && currentUser.value?.role !== 'admin') {
     ElMessage.warning('仅管理员可访问「基础设置」')
     return '/'
   }

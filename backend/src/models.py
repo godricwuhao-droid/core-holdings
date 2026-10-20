@@ -242,12 +242,12 @@ class FileMeta(Base):
 
 
 class BaseRecord(Base):
-    """供应商 / 客户 / 生态人员，通用表按 kind 区分"""
+    """供应商 / 客户，通用表按 kind 区分（CLEANUP-20261020：reps 已下线）"""
 
     __tablename__ = "base_records"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    kind: Mapped[str] = mapped_column(String(32), index=True)  # suppliers / customers / reps
+    kind: Mapped[str] = mapped_column(String(32), index=True)  # suppliers / customers（reps 已下线）
     name: Mapped[str] = mapped_column(String(128), default="")
     contact: Mapped[str] = mapped_column(String(64), default="")
     phone: Mapped[str] = mapped_column(String(32), default="")
