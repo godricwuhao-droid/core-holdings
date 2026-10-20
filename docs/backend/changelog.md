@@ -2,6 +2,35 @@
 
 > 记录 core-holdings 后端（FastAPI + SQLAlchemy + SQLite）的接口与行为变更。
 
+## 2026-10-20 ｜ 修改：数据订正——rs_items 删旧留新（「甘肃省」旧行删除 + 「河北省」→「河北」改名收尾，业务确认方案 A）
+
+> 无代码变更，纯数据订正。前置备份 `backend/core_holdings.db.bak-province-cleanup`（保留不入库）。业务确认方案 A：清掉引用旧行的测试草稿购物车行后删旧明细。
+
+| 日期 | 类型 | 变更内容 | 影响文件范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-20 | 修改 | 改名（上一轮已完成，本轮记录收尾）：`rs_items` id=1 明细 `province` 「河北省」→「河北」（`PUT /api/rs-items/1` 200）；行其余字段不变（石家庄市 / 1.5m / 2026-09 / ¥330,000） | `backend/core_holdings.db`（rs_items id=1） | rs_items 删旧留新 | 全表 province 去「省」后缀口径统一 |
+| 2026-10-20 | 删除 | 删除测试草稿购物车行 `cart_items` id=9（lshangkun / userId=2 的草稿：assetId=29、itemId=2、qty=1、customer=''、amount=NULL、无服务期限，2026-10-20 17:19 创建）。**执行方式偏离说明**：`DELETE /api/cart/9`（admin token）被 ADR-009 购物车用户隔离拦截（`remove_cart_item` 强制 `userId == 当前登录用户`，admin id=1 ≠ 2 → 404「购物车项不存在」）；lshangkun 密码未知且约束不改代码，故按业务确认直接 SQL 删除（条件收紧 `id=9 AND userId='2' AND itemId=2`，命中 1 行）；该 API 路径本身不写审计日志，无审计差异 | `backend/core_holdings.db`（cart_items id=9） | rs_items 删旧留新 | 删除后 cart_items 12 行，无任何行再引用 itemId=2 |
+| 2026-10-20 | 删除 | 删除旧明细 `rs_items` id=2（`DELETE /api/rs-items/2` admin → 200 `{"ok":true}`）。**被删行快照**：id=2 / assetId=29 / province=甘肃省 / city='' / resolution=1.0 / saleMonth=2026-10 / price=¥280,000 / repeatSale=true / createdAt=2026-10-16 11:42 / updatedAt=2026-10-16 11:46（新甘肃行 id=35–50 已覆盖 2024-10~2026-01 各期，本旧行为冗余） | `backend/core_holdings.db`（rs_items id=2） | rs_items 删旧留新 | 删除前 `DELETE /api/rs-items/2` 曾被 cart_items id=9 引用拦截 400「该明细存在销售关联，无法删除」，清草稿行后重试通过 |
+
+### 删除后验证（全部通过）
+
+- 资产 29 明细数：98 → **97**（`rs_items` 全表亦 97 条，资产 29 为唯一持有者）。
+- 全表 province 无「省」后缀残留：`SELECT DISTINCT province` = **内蒙古 / 宁夏 / 新疆 / 河北 / 甘肃 / 陕西 / 青海**（7 省，`LIKE '%省'` 命中 0）。
+- `project_items` 行数不变（0 行）；`cart_items` 12 行，无行引用 itemId=2。
+- `GET /api/bootstrap`（admin）：`rsItems` = **97** 条，无「甘肃省」、无 id=2；河北行 = `{id:1, province:'河北', city:'石家庄市', resolution:1.5, saleMonth:'2026-09', price:330000}`。
+
+### 97 条明细 province 清单（id / province / city / resolution / saleMonth / price）
+
+- 河北（1 条）：1 / 河北 / 石家庄市 / 1.5 / 2026-09 / 330000
+- 新疆（16 条，id 3–18）：1.0m × 2024-10~2026-01 各期 / 27400
+- 陕西（16 条，id 19–34）：1.0m × 2024-10~2026-01 各期 / 31700
+- 甘肃（16 条，id 35–50）：1.0m × 2024-10~2026-01 各期 / 20600
+- 宁夏（16 条，id 51–66）：1.0m × 2024-10~2026-01 各期 / 11450
+- 青海（16 条，id 67–82）：1.0m × 2024-10~2026-01 各期 / 6350
+- 内蒙古（16 条，id 83–98）：1.0m × 2024-10~2026-01 各期 / 13375
+
+- 约束遵守：未动其他数据、未改代码、未 git commit、备份文件 `core_holdings.db.bak-province-cleanup` 保留不入库。
+
 ## 2026-10-20 ｜ 新增/修改：RSITEM-RANGE-20261020 遥感售卖明细（rs_items）参考价区间（分支 feat/pricing-discount-timelines）
 
 > 依据 ADR-021（取代 ADR-018 §5「遥感行不限制」口径），前后端同批上线（契约见 api-contracts.md「RSITEM-RANGE-20261020 批次」）。

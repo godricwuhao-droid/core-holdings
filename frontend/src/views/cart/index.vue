@@ -92,6 +92,16 @@ function amountPlaceholder(row: CartRow): string {
   return '整数元（选填）'
 }
 
+/** 金额留空兜底口径提示（2026-10-22 修复⑤：金额下方 11px 小字，一行以内，复用 .muted 辅助色，不新增样式体系）：
+ *  - 遥感行留空 = 按明细价结算（qty 恒 1）
+ *  - amount 行留空 = 挂牌价×数量（viewer 可留空；商务必填，提示「必填」）
+ *  - unit 行留空 = 挂牌价×数量 */
+function amountFallbackHint(row: CartRow): string {
+  if (row.rsItem) return '留空按明细价结算'
+  if (row.isAmount) return isViewer.value ? '留空按 挂牌价×数量 结算' : '必填，整数元'
+  return '留空按挂牌价结算'
+}
+
 /** 失焦提交（ADR-018 §3，PRICING-20261020）：
  *  - unit/遥感行：选填——留空 = 原价成交（不提交）；填写须为整数元（≥0），超参考区间由后端 400（文案走 showError）
  *  - amount 行：整数元 > 0（商务必填；生态留空走挂牌价回退）
@@ -345,7 +355,8 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
 </script>
 
 <template>
-  <div class="page-container">
+  <!-- 2026-10-22 修复④：加 cart-page 类——底部留白需让开 sticky 深色结算栏（见 scoped 样式） -->
+  <div class="page-container cart-page">
     <!-- 页面头部 -->
     <div class="page-head">
       <div>
@@ -491,6 +502,8 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
               <div v-if="rowRangeText(row)" class="cart-amount-range">
                 参考区间 {{ rowRangeText(row) }} 元/{{ row.rsItem ? '份' : (row.asset.unit || '单位') }}
               </div>
+              <!-- 2026-10-22 修复⑤：金额留空兜底口径小字（遥感行=明细价 / 普通行=挂牌价，一行以内，辅助色） -->
+              <div class="muted cart-amount-fallback">{{ amountFallbackHint(row) }}</div>
             </template>
           </el-table-column>
           <!-- ADR-020（PRICING-20261020）：服务期限——普通产品行填写（变更即 PUT 提交）；
@@ -521,7 +534,8 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
                   />
                 </div>
               </template>
-              <span v-else class="muted">-</span>
+              <!-- 2026-10-22 修复⑤：遥感行「-」在整列宽度内居中（原裸 span 随单元格左对齐出现半列偏移） -->
+              <span v-else class="muted cart-service-dash">-</span>
             </template>
           </el-table-column>
           <!-- 2026-10-22 微调：小计列宽 130→110（次要列收窄，缓解横向滚动压力，信息完整保留） -->
@@ -746,6 +760,13 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
   background: var(--el-color-danger-light-9);
 }
 
+/* 2026-10-22 修复④：页面底部留白——结算栏 sticky 悬浮（bottom:16px，实际高度约 72px），
+   原 .page-container 底部仅 24px，滚动到底时末行金额/小计被结算栏压住；
+   130px = 结算栏高度 + bottom 偏移 16px + 约 40px 间距，保证任意滚动位置末行不被遮挡 */
+.cart-page {
+  padding-bottom: 130px;
+}
+
 /* 底部深色结算栏：sticky 固定内容区底部（滚动容器为 el-main），深蓝底白字 + 主蓝按钮 */
 .cart-checkout {
   position: sticky;
@@ -810,6 +831,18 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
   color: #71829a;
   margin-top: 4px;
   line-height: 1.4;
+}
+/* 2026-10-22 修复⑤：金额留空兜底口径小字——与参考区间提示同款规格（11px + 辅助色 #71829A），不引入新样式体系 */
+.cart-amount-fallback {
+  font-size: 11px;
+  color: #71829a;
+  margin-top: 4px;
+  line-height: 1.4;
+}
+/* 2026-10-22 修复⑤：遥感行服务期限「-」整列宽度内居中（block + text-align，覆盖单元格默认左对齐） */
+.cart-service-dash {
+  display: block;
+  text-align: center;
 }
 /* ADR-020（PRICING-20261020）：服务期限双日期输入（开始/结束）
    2026-10-20 修复：间距 6→8px，两输入各 136px 明确宽度（配合列宽 300），避免日期截断 */
