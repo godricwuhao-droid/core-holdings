@@ -19,6 +19,7 @@ import uuid
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPAuthorizationCredentials
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from .. import models, schemas, security, services
@@ -282,6 +283,86 @@ def delete_rs_item(item_id: int, db: Session = Depends(get_db),
     security.record_audit(db, user, "asset_change", "删除可售明细", "asset",
                           a.name if a else str(item_id), f"rsItemId={item_id}")
     return {"ok": True}
+
+
+# ============================================================
+# 产品相关列表服务端分页（PAGE-20261021，读：三角色放行，对齐 /audit-logs 先例）
+# bootstrap 快照字段（rsItems/flows/logs）保留不动——RsItemPicker 树等消费方仍依赖全量镜像
+# ============================================================
+@router.get("/assets/{asset_id}/rs-items")
+def list_rs_items(
+    asset_id: int,
+    page: int = Query(1, ge=1),
+    pageSize: int = Query(10, ge=1, le=100),  # PAGE-20261021：默认 10（单页 10 条）
+    db: Session = Depends(get_db),
+    _: models.User = Depends(security.get_current_user),
+):
+    """PAGE-20261021：可售明细分页（id ASC）。items = RsItemOut + 派生 soldCount。
+    soldCount 口径：该明细被 delivered 状态合同的项目明细计数
+    （project_items.itemId == rs_item.id 且所属合同 status='delivered'），
+    一条聚合查询按当页 id 批量计算，避免逐行查。"""
+    a = db.get(models.Asset, asset_id)
+    if a is None:
+        raise HTTPException(404, "产品不存在")
+    q = db.query(models.RsItem).filter(models.RsItem.assetId == asset_id)
+    total = q.count()
+    items = q.order_by(models.RsItem.id.asc()).offset((page - 1) * pageSize).limit(pageSize).all()
+    sold: dict[int, int] = {}
+    if items:
+        ids = [i.id for i in items]
+        rows = (
+            db.query(models.ProjectItem.itemId, func.count(models.ProjectItem.id))
+            .join(models.Contract, models.ProjectItem.contractId == models.Contract.id)
+            .filter(models.Contract.status == "delivered", models.ProjectItem.itemId.in_(ids))
+            .group_by(models.ProjectItem.itemId)
+            .all()
+        )
+        sold = {item_id: cnt for item_id, cnt in rows}
+    out = []
+    for i in items:
+        d = schemas.RsItemOut.model_validate(i).model_dump()
+        d["soldCount"] = sold.get(i.id, 0)
+        out.append(schemas.RsItemOutWithSold.model_validate(d).model_dump())
+    return {"total": total, "items": out}
+
+
+@router.get("/assets/{asset_id}/flows")
+def list_asset_flows(
+    asset_id: int,
+    page: int = Query(1, ge=1),
+    pageSize: int = Query(10, ge=1, le=100),  # PAGE-20261021：默认 10
+    db: Session = Depends(get_db),
+    _: models.User = Depends(security.get_current_user),
+):
+    """PAGE-20261021：产品级数量流水分页（id DESC，仅该 assetId）。
+    asset 级流水对 viewer 全量放行是现状口径，保持一致。"""
+    a = db.get(models.Asset, asset_id)
+    if a is None:
+        raise HTTPException(404, "产品不存在")
+    q = db.query(models.AssetFlow).filter(models.AssetFlow.assetId == asset_id)
+    total = q.count()
+    items = q.order_by(models.AssetFlow.id.desc()).offset((page - 1) * pageSize).limit(pageSize).all()
+    return {"total": total, "items": [schemas.FlowOut.model_validate(i).model_dump() for i in items]}
+
+
+@router.get("/assets/{asset_id}/logs")
+def list_asset_logs(
+    asset_id: int,
+    page: int = Query(1, ge=1),
+    pageSize: int = Query(10, ge=1, le=100),  # PAGE-20261021：默认 10
+    db: Session = Depends(get_db),
+    _: models.User = Depends(security.get_current_user),
+):
+    """PAGE-20261021：产品操作日志分页（target='asset' 且 assetId 过滤，id DESC）。
+    抽屉「最近动态」由前端取两接口各一页后合并排序取 10 条（契约 PAGE-20261021 §3）。"""
+    a = db.get(models.Asset, asset_id)
+    if a is None:
+        raise HTTPException(404, "产品不存在")
+    q = db.query(models.OpLog).filter(
+        models.OpLog.target == "asset", models.OpLog.assetId == asset_id)
+    total = q.count()
+    items = q.order_by(models.OpLog.id.desc()).offset((page - 1) * pageSize).limit(pageSize).all()
+    return {"total": total, "items": [schemas.LogOut.model_validate(i).model_dump() for i in items]}
 
 
 # ============================================================

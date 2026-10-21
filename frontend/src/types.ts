@@ -119,6 +119,12 @@ export function rsItemName(r: RsItem): string {
   return `${r.province}${r.city || ''} ${r.resolution}m ${r.saleMonth}`
 }
 
+/** 可售明细 + 已售次数（PAGE-20261021）：GET /assets/{id}/rs-items 分页接口的派生行类型，
+ * soldCount 由后端按 delivered 合同明细 itemId 计数（替代前端遍历 contracts 派生） */
+export interface RsItemWithSold extends RsItem {
+  soldCount: number
+}
+
 /** 是否包量定价模式（ADR-008）：amount 模式下合同金额为权威输入，salePrice 仅参考 */
 export function isAmountMode(a: Pick<Asset, 'pricingMode'>): boolean {
   return a.pricingMode === 'amount'

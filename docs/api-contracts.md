@@ -104,6 +104,33 @@
 
 ---
 
+## PAGE-20261021 批次：产品相关列表服务端分页（单页 10 条）
+
+> 背景：抽屉/详情页的可售明细、数量流水、操作记录此前随 bootstrap 全量下发前端渲染（遥感明细 96 条，日志随时间累积），改服务端分页。**bootstrap 快照字段（rsItems/flows/logs）保留不动**——RsItemPicker 树、项目页名称查找等 5 处消费方仍依赖全量镜像。
+
+### 统一口径（对齐 GET /audit-logs 先例）
+- 参数：`page: int = Query(1, ge=1)`、`pageSize: int = Query(10, ge=1, le=100)`（**默认 10**）
+- 返回：`{ "total": number, "items": [...] }`
+- 守卫：`get_current_user`（读接口三角色放行，与 bootstrap 读同口径；asset 级 flows/logs 对 viewer 全量放行是现状口径，保持一致）
+
+### 新端点
+1. **GET /assets/{asset_id}/rs-items**
+   - items = `RsItemOut` + 新增派生字段 `soldCount`（number，后端按 delivered 合同 project_items 按 itemId 计数，替代前端遍历 contracts 派生）。
+   - 排序：`id ASC`（录入顺序稳定）。
+   - 产品不存在 404。
+2. **GET /assets/{asset_id}/flows**
+   - items = `FlowOut`（仅该 assetId 的产品级流水）。排序 `id DESC`。
+3. **GET /assets/{asset_id}/logs**
+   - items = `LogOut`（`target='asset' && assetId` 的操作日志）。排序 `id DESC`。
+   - **抽屉「最近动态」沿用前端合并逻辑**（flows+logs 合并倒序）改成分页取两个接口各一页后前端合并排序取 10 条——不新增合并端点（trade-off：抽屉动态条数多时可能有 1-2 条口径误差，可接受；避免维护第三个合并接口）。
+
+### 前端
+4. 抽屉（assets/list.vue）：可售明细表 → 分页加载（el-pagination，`layout="total, prev, pager, next"`，照 settings/users.vue 模式）；最近动态保持"只看前 10 条"语义（分页参数 10）。
+5. 产品详情（assets/detail.vue）：「可售明细」tab（遥感）分页；「数量流水」「操作记录」tab 分页（替换全量时间线渲染）。
+6. 表格内原「已售次数」前端派生列改用后端 `soldCount`。
+
+---
+
 ## REQUIRED-20261024 批次：购物车结算必填口径（ADR-022）
 
 > 取代 ADR-018 §3「留空按原价成交」兜底。前后端同批上线。

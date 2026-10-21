@@ -5,7 +5,7 @@
  * 卫星服务板块顶部增加二级切换：卫星 Token / 卫星数据
  * 筛选：名称搜索 / 状态 / 主体 / 登记日期
  */
-import { computed, ref, watch } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { Box, Close, Document, InfoFilled, Plus, Search, ShoppingCart } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
@@ -32,11 +32,13 @@ import {
 import {
   addCartBatch,
   addToCart,
-  assetFlows,
   db,
   fileDisplayName,
   fileUrl,
   getAssetDeliverables,
+  listAssetFlows,
+  listAssetLogs,
+  listAssetRsItems,
   projectItemsOfAsset,
   refresh,
   showError,
@@ -44,7 +46,7 @@ import {
 import FilePreview from '@/components/FilePreview.vue'
 import RsItemPicker from '@/components/RsItemPicker.vue'
 import { canWrite, NO_PERM_TIP } from '@/auth'
-import type { RsItem } from '@/types'
+import type { RsItem, RsItemWithSold } from '@/types'
 
 const route = useRoute()
 const router = useRouter()
@@ -262,29 +264,54 @@ function salePriceText(a: Asset): string {
 // ---- ADR-011：遥感数据（容器产品）抽屉五段式结构 ----
 const isRemote = computed(() => drawerAsset.value?.type === '遥感数据')
 
-/** 可售明细（遥感数据父产品） */
-const dRsItems = computed<RsItem[]>(() =>
-  drawerAsset.value ? db.rsItems.filter((r) => r.assetId === drawerAsset.value!.id) : [],
-)
+/** 可售明细（PAGE-20261021）：服务端分页（抽屉打开时加载第 1 页）；
+ * 「已售次数」列改读后端 soldCount，不再前端遍历 contracts 派生 */
+const dRs = reactive({
+  loading: false,
+  page: 1,
+  pageSize: 10,
+  total: 0,
+  items: [] as RsItemWithSold[],
+})
 
-/** 已售次数（派生）：delivered 合同明细按 itemId 计数（明细行 qty 恒 1，一行 = 一次售卖） */
-const dSoldMap = computed(() => {
-  const m = new Map<number, number>()
+async function loadDrawerRs() {
+  const a = drawerAsset.value
+  if (!a || a.type !== '遥感数据') return
+  dRs.loading = true
+  try {
+    const res = await listAssetRsItems(a.id, dRs.page, dRs.pageSize)
+    dRs.total = res.total
+    dRs.items = res.items
+  } catch (e) {
+    showError(e, '加载可售明细失败')
+  } finally {
+    dRs.loading = false
+  }
+}
+
+function onDrawerRsPageChange(page: number) {
+  dRs.page = page
+  loadDrawerRs()
+}
+
+/** 遥感容器「已售次数」总数（PAGE-20261021）：后端仅按行返回 soldCount（当前页），
+ * 抽屉头部总数仍由 bootstrap 镜像派生（db.rsItems 取该产品的明细 id + db.contracts 按 itemId 计数，口径与原先一致） */
+const dRsSoldTotal = computed(() => {
+  const a = drawerAsset.value
+  if (!a) return 0
+  const ids = new Set(db.rsItems.filter((r) => r.assetId === a.id).map((r) => r.id))
+  let n = 0
   for (const c of db.contracts) {
     if (c.status !== 'delivered') continue
     for (const it of c.items) {
-      if (it.itemId != null) m.set(it.itemId, (m.get(it.itemId) ?? 0) + 1)
+      if (it.itemId != null && ids.has(it.itemId)) n++
     }
   }
-  return m
+  return n
 })
 
-/** 遥感容器「已售次数」：该产品明细的 dSoldMap 值求和（与「可售明细」表列同口径） */
-const dRsSoldTotal = computed(() =>
-  dRsItems.value.reduce((s, r) => s + (dSoldMap.value.get(r.id) ?? 0), 0),
-)
-
-/** 最近动态：操作日志（db.logs）与数量流水（db.flows）合并，按时间倒序取前 8 条 */
+/** 最近动态（PAGE-20261021，契约 §4.3）：并行取 flows 第 1 页(10) + logs 第 1 页(10)，
+ * 前端合并倒序取前 10 条（保持「最近 10 条」语义；不新增合并端点，动态条数多时可能有 1-2 条口径误差，契约已接受） */
 interface DrawerActivity {
   key: string
   time: string
@@ -292,26 +319,44 @@ interface DrawerActivity {
   operator?: string
   kind: 'flow' | 'log'
 }
-const dActivities = computed<DrawerActivity[]>(() => {
+const dActivities = ref<DrawerActivity[]>([])
+
+async function loadDrawerActivities() {
   const a = drawerAsset.value
-  if (!a) return []
-  const flows: DrawerActivity[] = assetFlows(a.id).map((f) => ({
-    key: `flow-${f.id}`,
-    time: f.date.slice(0, 10),
-    title: [FLOW_TYPES[f.type].label, f.ref, f.note].filter(Boolean).join(' · '),
-    operator: f.operator ? (f.operator === 'system' ? '系统' : f.operator) : undefined,
-    kind: 'flow' as const,
-  }))
-  const logs: DrawerActivity[] = db.logs
-    .filter((l) => l.target === 'asset' && l.assetId === a.id)
-    .map((l) => ({
+  if (!a) return
+  try {
+    const [flowsRes, logsRes] = await Promise.all([
+      listAssetFlows(a.id, 1, 10),
+      listAssetLogs(a.id, 1, 10),
+    ])
+    const flows: DrawerActivity[] = flowsRes.items.map((f) => ({
+      key: `flow-${f.id}`,
+      time: f.date.slice(0, 10),
+      title: [FLOW_TYPES[f.type].label, f.ref, f.note].filter(Boolean).join(' · '),
+      operator: f.operator ? (f.operator === 'system' ? '系统' : f.operator) : undefined,
+      kind: 'flow' as const,
+    }))
+    const logs: DrawerActivity[] = logsRes.items.map((l) => ({
       key: `log-${l.id}`,
       time: l.time.slice(0, 16),
       title: [l.action, l.detail].filter(Boolean).join(' · '),
       operator: l.operator || undefined,
       kind: 'log' as const,
     }))
-  return [...flows, ...logs].sort((x, y) => y.time.localeCompare(x.time)).slice(0, 8)
+    dActivities.value = [...flows, ...logs].sort((x, y) => y.time.localeCompare(x.time)).slice(0, 10)
+  } catch (e) {
+    dActivities.value = []
+    showError(e, '加载最近动态失败')
+  }
+}
+
+// PAGE-20261021：抽屉打开时重置并加载可售明细（仅遥感）与最近动态
+watch(drawerVisible, (v) => {
+  if (!v || !drawerAsset.value) return
+  dRs.page = 1
+  dActivities.value = []
+  loadDrawerRs()
+  loadDrawerActivities()
 })
 
 /** 数量进度分段（不可重复售卖时展示） */
@@ -637,7 +682,8 @@ const boardMeta = computed(() => {
             <template v-if="isRemote">
               <div class="info-item">
                 <span class="il">明细份数</span>
-                <span class="iv">{{ dRsItems.length }} 份</span>
+                <!-- PAGE-20261021：份数改用分页接口 total（dRsItems 已改分页，仅当前页） -->
+                <span class="iv">{{ dRs.total }} 份</span>
               </div>
               <div class="info-item">
                 <span class="il">已售次数</span>
@@ -655,7 +701,8 @@ const boardMeta = computed(() => {
         <div v-if="isRemote" class="dr-section">
           <div class="sec-title">可售明细</div>
           <div class="sec-desc muted">按 省 / 精度 / 月份 维护的可售子项（只计次不扣量）</div>
-          <el-table v-if="dRsItems.length" :data="dRsItems" class="rs-table" size="small">
+          <!-- PAGE-20261021：可售明细改服务端分页（el-pagination 照 settings/users.vue 先例）；「已售次数」改读后端 soldCount -->
+          <el-table v-if="dRs.loading || dRs.items.length" v-loading="dRs.loading" :data="dRs.items" class="rs-table" size="small">
             <el-table-column label="省 / 市" min-width="150" align="left">
               <template #default="{ row }">{{ row.city ? `${row.province} / ${row.city}` : row.province }}</template>
             </el-table-column>
@@ -667,10 +714,19 @@ const boardMeta = computed(() => {
               <template #default="{ row }">{{ formatMoney(row.price) }}</template>
             </el-table-column>
             <el-table-column label="已售次数" width="80" align="center">
-              <template #default="{ row }">{{ dSoldMap.get(row.id) ?? 0 }}</template>
+              <template #default="{ row }">{{ row.soldCount }}</template>
             </el-table-column>
           </el-table>
-          <el-empty v-else description="暂无可售明细，请在产品详情维护" :image-size="56" />
+          <div v-if="dRs.total > 0" class="pagination">
+            <el-pagination
+              v-model:current-page="dRs.page"
+              :page-size="dRs.pageSize"
+              :total="dRs.total"
+              layout="total, prev, pager, next"
+              @current-change="onDrawerRsPageChange"
+            />
+          </div>
+          <el-empty v-if="!dRs.loading && !dRs.items.length" description="暂无可售明细，请在产品详情维护" :image-size="56" />
         </div>
 
         <!-- 交付物（全类型统一 15px 标题 + 弱说明） -->
@@ -701,7 +757,7 @@ const boardMeta = computed(() => {
         <!-- 最近动态（全类型统一：操作日志 + 数量流水合并，细线时间线） -->
         <div class="dr-section">
           <div class="sec-title">最近动态</div>
-          <div class="sec-desc muted">操作日志与数量流水合并，倒序前 8 条 · 关联销售 {{ dProjects.length }} 项</div>
+          <div class="sec-desc muted">操作日志与数量流水合并，倒序前 10 条 · 关联销售 {{ dProjects.length }} 项</div>
           <div v-if="dActivities.length" class="rs-tl">
             <div v-for="act in dActivities" :key="act.key" class="rs-tl-item">
               <span class="rs-tl-dot" :class="act.kind" aria-hidden="true"></span>

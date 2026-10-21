@@ -171,6 +171,17 @@ class RsItemOut(_ORM):
     updatedAt: str
 
 
+class RsItemOutWithSold(RsItemOut):
+    """PAGE-20261021：GET /assets/{id}/rs-items 出参 = RsItemOut 全部字段 + 派生 soldCount。
+
+    soldCount 口径：该明细被 delivered 状态合同的项目明细计数
+    （project_items.itemId == rs_item.id 且所属合同 status='delivered'），
+    由路由层聚合查询后回填（ORM 对象无此属性，故不设默认值依赖 from_attributes）。
+    """
+
+    soldCount: int
+
+
 # ============================================================
 # 销售项目
 # ============================================================

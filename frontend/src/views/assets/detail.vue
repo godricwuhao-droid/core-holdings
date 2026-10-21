@@ -7,7 +7,7 @@
  * → 五页签：基本信息(左基础资料 1 列 + 右数量与归属含可售数量) / 交付物
  *   / 销售关联(空状态) / 数量流水(时间线) / 操作记录
  */
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
@@ -43,22 +43,25 @@ import {
   type AssetFlow,
   type DeliverableCategory,
   type FlowType,
+  type OpLog,
   type Project,
   type ProjectItem,
   type RsItem,
+  type RsItemWithSold,
 } from '@/types'
 import {
   addAssetDeliverable,
   addRsItem,
-  assetFlows,
   deleteAsset,
   deleteRsItem,
   getAsset,
   getAssetDeliverables,
   allUserOptions,
+  listAssetFlows,
+  listAssetLogs,
+  listAssetRsItems,
   projectItemsOfAsset,
   refresh,
-  rsItemsOfAsset,
   showError,
   translateFileNames,
   updateAssetDeliverable,
@@ -79,12 +82,68 @@ const asset = computed(() => getAsset(assetId.value))
 const salesLinks = computed(() =>
   asset.value ? projectItemsOfAsset(asset.value.id) : [],
 )
-const flows = computed(() => (asset.value ? assetFlows(asset.value.id) : []))
-const opLogs = computed(() =>
-  asset.value
-    ? db.logs.filter((l) => l.target === 'asset' && l.assetId === asset.value!.id)
-    : [],
-)
+// ============================================================
+// 数量流水 / 操作记录（PAGE-20261021：服务端分页，tab 首次激活时加载）
+// ============================================================
+const flow = reactive({
+  loading: false,
+  page: 1,
+  pageSize: 10,
+  total: 0,
+  items: [] as AssetFlow[],
+  loaded: false,
+})
+
+async function loadFlows() {
+  const a = asset.value
+  if (!a) return
+  flow.loading = true
+  try {
+    const res = await listAssetFlows(a.id, flow.page, flow.pageSize)
+    flow.total = res.total
+    flow.items = res.items
+    flow.loaded = true
+  } catch (e) {
+    showError(e, '加载数量流水失败')
+  } finally {
+    flow.loading = false
+  }
+}
+
+function onFlowPageChange(page: number) {
+  flow.page = page
+  loadFlows()
+}
+
+const opLog = reactive({
+  loading: false,
+  page: 1,
+  pageSize: 10,
+  total: 0,
+  items: [] as OpLog[],
+  loaded: false,
+})
+
+async function loadOpLogs() {
+  const a = asset.value
+  if (!a) return
+  opLog.loading = true
+  try {
+    const res = await listAssetLogs(a.id, opLog.page, opLog.pageSize)
+    opLog.total = res.total
+    opLog.items = res.items
+    opLog.loaded = true
+  } catch (e) {
+    showError(e, '加载操作记录失败')
+  } finally {
+    opLog.loading = false
+  }
+}
+
+function onOpLogPageChange(page: number) {
+  opLog.page = page
+  loadOpLogs()
+}
 
 // 2026-10-20（问题12b）：「销售关联」生态人员走账号→姓名映射——
 // 复用项目页既有口径（/users/options/all 全量名册 + repName 同构实现，原本页裸账号外露）
@@ -168,8 +227,10 @@ onMounted(() => {
 // ============================================================
 type FlowGroup = 'all' | 'purchase_in' | 'project_lock' | 'sale_out' | 'adjust'
 const flowFilter = ref<FlowGroup>('all')
+/** PAGE-20261021：后端分页接口不支持 type 参数，类型过滤保持前端过滤、仅作用于当前页（UI 已注明口径）；
+ * 接口本身按 id DESC 返回，无需再 reverse */
 const filteredFlows = computed(() => {
-  const list = [...flows.value].reverse()
+  const list = [...flow.items]
   if (flowFilter.value === 'all') return list
   if (flowFilter.value === 'adjust') {
     return list.filter((f) => f.type === 'cancel_release' || f.type === 'manual_adjust')
@@ -272,18 +333,75 @@ async function setDelStatus(status: 'ready' | 'todo') {
 
 // ============================================================
 // 可售明细（ADR-011：仅 type='遥感数据' 显示页签；CRUD 走 rs-items 接口，require_editor）
+// PAGE-20261021：列表改服务端分页（tab 首次激活时加载，asset 切换重置）；
+// 「已售次数」列改读后端 soldCount，删除前端遍历 contracts 派生
 // ============================================================
-const rsItems = computed<RsItem[]>(() => (asset.value ? rsItemsOfAsset(asset.value.id) : []))
+const rs = reactive({
+  loading: false,
+  page: 1,
+  pageSize: 10,
+  total: 0,
+  items: [] as RsItemWithSold[],
+  loaded: false,
+})
+
+async function loadRsItems() {
+  const a = asset.value
+  if (!a) return
+  rs.loading = true
+  try {
+    const res = await listAssetRsItems(a.id, rs.page, rs.pageSize)
+    rs.total = res.total
+    rs.items = res.items
+    rs.loaded = true
+  } catch (e) {
+    showError(e, '加载可售明细失败')
+  } finally {
+    rs.loading = false
+  }
+}
+
+function onRsPageChange(page: number) {
+  rs.page = page
+  loadRsItems()
+}
+
+// PAGE-20261021：tab 首次激活时加载对应分页数据（loaded 标记只拉一次，重复进入不重拉）
+function ensureTabLoaded() {
+  const a = asset.value
+  if (!a) return
+  if (activeTab.value === 'rsItems' && a.type === '遥感数据' && !rs.loaded) {
+    rs.page = 1
+    loadRsItems()
+  } else if (activeTab.value === 'flows' && !flow.loaded) {
+    flow.page = 1
+    loadFlows()
+  } else if (activeTab.value === 'logs' && !opLog.loaded) {
+    opLog.page = 1
+    loadOpLogs()
+  }
+}
+watch(activeTab, ensureTabLoaded)
+// bootstrap 晚于 tab 切换就绪时补拉（db 刷新后 asset computed 重新求值触发）
+watch(asset, ensureTabLoaded)
+// PAGE-20261021：切换产品（路由参数变化复用组件）时重置三处分页状态
+watch(assetId, () => {
+  rs.page = 1
+  rs.loaded = false
+  rs.items = []
+  rs.total = 0
+  flow.page = 1
+  flow.loaded = false
+  flow.items = []
+  flow.total = 0
+  opLog.page = 1
+  opLog.loaded = false
+  opLog.items = []
+  opLog.total = 0
+})
 
 /** 精度选项（米） */
 const RS_RESOLUTIONS = [0.5, 1, 1.5, 2]
-
-/** 已售次数（派生）：db 中该 itemId 已完成（delivered）合同明细计次；统计不到显示 0 */
-function rsSoldCount(itemId: number): number {
-  return db.contracts
-    .filter((c) => c.status === 'delivered')
-    .reduce((s, c) => s + c.items.filter((it) => it.itemId === itemId).length, 0)
-}
 
 const rsForm = reactive({
   visible: false,
@@ -354,14 +472,18 @@ async function saveRsItem() {
     repeatSale: rsForm.editing ? rsForm.editing.repeatSale : true,
   }
   try {
-    if (rsForm.editing) {
-      await updateRsItem(rsForm.editing.id, data)
+    const wasEdit = !!rsForm.editing
+    if (wasEdit) {
+      await updateRsItem(rsForm.editing!.id, data)
       ElMessage.success('明细已更新')
     } else {
       await addRsItem(asset.value.id, data)
       ElMessage.success('明细已新增')
     }
     rsForm.visible = false
+    // PAGE-20261021：CRUD 后重载分页数据（明细按 id ASC 追加，新增后跳末页展示新行）
+    if (!wasEdit) rs.page = Math.ceil((rs.total + 1) / rs.pageSize)
+    loadRsItems()
   } catch (e) {
     showError(e, '保存失败')
   }
@@ -380,6 +502,9 @@ async function removeRsItem(it: RsItem) {
   try {
     await deleteRsItem(it.id)
     ElMessage.success('明细已删除')
+    // PAGE-20261021：删除后当前页变空且非第 1 页时回退一页，再重载
+    if (rs.items.length <= 1 && rs.page > 1) rs.page -= 1
+    loadRsItems()
   } catch (e) {
     // 后端 400「该明细存在销售关联，无法删除」原样 toast
     showError(e, '删除失败')
@@ -560,8 +685,8 @@ function operatorText(f: AssetFlow): string {
             </div>
           </el-tab-pane>
 
-          <!-- 1.5 可售明细（ADR-011：仅遥感数据父产品显示；CRUD 明细） -->
-          <el-tab-pane v-if="asset.type === '遥感数据'" :label="`可售明细（${rsItems.length}）`" name="rsItems">
+          <!-- 1.5 可售明细（ADR-011：仅遥感数据父产品显示；CRUD 明细；PAGE-20261021：服务端分页） -->
+          <el-tab-pane v-if="asset.type === '遥感数据'" :label="`可售明细（${rs.total}）`" name="rsItems">
             <div class="detail-card">
               <div class="card-head">
                 <div>
@@ -576,7 +701,7 @@ function operatorText(f: AssetFlow): string {
                   </span>
                 </el-tooltip>
               </div>
-              <el-table v-if="rsItems.length" :data="rsItems" border stripe>
+              <el-table v-if="rs.loading || rs.items.length" v-loading="rs.loading" :data="rs.items" border stripe>
                 <el-table-column label="省 / 市" min-width="180" align="left">
                   <template #default="{ row }">{{ row.city ? `${row.province} / ${row.city}` : row.province }}</template>
                 </el-table-column>
@@ -599,7 +724,8 @@ function operatorText(f: AssetFlow): string {
                   </template>
                 </el-table-column>
                 <el-table-column label="已售次数" width="100" align="center">
-                  <template #default="{ row }">{{ rsSoldCount(row.id) }}</template>
+                  <!-- PAGE-20261021：改读后端 soldCount（原前端遍历 contracts 派生已删除） -->
+                  <template #default="{ row }">{{ row.soldCount }}</template>
                 </el-table-column>
                 <el-table-column label="操作" width="120" align="center">
                   <template #default="{ row }">
@@ -620,7 +746,7 @@ function operatorText(f: AssetFlow): string {
                   </template>
                 </el-table-column>
               </el-table>
-              <el-empty v-else description="暂无可售明细" :image-size="70">
+              <el-empty v-if="!rs.loading && !rs.items.length" description="暂无可售明细" :image-size="70">
                 <el-tooltip :content="NO_PERM_TIP" :disabled="canWrite" placement="top">
                   <span>
                     <el-button type="primary" size="small" :icon="Plus" :disabled="!canWrite" @click="openRsCreate">
@@ -629,6 +755,16 @@ function operatorText(f: AssetFlow): string {
                   </span>
                 </el-tooltip>
               </el-empty>
+              <!-- PAGE-20261021：服务端分页（el-pagination 照 settings/users.vue 先例） -->
+              <div v-if="rs.total > 0" class="pagination">
+                <el-pagination
+                  v-model:current-page="rs.page"
+                  :page-size="rs.pageSize"
+                  :total="rs.total"
+                  layout="total, prev, pager, next"
+                  @current-change="onRsPageChange"
+                />
+              </div>
             </div>
           </el-tab-pane>
 
@@ -797,13 +933,14 @@ function operatorText(f: AssetFlow): string {
             </div>
           </el-tab-pane>
 
-          <!-- 4 数量流水 -->
-          <el-tab-pane :label="`数量流水（${flows.length}）`" name="flows">
-            <div class="detail-card">
+          <!-- 4 数量流水（PAGE-20261021：服务端分页） -->
+          <el-tab-pane :label="`数量流水（${flow.total}）`" name="flows">
+            <div class="detail-card" v-loading="flow.loading">
               <div class="card-head">
                 <div>
                   <div class="card-title">数量流水</div>
-                  <div class="card-desc">登记、锁定、交付、调整与撤销均留痕，审计记录不可删除。</div>
+                  <!-- PAGE-20261021：后端分页接口不支持 type 参数，类型过滤仅作用于当前页 -->
+                  <div class="card-desc">登记、锁定、交付、调整与撤销均留痕，审计记录不可删除。按类型过滤仅作用于当前页。</div>
                 </div>
                 <el-radio-group v-model="flowFilter" size="small">
                   <el-radio-button value="all">全部流水</el-radio-button>
@@ -835,23 +972,35 @@ function operatorText(f: AssetFlow): string {
                   </div>
                 </div>
               </div>
-              <el-empty v-else description="暂无流水" :image-size="70" />
+              <el-empty v-if="!flow.loading && !filteredFlows.length" description="暂无流水" :image-size="70" />
+              <!-- PAGE-20261021：服务端分页（el-pagination 照 settings/users.vue 先例） -->
+              <div v-if="flow.total > 0" class="pagination">
+                <el-pagination
+                  v-model:current-page="flow.page"
+                  :page-size="flow.pageSize"
+                  :total="flow.total"
+                  layout="total, prev, pager, next"
+                  @current-change="onFlowPageChange"
+                />
+              </div>
             </div>
           </el-tab-pane>
 
-          <!-- 5 操作记录 -->
-          <el-tab-pane :label="`操作记录（${opLogs.length}）`" name="logs">
-            <div class="detail-card">
+          <!-- 5 操作记录（PAGE-20261021：服务端分页） -->
+          <el-tab-pane :label="`操作记录（${opLog.total}）`" name="logs">
+            <div class="detail-card" v-loading="opLog.loading">
               <div class="card-head">
                 <div>
                   <div class="card-title">操作记录</div>
                   <div class="card-desc">产品创建、状态变更、编辑与删除的审计留痕，不提供编辑或删除。</div>
                 </div>
-                <span class="muted" style="font-size: 12px;">共 {{ opLogs.length }} 条</span>
+                <!-- PAGE-20261021：总数改用分页接口 total -->
+                <span class="muted" style="font-size: 12px;">共 {{ opLog.total }} 条</span>
               </div>
-              <el-timeline v-if="opLogs.length">
+              <!-- 接口按 id DESC 返回，无需再 reverse -->
+              <el-timeline v-if="opLog.items.length">
                 <el-timeline-item
-                  v-for="log in [...opLogs].reverse()"
+                  v-for="log in opLog.items"
                   :key="log.id"
                   :timestamp="`${log.time} · ${log.operator}`"
                   placement="top"
@@ -861,7 +1010,17 @@ function operatorText(f: AssetFlow): string {
                   <div class="log-detail muted">{{ log.detail }}</div>
                 </el-timeline-item>
               </el-timeline>
-              <el-empty v-else description="暂无操作记录" :image-size="70" />
+              <el-empty v-if="!opLog.loading && !opLog.items.length" description="暂无操作记录" :image-size="70" />
+              <!-- PAGE-20261021：服务端分页（el-pagination 照 settings/users.vue 先例） -->
+              <div v-if="opLog.total > 0" class="pagination">
+                <el-pagination
+                  v-model:current-page="opLog.page"
+                  :page-size="opLog.pageSize"
+                  :total="opLog.total"
+                  layout="total, prev, pager, next"
+                  @current-change="onOpLogPageChange"
+                />
+              </div>
             </div>
           </el-tab-pane>
         </el-tabs>

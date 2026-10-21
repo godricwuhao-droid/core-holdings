@@ -2,6 +2,26 @@
 
 > 记录 core-holdings 后端（FastAPI + SQLAlchemy + SQLite）的接口与行为变更。
 
+## 2026-10-21 ｜ 新增：PAGE-20261021 产品相关列表服务端分页（分支 feat/pricing-discount-timelines）
+
+> 抽屉/详情页的可售明细、数量流水、操作记录由 bootstrap 全量下发改服务端分页（单页默认 10 条）。**bootstrap 快照字段（rsItems/flows/logs）保留不动**——RsItemPicker 树、项目页名称查找等消费方仍依赖全量镜像。契约见 api-contracts.md「PAGE-20261021 批次」，口径对齐 `GET /audit-logs` 先例（`page`/`pageSize` 参数、`{total, items}` 返回）。
+
+| 日期 | 类型 | 变更内容 | 影响文件范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-21 | 新增 | `GET /api/assets/{asset_id}/rs-items`：可售明细分页（`id ASC`，默认 pageSize=10），items = `RsItemOut` 全 13 字段 + 派生 `soldCount`（该明细被 delivered 状态合同的项目明细计数：`project_items.itemId == rs_item.id` 且所属合同 `status='delivered'`；一条聚合查询按当页 id 批量计算，避免逐行查）。产品不存在 404「产品不存在」 | `backend/src/routers/api.py`（`list_rs_items`）、`backend/src/schemas.py`（`RsItemOutWithSold`） | PAGE-20261021 | 守卫 `get_current_user`（读接口三角色放行，与 bootstrap 读同口径）；替代前端遍历 contracts 派生「已售次数」列 |
+| 2026-10-21 | 新增 | `GET /api/assets/{asset_id}/flows`：产品级数量流水分页（`assetId` 过滤，`id DESC`），items = `FlowOut`。产品不存在 404 | `backend/src/routers/api.py`（`list_asset_flows`） | PAGE-20261021 | asset 级流水对 viewer 全量放行是现状口径，保持一致 |
+| 2026-10-21 | 新增 | `GET /api/assets/{asset_id}/logs`：产品操作日志分页（`target='asset'` 且 `assetId` 过滤，`id DESC`），items = `LogOut`。产品不存在 404 | `backend/src/routers/api.py`（`list_asset_logs`） | PAGE-20261021 | 抽屉「最近动态」由前端取两接口各一页后合并排序取 10 条（契约 §3，不新增合并端点） |
+
+### 验证（dev server 8000，admin + viewer，curl 实测）
+
+- `python3 -m compileall -q src main.py` 通过；`import src.services / src.routers.api / src.schemas / src.models / main` → import ok。
+- `GET /api/assets/29/rs-items?page=1&pageSize=10`（admin）→ 200，`total=97`、items 10 条、每行 13 字段 + `soldCount`；`page=10` → 7 条（lastId=98）；`page=11` → 0 条。
+- soldCount 口径核对：当前库 `contracts.status='delivered'` 为 0 条 → 全部明细 `soldCount=0`（SQL 基准查询同口径核对一致）。
+- `GET /api/assets/29/flows` → 200 `{total:12, items:10}`（首条 id=78，id DESC）；`GET /api/assets/29/logs` → 200 `{total:122, items:10}`（首条 id=542，target='asset' 且 assetId=29）。
+- viewer 三角色放行：三端点 viewer token 均 200（rs-items total=97 / flows total=12 / logs total=122）。
+- 不存在产品：`GET /api/assets/9999/{rs-items,flows,logs}` → 404 `{"detail":"产品不存在"}`；无 token → 401。
+- 只读操作，未动任何业务数据；未修改 frontend/、未执行构建/部署、未 git commit。
+
 ## 2026-10-24 ｜ 修改：REQUIRED-20261024 购物车结算必填口径（分支 feat/pricing-discount-timelines）
 
 > 依据 ADR-022（业务拍板：购物车所有都是必填项），取代 ADR-018 §3「留空按挂牌价成交」兜底。前后端同批上线（契约见 api-contracts.md「REQUIRED-20261024 批次」）。

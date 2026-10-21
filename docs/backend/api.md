@@ -4,6 +4,63 @@
 
 ---
 
+## 2026-10-21 变更（PAGE-20261021 产品相关列表服务端分页，新增 3 个 GET 端点）
+
+> 抽屉/详情页的可售明细、数量流水、操作记录改服务端分页（单页默认 10 条）。**`GET /api/bootstrap` 快照字段（rsItems/flows/logs）保留不动**（RsItemPicker 树等消费方仍依赖全量镜像）。契约见 api-contracts.md「PAGE-20261021 批次」。
+
+**统一口径**（对齐 `GET /api/audit-logs` 先例）：
+
+- 参数：`page: int ≥ 1`（默认 1）、`pageSize: int 1~100`（**默认 10**）
+- 返回：`{ "total": number, "items": [...] }`
+- 守卫：`get_current_user`（读接口三角色放行，与 bootstrap 读同口径；asset 级 flows/logs 对 viewer 全量放行是现状口径）
+- 产品不存在（`asset_id` 无对应 assets 行）：三端点均 404 `{"detail":"产品不存在"}`
+
+### `GET /api/assets/{asset_id}/rs-items`
+
+可售明细分页，`id ASC`（录入顺序稳定）。items = `RsItemOut` 全部 13 字段 + 派生字段 `soldCount`。
+
+请求：`GET /api/assets/29/rs-items?page=1&pageSize=10`
+
+响应（200，实测）：
+
+```json
+{"total":97,"items":[{"id":1,"assetId":29,"province":"河北","city":"石家庄市","resolution":1.5,"saleMonth":"2026-09","price":330000.0,"priceMin":null,"priceMax":null,"repeatSale":true,"createdAt":"2026-10-16 11:41","updatedAt":"2026-10-20 17:31","soldCount":0}]}
+```
+
+关键字段：`total`（该产品明细总数）、`items[].soldCount`（number，**派生口径**：该明细被 delivered 状态合同的项目明细计数——`project_items.itemId == rs_item.id` 且所属合同 `status='delivered'`，后端一条聚合查询计算，替代前端遍历 contracts 派生「已售次数」列；无关联为 0）。
+
+### `GET /api/assets/{asset_id}/flows`
+
+产品级数量流水分页（仅该 `assetId`），`id DESC`。items = `FlowOut`。
+
+请求：`GET /api/assets/29/flows?page=1&pageSize=10`
+
+响应（200，实测）：
+
+```json
+{"total":12,"items":[{"id":78,"assetId":29,"type":"cancel_release","qty":1,"unit":"份","amount":0.0,"date":"2026-10-16","ref":"HT-0007","note":"项目释放锁定","operator":"admin","contractId":7}]}
+```
+
+关键字段：`total`（该产品流水总数）、`items[]`（FlowOut，`contractId` 非合同场景为 null）。
+
+### `GET /api/assets/{asset_id}/logs`
+
+产品操作日志分页（`target='asset'` 且 `assetId` 过滤），`id DESC`。items = `LogOut`。
+
+请求：`GET /api/assets/29/logs?page=1&pageSize=10`
+
+响应（200，实测）：
+
+```json
+{"total":122,"items":[{"id":542,"target":"asset","targetName":"遥感数据-2026","action":"删除可售明细","detail":"删除明细 #2：甘肃省 1m 2026-10","operator":"admin","time":"2026-10-20 17:34","assetId":29,"changes":"","contractId":null}]}
+```
+
+关键字段：`total`（该产品操作日志总数）、`items[]`（LogOut，`changes` 仅产品字段级编辑时非空）。
+
+> 抽屉「最近动态」沿用前端合并逻辑：分页取 flows/logs 各一页后前端合并排序取 10 条，不新增合并端点（契约 §3）。
+
+---
+
 ## 2026-10-24 变更（REQUIRED-20261024 购物车结算必填口径，⚠️ checkout 400 场景扩充，依据 ADR-022）
 
 > 取代 ADR-018 §3「留空按挂牌价成交」兜底：后端 amount 为空回退 `salePrice×qty`（遥感行回退明细 price）的分支已删除，viewer 金额免填口径同步作废。前后端同批上线（契约见 api-contracts.md「REQUIRED-20261024 批次」）。

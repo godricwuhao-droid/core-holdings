@@ -37,6 +37,7 @@ import {
   type Contract,
   type Board,
   type RsItem,
+  type RsItemWithSold,
 } from '@/types'
 import { CATEGORY_UNITS, FEATURE_CATALOGS } from '@/constants'
 import {
@@ -707,6 +708,50 @@ export async function updateRsItem(id: number, data: RsItemInput): Promise<void>
 export async function deleteRsItem(id: number): Promise<void> {
   await http.delete(`/rs-items/${id}`)
   await afterWrite()
+}
+
+// ============================================================
+// 产品列表服务端分页（PAGE-20261021，契约 docs/api-contracts.md）：
+// 参数 page/pageSize（默认 10，上限 100），返回 { total, items }；
+// bootstrap 镜像字段（rsItems/flows/logs）保留不动，RsItemPicker / 项目页名称查找仍用全量
+// ============================================================
+/** 可售明细分页（GET /assets/{assetId}/rs-items）：items = RsItem + 后端派生 soldCount，id ASC */
+export async function listAssetRsItems(
+  assetId: number,
+  page = 1,
+  pageSize = 10,
+): Promise<{ total: number; items: RsItemWithSold[] }> {
+  const { data } = await http.get<{ total: number; items: RsItemWithSold[] }>(
+    `/assets/${assetId}/rs-items`,
+    { params: { page, pageSize } },
+  )
+  return data
+}
+
+/** 数量流水分页（GET /assets/{assetId}/flows）：仅该 assetId 的产品级流水，id DESC */
+export async function listAssetFlows(
+  assetId: number,
+  page = 1,
+  pageSize = 10,
+): Promise<{ total: number; items: AssetFlow[] }> {
+  const { data } = await http.get<{ total: number; items: AssetFlow[] }>(
+    `/assets/${assetId}/flows`,
+    { params: { page, pageSize } },
+  )
+  return data
+}
+
+/** 操作日志分页（GET /assets/{assetId}/logs）：target='asset' && assetId 的操作日志，id DESC */
+export async function listAssetLogs(
+  assetId: number,
+  page = 1,
+  pageSize = 10,
+): Promise<{ total: number; items: OpLog[] }> {
+  const { data } = await http.get<{ total: number; items: OpLog[] }>(
+    `/assets/${assetId}/logs`,
+    { params: { page, pageSize } },
+  )
+  return data
 }
 
 // ============================================================

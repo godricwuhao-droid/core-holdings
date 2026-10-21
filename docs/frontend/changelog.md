@@ -2,6 +2,27 @@
 
 > 记录 core-holdings 前端（Vue3 + TS + Element Plus + Vite）的页面/组件/接口封装变更。
 
+## 2026-10-21 ｜ 修改：产品抽屉/详情页列表服务端分页（4 处 UI）+ 已售次数改后端 soldCount（PAGE-20261021）
+
+**关联任务**：PAGE-20261021（契约见 docs/api-contracts.md「PAGE-20261021 批次」）。抽屉/详情页的可售明细、数量流水、操作记录此前随 bootstrap 全量下发前端渲染（遥感明细 97 条、日志随时间累积），改服务端分页（单页 10 条，`layout="total, prev, pager, next"` 照 settings/users.vue 先例）。**bootstrap 快照字段（db.rsItems/db.flows/db.logs）保留不动**——RsItemPicker 树、项目页名称查找（create/detail/review）、列表页「N 期」摘要等消费方仍用全量镜像，本次仅改 4 处渲染的数据源。
+
+| 日期 | 类型 | 变更内容 | 影响文件范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-21 | 新增 | ① API 封装 3 个分页函数（参数 page/pageSize 默认 10，返回 `{total, items}`，对齐契约）：`listAssetRsItems`（GET /assets/{id}/rs-items，items = RsItem + 后端派生 `soldCount`）、`listAssetFlows`（GET /assets/{id}/flows，id DESC）、`listAssetLogs`（GET /assets/{id}/logs，id DESC）；types.ts 新增派生类型 `RsItemWithSold extends RsItem { soldCount: number }` | api/index.ts、types.ts | PAGE-20261021 | 读接口，无 afterWrite |
+| 2026-10-21 | 修改 | ② 抽屉·可售明细（list.vue）：`dRsItems` computed（db.rsItems 全量过滤）→ `dRs` 分页状态（reactive page/pageSize/total/items/loading）+ `loadDrawerRs()`，watch drawerVisible 打开时重置第 1 页并加载（仅遥感产品发请求）；表格下加 el-pagination；「已售次数」列改读后端 `row.soldCount`；「明细份数」关键信息行改读 `dRs.total`（原 `dRsItems.length` 分页后仅当前页）；加载中 el-table v-loading | views/assets/list.vue | PAGE-20261021 | 空态/loading 分支：`!loading && !items.length` 才显示 el-empty |
+| 2026-10-21 | 修改 | ③ 抽屉·最近动态（list.vue）：`dActivities` computed（db 全量合并 slice(0,8)）→ ref + `loadDrawerActivities()`，按契约 §4.3 并行取 flows 第 1 页(10) + logs 第 1 页(10) 后前端合并倒序取前 **10** 条（保持「最近 10 条」语义；不新增合并端点，动态条数多时 1-2 条口径误差为契约已接受 trade-off）；抽屉打开时加载 | views/assets/list.vue | PAGE-20261021 | 展示映射（时间/标题/操作人）与原口径一致 |
+| 2026-10-21 | 修改 | ④ 详情·可售明细 tab（detail.vue）：`rsItems` computed（rsItemsOfAsset 全量）→ `rs` 分页状态 + `loadRsItems()`，tab 首次激活时加载（`ensureTabLoaded`，loaded 标记只拉一次）；tab label「（N 条）」与表格数据源改用分页接口 total/items；「已售次数」列改读后端 `row.soldCount`；表格下加 el-pagination；CRUD 后重载（新增跳末页展示新行、删除末页空页回退一页）；watch assetId 切换产品重置分页状态 | views/assets/detail.vue | PAGE-20261021 | 接口 id ASC 稳定排序 |
+| 2026-10-21 | 修改 | ⑤ 详情·数量流水 tab（detail.vue）：`flows` computed（assetFlows 全量）→ `flow` 分页状态 + `loadFlows()`，tab 首次激活加载；tab label 与时间线数据源改用分页接口；**类型 radio 过滤保持前端过滤、仅作用于当前页**（后端接口不支持 type 参数，选改动最小口径，card-desc 已注明「按类型过滤仅作用于当前页」）；接口本身 id DESC，删除原 `.reverse()`；时间线下加 el-pagination | views/assets/detail.vue | PAGE-20261021 | — |
+| 2026-10-21 | 修改 | ⑥ 详情·操作记录 tab（detail.vue）：`opLogs` computed（db.logs 全量过滤）→ `opLog` 分页状态 + `loadOpLogs()`，tab 首次激活加载；「共 N 条」与 tab label 改用分页接口 total；时间线数据源改用分页 items（id DESC，删除原 `.reverse()`）；时间线下加 el-pagination | views/assets/detail.vue | PAGE-20261021 | — |
+| 2026-10-21 | 删除 | ⑦ 前端 soldCount 派生逻辑删除：list.vue `dSoldMap`（遍历 db.contracts 按 itemId 计次）、detail.vue `rsSoldCount()` 函数均删除（grep 确认无残留调用）；抽屉头部「已售次数」总数 `dRsSoldTotal` 因后端仅按行返回 soldCount（当前页）、无聚合值，改为在自身 computed 内由 bootstrap 镜像派生（db.rsItems 取该产品明细 id + db.contracts 按 itemId 计数，口径与原先一致）；detail.vue 移除 `assetFlows`/`rsItemsOfAsset` 导入，list.vue 移除 `assetFlows` 导入（api 层两个导出函数保留，未删公共 API） | views/assets/list.vue、views/assets/detail.vue | PAGE-20261021 | db.rsItems 其他消费方（RsItemPicker、项目页 create/detail/review 名称查找、列表页摘要）零改动 |
+
+### 验证
+
+- `npx vue-tsc --noEmit` 0 error（strict）；IDE 诊断 0。
+- curl 契约验证（后端已就绪）：rs-items total=97、id ASC、含 `soldCount` 字段；flows total=12、id DESC；logs total=122、id DESC；asset 不存在 404。
+- agent-browser 页面冒烟（127.0.0.1:5173，admin）：卫星板块行点击开抽屉 → 可售明细表 10 行 + 分页「共 97 条」翻页正常、最近动态 10 条（新接口）；详情页「可售明细（97）」tab 首次激活加载 + 分页、「数量流水（12）」含「按类型过滤仅作用于当前页」小字、「操作记录（122）」时间线 + 分页均正常。
+- 未修改 backend/ 下任何文件；未执行构建/部署；未 commit。
+
 ## 2026-10-24 ｜ 修改：购物车结算必填口径（客户/金额/服务期限）+ 删除按钮默认红色（ADR-022）
 
 **关联任务**：REQUIRED-20261024（契约见 docs/api-contracts.md「REQUIRED-20261024 批次」，决策 ADR-022）。后端并行实现 checkout 必填 400，前端按契约先行。
