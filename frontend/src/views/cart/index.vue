@@ -134,21 +134,8 @@ function serviceMissing(row: CartRow, which: 'start' | 'end'): boolean {
   return which === 'start' ? !s || orderBad : !e || orderBad
 }
 
-/** 金额 tooltip 文案（2026-10-24 ADR-022：所有行必填、整数元 > 0；
- *  旧「选填：留空按原价成交 / 生态可留空」口径随留空兜底一并废弃）
- *  DISCOUNT-20261021（ADR-023，2026-10-21）：填了折扣时提示行优先显示折扣摘要（原价总额·折后单价），
- *  参考区间移到本 tooltip 合并展示（折扣与区间同时存在时的展示优先级，见模板 cell-hint 注释） */
-function amountTip(row: CartRow): string {
-  const base = row.isAmount
-    ? '包量定价：销售金额（整数元 > 0）为权威输入，必填'
-    : '必填，整数元（> 0）；设参考区间时须落在区间内'
-  const range = rowRangeText(row)
-  // CART-PERF-20261021：折扣判断改读「草稿或已提交值」有效折扣率（与摘要渲染条件同口径）
-  if (discountPreviewRate(row) != null && range) {
-    return `${base}；参考区间 ${range} 元/${row.rsItem ? '份' : (row.asset.unit || '单位')}`
-  }
-  return base
-}
+// 2026-10-25：金额输入框 tooltip 文案 amountTip() 随输入框 hover 提示删除（用户反馈「太碍事」）——
+// 必填/整数元口径见列头红星 + 顶部提示条，参考区间见金额下方提示行，无信息死角
 
 /** 行参考区间文案（ADR-021，RSITEM-RANGE-20261020）：
  *  遥感明细行（rsItem 非空）读该明细自身区间（不再取父产品容器区间）；普通行读产品区间；未设返回空串不显示 */
@@ -190,8 +177,8 @@ async function onAmountChange(row: CartRow) {
 const discountDrafts = reactive<Record<number, string>>({})
 
 // CART-PERF-20261021（2026-10-21）性能自查（修复清单第 4 项）：模板单元格内调用的方法
-// （discountDraft/discountInvalid/discountTip/discountSummary/discountPreviewRate/amountDraft/
-// amountInvalid/amountPlaceholder/amountTip/serviceMissing/rowRangeText 等）均只读
+// （discountDraft/discountInvalid/discountSummary/discountPreviewRate/amountDraft/
+// amountInvalid/amountPlaceholder/serviceMissing/rowRangeText 等）均只读
 // per-row 状态（row.cart.* 属性 + 草稿 Record 的单个 id 键），不遍历 cartRows/db.cart——
 // 敲字只失效本行依赖，cartRows computed（:data）不重算，el-table 无整表重建（无固定列双渲染重建）。
 // 遍历 cartRows 的 previewGroups/orderItems 仅用于结算栏/弹窗，不在表格单元格渲染路径上。
@@ -215,10 +202,8 @@ function discountInvalid(row: CartRow): boolean {
   return !/^\d+(\.\d)?$/.test(t) || !(n > 0 && n <= 10)
 }
 
-/** 折扣输入 tooltip 文案（快捷入口说明 + 一致性规则提示） */
-function discountTip(row: CartRow): string {
-  return `选填，0-10 一位小数（如 9、8.5）；填写后自动按 ${row.rsItem ? '明细价' : '原价单价'} × 数量 × 折扣回填销售金额；手动改金额将清空折扣`
-}
+// 2026-10-25：折扣输入框 tooltip 文案 discountTip() 随输入框 hover 提示删除（用户反馈「太碍事」）——
+// 折扣回填/一致性规则见顶部提示条 + 折扣摘要提示行
 
 /** CART-PERF-20261021（2026-10-21）：折扣有效率（0-1 小数，草稿或已提交值合并口径）——
  *  草稿合法（0<r≤10，本地校验同 onDiscountChange 正则）取草稿；无草稿读已提交值；
@@ -640,16 +625,15 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
                        :model-value 草稿优先（无草稿读已提交值），敲字只写草稿不碰 db.cart 镜像
                        （cartRows 不重算、无整表重建）；标红/placeholder 改读合并口径 customerValue
                        （草稿优先 trim 后），标红跟随输入草稿实时变化 -->
-                  <el-tooltip content="结算时按「产品 + 客户」分组生成销售记录" placement="top">
-                    <el-input
-                      :model-value="customerDraft(row)"
-                      size="small"
-                      :placeholder="customerValue(row) ? '填写客户' : '必填'"
-                      :class="{ 'cart-customer-error': customerValue(row) === '' }"
-                      @input="onCustomerInput(row, $event)"
-                      @change="onCustomerChange(row)"
-                    />
-                  </el-tooltip>
+                  <!-- 2026-10-25：用户反馈输入框 hover 提示「太碍事」，删除客户输入框 tooltip（分组规则见顶部提示条） -->
+                  <el-input
+                    :model-value="customerDraft(row)"
+                    size="small"
+                    :placeholder="customerValue(row) ? '填写客户' : '必填'"
+                    :class="{ 'cart-customer-error': customerValue(row) === '' }"
+                    @input="onCustomerInput(row, $event)"
+                    @change="onCustomerChange(row)"
+                  />
                 </div>
                 <div class="cell-hint" aria-hidden="true"></div>
               </div>
@@ -737,37 +721,37 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
                     <!-- CART-PERF-20261021（2026-10-21）：金额输入改本地草稿——
                          :model-value 草稿优先（无草稿读已提交值），敲字只写草稿不碰 db.cart 镜像；
                          placeholder 实时回填折扣预计金额（纯展示，无重复提交风险，见 amountPlaceholder 注释） -->
-                    <el-tooltip :content="amountTip(row)" placement="top">
-                      <el-input
-                        :model-value="amountDraft(row)"
-                        :placeholder="amountPlaceholder(row)"
-                        size="small"
-                        class="cart-amount-input"
-                        :class="{ 'cart-customer-error': amountInvalid(row) }"
-                        @input="onAmountInput(row, $event)"
-                        @change="onAmountChange(row)"
-                      />
-                    </el-tooltip>
+                    <!-- 2026-10-25：用户反馈输入框 hover 提示「太碍事」，删除金额输入框 tooltip
+                         （必填/整数元口径见列头红星 + 顶部提示条，参考区间见下方提示行） -->
+                    <el-input
+                      :model-value="amountDraft(row)"
+                      :placeholder="amountPlaceholder(row)"
+                      size="small"
+                      class="cart-amount-input"
+                      :class="{ 'cart-customer-error': amountInvalid(row) }"
+                      @input="onAmountInput(row, $event)"
+                      @change="onAmountChange(row)"
+                    />
                     <!-- 折扣输入（选填，0-10 一位小数）：合法→回填金额走 onAmountChange 提交链路；
-                         非法（0/超10/非数字）→ 值驱动标红不回填；手改金额自动清空（onAmountInput） -->
-                    <el-tooltip :content="discountTip(row)" placement="top">
-                      <el-input
-                        :model-value="discountDraft(row)"
-                        placeholder="折扣"
-                        size="small"
-                        class="cart-discount-input"
-                        :class="{ 'cart-customer-error': discountInvalid(row) }"
-                        @input="onDiscountInput(row, $event)"
-                        @change="onDiscountChange(row)"
-                      />
-                    </el-tooltip>
+                         非法（0/超10/非数字）→ 值驱动标红不回填；手改金额自动清空（onAmountInput）
+                         2026-10-25：删除折扣输入框 tooltip（回填规则见顶部提示条 + 折扣摘要提示行） -->
+                    <el-input
+                      :model-value="discountDraft(row)"
+                      placeholder="折扣"
+                      size="small"
+                      class="cart-discount-input"
+                      :class="{ 'cart-customer-error': discountInvalid(row) }"
+                      @input="onDiscountInput(row, $event)"
+                      @change="onDiscountChange(row)"
+                    />
                   </div>
                 </div>
                 <div class="cell-hint">
                   <!-- DISCOUNT-20261021（ADR-023，2026-10-21）：填了折扣 → 提示行优先显示折扣摘要
                        （原价总额 · 折后单价，11px 辅助色 #71829A，超长省略 + tooltip 全文）；
-                       参考区间此时移到金额输入框 hover tooltip 合并展示（见 amountTip 注释）；
-                       未填折扣 → 维持现状（参考区间或空） -->
+                       未填折扣 → 维持现状（参考区间或空）
+                       2026-10-25：金额输入框 hover tooltip 删除后，填了折扣的行参考区间不再于提示行展示
+                       （超区间由后端 400 文案兜底，无信息死角，按用户要求不补新展示） -->
                   <!-- CART-PERF-20261021（2026-10-21）：渲染条件改「草稿合法或已提交值非空」（discountPreviewRate）——
                        折扣输入过程中摘要实时出现，不等失焦落值；截断时 el-tooltip 全文可触发（见 .cart-amount-range 样式） -->
                   <el-tooltip v-if="discountPreviewRate(row) != null" :content="discountSummary(row)" placement="top">
