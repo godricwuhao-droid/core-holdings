@@ -4,6 +4,26 @@
 
 ---
 
+## 2026-10-21 变更（CART-PERF-20261021 购物车行更新性能：`PATCH /api/cart/{id}` 响应变更）
+
+> 背景：行级更新（qty/amount/discountRate/service）每次写后前端全量重拉 bootstrap（含 97 条 rsItems/122 条 logs）整表重建 → 输入卡顿。改「写接口返回更新行 → 前端本地打补丁」。契约见 api-contracts.md「CART-PERF-20261021 批次」。
+
+**响应变更**：`PATCH /api/cart/{id}` 由 `{"ok": true}` 改为**返回更新后的完整 `CartItemOut`**（含最新 customer/qty/amount/serviceStart/serviceEnd/discountRate）。入参、校验、400/404 文案、审计日志均不变。
+
+请求：`PATCH /api/cart/6`，body `{"customer":"CART-PERF测试客户","amount":30000000,"discountRate":0.93}`
+
+响应（200，实测）：
+
+```json
+{"id":6,"userId":"1","assetId":28,"customer":"CART-PERF测试客户","qty":1,"amount":30000000.0,"itemId":null,"serviceStart":null,"serviceEnd":null,"discountRate":0.93,"createdAt":"2026-10-21 10:52","updatedAt":"2026-10-21 10:52"}
+```
+
+关键字段：与 `POST /api/cart` 出参同构（`CartItemOut` 全字段）——`amount`（number|null，本次更新后的合同/折扣金额）、`discountRate`（number|null，0-1 小数）、`customer`（行级客户）、`qty`、`serviceStart`/`serviceEnd`（YYYY-MM-DD|null）、`updatedAt`（有字段变更时刷新）。
+
+补漏（CART-PERF-20261021）：`PUT /api/cart/{id}`（set_cart_qty，数量端点）同口径返回 `CartItemOut`（原 `{"ok": true}`），入参、校验、400/404 文案不变。
+
+---
+
 ## 2026-10-21 变更（DISCOUNT-20261021 购物车折扣率输入，新增可选字段 `discountRate`，依据 ADR-023）
 
 > 选填快捷入口；销售金额仍是权威必填值（ADR-022 不变）。前后端同批上线（契约见 api-contracts.md「DISCOUNT-20261021 批次」）。**后端只存不算**：不做金额回填计算（前端回填 `amount = round(salePrice × qty × rate)` 后一次性提交 amount+discountRate；手动改 amount → 前端提交 `discountRate: null`），amount 现有校验（必填/整数元/参考区间）完全不变。

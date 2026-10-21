@@ -525,31 +525,33 @@ def add_to_cart_batch(data: schemas.CartBatchInput, db: Session = Depends(get_db
     return services.add_to_cart_batch(db, data, user_id=str(user.id))
 
 
-@router.put("/cart/{cart_id}")
+@router.put("/cart/{cart_id}", response_model=schemas.CartItemOut)
 def set_cart_qty(cart_id: int, request: dict, db: Session = Depends(get_db),
                  user: models.User = Depends(security.require_order)):
     # ADR-008/ADR-018 §3：可选携带 amount（unit/遥感行=折扣金额过区间校验；amount 行=整数元权威）
     # ADR-020：可选携带 serviceStart/serviceEnd（服务期限）
     # DISCOUNT-20261021/ADR-023：可选携带 discountRate（0-1 小数，0 < rate ≤ 1 否则 400；null=清空）
-    services.set_cart_qty(db, cart_id, int(request.get("qty", 0)), user_id=str(user.id),
-                          amount=request.get("amount"),
-                          service_start=request.get("serviceStart"),
-                          service_end=request.get("serviceEnd"),
-                          discount_rate=request.get("discountRate"))
-    return {"ok": True}
+    # CART-PERF-20261021：响应由 {"ok": true} 改为更新后的完整 CartItemOut（前端本地打补丁，免全量重拉）
+    item = services.set_cart_qty(db, cart_id, int(request.get("qty", 0)), user_id=str(user.id),
+                                 amount=request.get("amount"),
+                                 service_start=request.get("serviceStart"),
+                                 service_end=request.get("serviceEnd"),
+                                 discount_rate=request.get("discountRate"))
+    return item
 
 
-@router.patch("/cart/{cart_id}")
+@router.patch("/cart/{cart_id}", response_model=schemas.CartItemOut)
 def patch_cart_item(cart_id: int, data: schemas.CartPatchInput, db: Session = Depends(get_db),
                     user: models.User = Depends(security.require_order)):
     """修改购物车行级客户（ADR-007）；可选携带合同金额（ADR-008/ADR-018 §3）、
     服务期限（ADR-020，PRICING-20261020）与折扣率（DISCOUNT-20261021/ADR-023，
-    0 < rate ≤ 1 否则 400；null=清空）"""
-    services.patch_cart_item(db, cart_id, data.customer, user_id=str(user.id), amount=data.amount,
-                             service_start=data.serviceStart, service_end=data.serviceEnd,
-                             discount_rate=data.discountRate)
+    0 < rate ≤ 1 否则 400；null=清空）。
+    CART-PERF-20261021：响应由 {"ok": true} 改为更新后的完整 CartItemOut（前端本地打补丁，免全量重拉）。"""
+    item = services.patch_cart_item(db, cart_id, data.customer, user_id=str(user.id), amount=data.amount,
+                                    service_start=data.serviceStart, service_end=data.serviceEnd,
+                                    discount_rate=data.discountRate)
     security.record_audit(db, user, "sale", "修改购物车客户", "cart", str(cart_id), f"customer={data.customer}")
-    return {"ok": True}
+    return item
 
 
 @router.delete("/cart/{cart_id}")

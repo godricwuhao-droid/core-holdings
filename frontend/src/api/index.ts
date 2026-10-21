@@ -198,6 +198,28 @@ async function afterWrite() {
   }
 }
 
+/**
+ * CART-PERF-20261021（2026-10-21）：购物车行级写本地打补丁（契约「CART-PERF-20261021 批次」§1/§2）。
+ * PUT/PATCH /cart/{id} 响应由 `{"ok":true}` 改为返回更新后的完整 CartItemOut：
+ * 成功后用响应体按 id 替换 db.cart 对应行（按下标替换，**数组引用保持稳定**，仅该行对象变更，
+ * 不再重拉 bootstrap——原每次行级 PUT 后全量刷新（97 条 rsItems + 122 条 logs）是输入卡顿主因）。
+ * 兼容回退：响应不是含 id 的对象（后端并行未就绪 / 旧格式 `{"ok":true}`）→ 回退 afterWrite()
+ * （即 refresh(true) 全量刷新 + 刷新失败温和提示，保旧行为不崩）。
+ * 注意：`afterWrite()` 全量刷新仅保留给结构性操作（加购/批量加购/删行/清空/结算，见下方各函数）。
+ */
+async function patchCartRow(id: number, data: unknown): Promise<void> {
+  const row = (data ?? null) as { id?: unknown } | null
+  if (row && typeof row === 'object' && typeof row.id === 'number') {
+    const idx = db.cart.findIndex((c) => c.id === id)
+    if (idx !== -1) {
+      db.cart[idx] = row as CartItem
+      return
+    }
+    // 本地镜像中未找到该行（理论边界：镜像未加载/已漂移）→ 全量刷新保证一致
+  }
+  await afterWrite()
+}
+
 // ============================================================
 // 输入类型（对齐后端 schema）
 // ============================================================
@@ -785,9 +807,10 @@ export async function addCartBatch(
   return data
 }
 
+/** CART-PERF-20261021（2026-10-21）：行级写改本地打补丁——成功后用响应 CartItemOut 替换本地行，不再全量刷新 */
 export async function setCartQty(id: number, qty: number): Promise<void> {
-  await http.put(`/cart/${id}`, { qty })
-  await afterWrite()
+  const { data } = await http.put(`/cart/${id}`, { qty })
+  await patchCartRow(id, data)
 }
 
 /**
@@ -807,8 +830,9 @@ export async function setCartAmount(
 ): Promise<void> {
   const body: { qty: number; amount: number; discountRate?: number | null } = { qty, amount }
   if (discountRate !== undefined) body.discountRate = discountRate
-  await http.put(`/cart/${id}`, body)
-  await afterWrite()
+  // CART-PERF-20261021（2026-10-21）：行级写改本地打补丁（响应 CartItemOut 替换本地行，旧格式回退全量刷新）
+  const { data } = await http.put(`/cart/${id}`, body)
+  await patchCartRow(id, data)
 }
 
 /**
@@ -821,14 +845,16 @@ export async function setCartService(
   serviceStart: string | null,
   serviceEnd: string | null,
 ): Promise<void> {
-  await http.put(`/cart/${id}`, { qty, serviceStart, serviceEnd })
-  await afterWrite()
+  // CART-PERF-20261021（2026-10-21）：行级写改本地打补丁（响应 CartItemOut 替换本地行，旧格式回退全量刷新）
+  const { data } = await http.put(`/cart/${id}`, { qty, serviceStart, serviceEnd })
+  await patchCartRow(id, data)
 }
 
-/** 修改购物车行级客户（ADR-007）：400「购物车中该产品在客户「X」下已有行，无法修改客户（请先删除原行）」 */
+/** 修改购物车行级客户（ADR-007）：400「购物车中该产品在客户「X」下已有行，无法修改客户（请先删除原行）」
+ *  CART-PERF-20261021（2026-10-21）：行级写改本地打补丁（PATCH 响应同为 CartItemOut，旧格式回退全量刷新） */
 export async function patchCartItem(id: number, customer: string): Promise<void> {
-  await http.patch(`/cart/${id}`, { customer })
-  await afterWrite()
+  const { data } = await http.patch(`/cart/${id}`, { customer })
+  await patchCartRow(id, data)
 }
 
 export async function removeCartItem(id: number): Promise<void> {

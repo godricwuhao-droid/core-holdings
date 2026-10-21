@@ -2091,7 +2091,7 @@ def add_to_cart(db: Session, data: schemas.CartItemInput, user_id: str = DEFAULT
 def patch_cart_item(db: Session, cart_id: int, customer: str, user_id: str = DEFAULT_USER,
                     amount: float | None = None,
                     service_start: str | None = None, service_end: str | None = None,
-                    discount_rate: float | None = None) -> None:
+                    discount_rate: float | None = None) -> models.CartItem:
     """修改购物车行级客户（ADR-007）；可选携带合同金额（ADR-008）、服务期限（ADR-020）
     与折扣率（DISCOUNT-20261021/ADR-023）。
 
@@ -2149,6 +2149,9 @@ def patch_cart_item(db: Session, cart_id: int, customer: str, user_id: str = DEF
         c.customer = new_customer
         c.updatedAt = now_str()
     db.commit()
+    # CART-PERF-20261021：commit 后 refresh 并返回更新后的行对象（供路由序列化为 CartItemOut，前端本地打补丁）
+    db.refresh(c)
+    return c
 
 
 def add_to_cart_batch(db: Session, data: schemas.CartBatchInput, user_id: str = DEFAULT_USER) -> dict:
@@ -2198,7 +2201,7 @@ def add_to_cart_batch(db: Session, data: schemas.CartBatchInput, user_id: str = 
 def set_cart_qty(db: Session, cart_id: int, qty: int, user_id: str = DEFAULT_USER,
                  amount: float | None = None,
                  service_start: str | None = None, service_end: str | None = None,
-                 discount_rate: float | None = None) -> None:
+                 discount_rate: float | None = None) -> models.CartItem:
     """PUT /cart/{id}：改数量；可选携带合同金额（ADR-008）、服务期限（ADR-020）
     与折扣率（DISCOUNT-20261021/ADR-023）。
 
@@ -2250,6 +2253,9 @@ def set_cart_qty(db: Session, cart_id: int, qty: int, user_id: str = DEFAULT_USE
     c.discountRate = _validate_discount_rate(discount_rate)
     c.updatedAt = now_str()
     db.commit()
+    # CART-PERF-20261021：commit 后 refresh 并返回更新后的行对象（供路由序列化为 CartItemOut，前端本地打补丁）
+    db.refresh(c)
+    return c
 
 
 def remove_cart_item(db: Session, cart_id: int, user_id: str = DEFAULT_USER) -> None:

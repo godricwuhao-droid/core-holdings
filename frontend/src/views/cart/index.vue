@@ -57,20 +57,40 @@ const totalAmount = computed(() => cartRows.value.reduce((s, r) => s + r.subtota
 //（字段为空即标红，与列头红星同口径），不再维护 error id 集合（原 customerErrors/amountErrors 删除）
 
 // ==================== 行级销售金额（ADR-008 包量定价行权威输入；ADR-022 起所有行必填） ====================
-/** 金额输入：仅保留整数位（元口径，禁止小数） */
-function onAmountInput(row: CartRow, v: string) {
-  const digits = (v ?? '').replace(/[^\d]/g, '')
-  row.cart.amount = digits === '' ? undefined : Number(digits)
-  // DISCOUNT-20261021（ADR-023，2026-10-21）一致性规则：手动编辑销售金额 → 清空该行折扣率
-  // （失焦提交 null）并清空折扣输入框显示——金额是权威值，折扣率只是快捷工具，
-  // 防止「显示 9 折但金额已被手改」的不一致（折扣回填金额是程序赋值，不触发本输入事件，不受影响）
-  row.cart.discountRate = null
-  discountDrafts[row.cart.id] = ''
+/** CART-PERF-20261021（2026-10-21）：金额输入本地草稿（与 discountDrafts 同模式，按行 id 存）——
+ *  卡顿次因：原每敲一字直接写 row.cart.amount（db.cart 共享镜像）→ cartRows computed 重算 →
+ *  el-table 整表重渲染（含固定列双渲染 + 全部 tooltip）。改敲字只写草稿（不碰镜像、cartRows 不重算），
+ *  失焦/回车经 onAmountChange 提交；无草稿时显示由已提交值派生（刷新后仍一致）。 */
+const amountDrafts = ref<Record<number, string>>({})
+
+/** 金额输入框当前显示值（草稿优先，无草稿读已提交值） */
+function amountDraft(row: CartRow): string {
+  return amountDrafts[row.cart.id] ?? (row.cart.amount != null ? String(row.cart.amount) : '')
 }
 
-/** 2026-10-24（ADR-022）：金额缺项（空 / 0 / 非整数）→ 标红，与客户列同一「必填缺项」样式 */
+/** 金额有效值（「草稿或已提交值」合并口径）——标红校验与结算前置校验共用：
+ *  用户敲了还没失焦的金额也计入校验（草稿优先），避免「敲了 1000 没失焦就点结算被拦」的坑 */
+function amountValue(row: CartRow): number | undefined {
+  const t = amountDraft(row)
+  return t === '' ? undefined : Number(t)
+}
+
+/** 金额输入：仅保留整数位（元口径，禁止小数）——CART-PERF-20261021：只写草稿，不再碰 row.cart.amount */
+function onAmountInput(row: CartRow, v: string) {
+  const digits = (v ?? '').replace(/[^\d]/g, '')
+  amountDrafts[row.cart.id] = digits
+  // DISCOUNT-20261021（ADR-023）一致性规则：手动编辑销售金额 → 清空该行折扣草稿（显示）
+  // 并置 discountRate 为 null（失焦提交 null）——金额是权威值，防止「显示 9 折但金额已被手改」。
+  // 注：discountRate 已为 null 时再置 null 是 Vue 响应式 no-op（同值不触发），
+  // 故每行至多触发一次重渲染（首次敲字），不会每 keystroke 整表重渲染
+  discountDrafts[row.cart.id] = ''
+  row.cart.discountRate = null
+}
+
+/** 2026-10-24（ADR-022）：金额缺项（空 / 0 / 非整数）→ 标红，与客户列同一「必填缺项」样式
+ *  CART-PERF-20261021：改读「草稿或已提交值」合并口径（amountValue），标红跟随输入草稿实时变化 */
 function amountInvalid(row: CartRow): boolean {
-  const n = row.cart.amount
+  const n = amountValue(row)
   return n === undefined || !Number.isInteger(n) || n <= 0
 }
 
@@ -92,7 +112,8 @@ function amountTip(row: CartRow): string {
     ? '包量定价：销售金额（整数元 > 0）为权威输入，必填'
     : '必填，整数元（> 0）；设参考区间时须落在区间内'
   const range = rowRangeText(row)
-  if (row.cart.discountRate != null && range) {
+  // CART-PERF-20261021：折扣判断改读「草稿或已提交值」有效折扣率（与摘要渲染条件同口径）
+  if (discountPreviewRate(row) != null && range) {
     return `${base}；参考区间 ${range} 元/${row.rsItem ? '份' : (row.asset.unit || '单位')}`
   }
   return base
@@ -104,12 +125,18 @@ function rowRangeText(row: CartRow): string {
   return row.rsItem ? priceRangeText(row.rsItem) : priceRangeText(row.asset)
 }
 
-/** 失焦提交（ADR-018 §3，PRICING-20261020；2026-10-24 ADR-022 改必填口径）：
- *  - 所有行（unit/amount/遥感）：整数元 > 0 才提交；缺项（空/0/非整数）不提交，输入框值驱动标红
- *  - 超参考区间由后端 400（文案走 showError），400 时回滚到后端值 */
+/** 失焦/回车提交（ADR-018 §3，PRICING-20261020；2026-10-24 ADR-022 必填口径；
+ *  CART-PERF-20261021 改读草稿）：
+ *  - 所有行（unit/amount/遥感）：整数元 > 0 才提交；缺项（空/0/非整数）不提交，保留草稿，输入框值驱动标红
+ *  - 合法草稿在 await 前的**同步段**即写入镜像并清草稿——点「结算下单」按钮会先触发本输入框 blur
+ *    （浏览器行为：mousedown → blur/change 先于 click），openOrder 校验运行时镜像已是最新值，
+ *    天然失焦链路成立，无需额外合并处理（amountInvalid 的草稿合并口径作双保险）
+ *  - 超参考区间由后端 400（文案走 showError），400 时回滚到后端值并重置草稿 */
 async function onAmountChange(row: CartRow) {
-  const n = row.cart.amount
-  if (n === undefined || !Number.isInteger(n) || n <= 0) return // 缺项不提交（标红由值驱动）
+  const n = amountValue(row)
+  if (n === undefined || !Number.isInteger(n) || n <= 0) return // 缺项不提交（标红由值驱动，草稿保留）
+  row.cart.amount = n
+  amountDrafts[row.cart.id] = ''
   try {
     // 回传该行当前 qty：后端 PUT 对 qty<=0 直接 400，且区间校验按新 qty 重算
     // DISCOUNT-20261021（ADR-023，2026-10-21）：amount + discountRate（0-1 小数）一次性提交；
@@ -118,6 +145,7 @@ async function onAmountChange(row: CartRow) {
   } catch (e) {
     showError(e, '销售金额更新失败')
     await refresh(true)
+    amountDrafts[row.cart.id] = '' // 回滚：草稿重置为后端值（显示改由刷新后的镜像派生）
   }
 }
 
@@ -126,6 +154,13 @@ async function onAmountChange(row: CartRow) {
  *  不直接 v-model 到 row.cart.discountRate（0-1 小数）：输入中间态（"8."、"0"）
  *  若回写后端值会被 model 覆盖；草稿按行 id 存，无草稿时由后端值派生（刷新后仍一致） */
 const discountDrafts = ref<Record<number, string>>({})
+
+// CART-PERF-20261021（2026-10-21）性能自查（修复清单第 4 项）：模板单元格内调用的方法
+// （discountDraft/discountInvalid/discountTip/discountSummary/discountPreviewRate/amountDraft/
+// amountInvalid/amountPlaceholder/amountTip/serviceMissing/rowRangeText 等）均只读
+// per-row 状态（row.cart.* 属性 + 草稿 Record 的单个 id 键），不遍历 cartRows/db.cart——
+// 敲字只失效本行依赖，cartRows computed（:data）不重算，el-table 无整表重建（无固定列双渲染重建）。
+// 遍历 cartRows 的 previewGroups/orderItems 仅用于结算栏/弹窗，不在表格单元格渲染路径上。
 
 /** 折扣率小数 → 输入框文案（0.9→"9"、0.85→"8.5"，一位小数去尾零） */
 function rateToText(rate: number): string {
@@ -151,11 +186,41 @@ function discountTip(row: CartRow): string {
   return `选填，0-10 一位小数（如 9、8.5）；填写后自动按 ${row.rsItem ? '明细价' : '原价单价'} × 数量 × 折扣回填销售金额；手动改金额将清空折扣`
 }
 
+/** CART-PERF-20261021（2026-10-21）：折扣有效率（0-1 小数，草稿或已提交值合并口径）——
+ *  草稿合法（0<r≤10，本地校验同 onDiscountChange 正则）取草稿；无草稿读已提交值；
+ *  草稿非法（0/超10/非数字）返回 null（不显示预览，标红提示用户）。
+ *  供摘要实时显示与金额 placeholder 预览共用——敲折扣数字过程中即可见摘要，不等失焦 */
+function discountPreviewRate(row: CartRow): number | null {
+  const t = discountDraft(row)
+  if (t !== '') {
+    const n = Number(t)
+    if (!/^\d+(\.\d)?$/.test(t) || !(n > 0 && n <= 10)) return null
+    return Math.round(n * 10) / 10 / 10 // 归一到一位小数后转 0-1 小数（如 "9" → 0.9）
+  }
+  return row.cart.discountRate ?? null
+}
+
 /** 提示行折扣摘要（DISCOUNT-20261021 / ADR-023：填了折扣后四个数字全可见——
- *  原价单价=单价列、原价总额与折后单价=本摘要、折扣总价=金额输入框值+小计列） */
+ *  原价单价=单价列、原价总额与折后单价=本摘要、折扣总价=金额输入框值+小计列）
+ *  CART-PERF-20261021（2026-10-21）：实时预览（按当前草稿率计算，已提交无草稿用提交值）+
+ *  文案压缩（契约 §3：`原价 ¥{单价×qty} · 折后 ¥{折后单价}`，折后单价保留 2 位——
+ *  比旧「原价总额 ¥X · 折后单价 ¥Z」短，200px 列宽下截断概率更低） */
 function discountSummary(row: CartRow): string {
-  const rate = row.cart.discountRate!
-  return `原价总额 ${formatMoney(row.price * row.cart.qty)} · 折后单价 ¥${(row.price * rate).toFixed(2)}`
+  const rate = discountPreviewRate(row) ?? 0
+  return `原价 ${formatMoney(row.price * row.cart.qty)} · 折后 ¥${(row.price * rate).toFixed(2)}`
+}
+
+/** CART-PERF-20261021（2026-10-21）：金额输入 placeholder——实时回填金额预览：
+ *  折扣合法（草稿或已提交）且金额为空（无草稿、无已提交值）时显示预计金额（灰色 placeholder 态）。
+ *  选 placeholder 方案（而非草稿预填）：placeholder 纯展示、不进 model 值、不触发提交，
+ *  失焦链路零重复提交风险（onAmountChange 读草稿，草稿为空即不提交）；
+ *  折扣失焦后金额回填为真实值，placeholder 自然让位 */
+function amountPlaceholder(row: CartRow): string {
+  const rate = discountPreviewRate(row)
+  if (rate != null && amountValue(row) === undefined) {
+    return `预计 ${Math.round(row.price * row.cart.qty * rate)}`
+  }
+  return '必填，整数元'
 }
 
 /** 折扣输入：仅保留数字与一个小数点（一位小数），中间态由值驱动标红 */
@@ -185,6 +250,9 @@ async function onDiscountChange(row: CartRow) {
     const rate = Math.round(n * 10) / 10 // 归一到一位小数（如 9 → 9.0）
     row.cart.discountRate = rate / 10
     row.cart.amount = Math.round(row.price * row.cart.qty * rate) // 回填金额输入框（整数元）
+    // CART-PERF-20261021（2026-10-21）：回填覆盖金额 → 清金额草稿，
+    // 防止 onAmountChange 读到用户先前未失焦的旧金额草稿（草稿优先口径）
+    amountDrafts[row.cart.id] = ''
   }
   await onAmountChange(row)
 }
@@ -328,6 +396,7 @@ async function stepQty(row: CartRow, delta: number) {
   if (ok && row.cart.discountRate != null) {
     const amount = Math.round(row.price * row.cart.qty * row.cart.discountRate)
     row.cart.amount = amount
+    amountDrafts[row.cart.id] = '' // CART-PERF-20261021（2026-10-21）：重算覆盖金额 → 清金额草稿（显示由镜像派生）
     try {
       await setCartAmount(row.cart.id, row.cart.qty, amount, row.cart.discountRate)
     } catch (e) {
@@ -388,7 +457,10 @@ const orderItems = computed<OrderItem[]>(() =>
 /** 结算前置校验（2026-10-24 ADR-022：三必填项逐行校验，与后端 checkout 400 同口径）：
  *  客户非空 / 金额整数元 > 0（所有行类型，含遥感行）/ 普通行服务期限两日期齐全且 start ≤ end
  *  （遥感明细行期限豁免，ADR-020）；有缺项不弹结算窗——提示点明缺项类别，
- *  缺项输入框本身已值驱动标红（amountInvalid / serviceMissing / 客户空值），用户可直接定位 */
+ *  缺项输入框本身已值驱动标红（amountInvalid / serviceMissing / 客户空值），用户可直接定位
+ *  CART-PERF-20261021（2026-10-21）：金额校验读「草稿或已提交值」合并口径（amountInvalid → amountValue）——
+ *  点结算按钮本身会先触发金额输入框 blur（change 先于 click，onAmountChange 同步段已把合法草稿写入镜像），
+ *  天然失焦链路 + 草稿合并口径双保险：敲了还没失焦的合法金额不会被误拦，非法草稿（0/空）仍拦截 */
 function openOrder() {
   if (!db.cart.length) return
   const missingCustomer = cartRows.value.filter((r) => !(r.cart.customer ?? '').trim())
@@ -608,10 +680,13 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
                      统一行结构不变（不加新行、不改行高） -->
                 <div class="cell-main">
                   <div class="cart-amount-row">
+                    <!-- CART-PERF-20261021（2026-10-21）：金额输入改本地草稿——
+                         :model-value 草稿优先（无草稿读已提交值），敲字只写草稿不碰 db.cart 镜像；
+                         placeholder 实时回填折扣预计金额（纯展示，无重复提交风险，见 amountPlaceholder 注释） -->
                     <el-tooltip :content="amountTip(row)" placement="top">
                       <el-input
-                        :model-value="row.cart.amount ?? ''"
-                        placeholder="必填，整数元"
+                        :model-value="amountDraft(row)"
+                        :placeholder="amountPlaceholder(row)"
                         size="small"
                         class="cart-amount-input"
                         :class="{ 'cart-customer-error': amountInvalid(row) }"
@@ -639,7 +714,9 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
                        （原价总额 · 折后单价，11px 辅助色 #71829A，超长省略 + tooltip 全文）；
                        参考区间此时移到金额输入框 hover tooltip 合并展示（见 amountTip 注释）；
                        未填折扣 → 维持现状（参考区间或空） -->
-                  <el-tooltip v-if="row.cart.discountRate != null" :content="discountSummary(row)" placement="top">
+                  <!-- CART-PERF-20261021（2026-10-21）：渲染条件改「草稿合法或已提交值非空」（discountPreviewRate）——
+                       折扣输入过程中摘要实时出现，不等失焦落值；截断时 el-tooltip 全文可触发（见 .cart-amount-range 样式） -->
+                  <el-tooltip v-if="discountPreviewRate(row) != null" :content="discountSummary(row)" placement="top">
                     <span class="cart-amount-range">{{ discountSummary(row) }}</span>
                   </el-tooltip>
                   <!-- ADR-018：产品设了参考区间时展示区间提示（超区间提交由后端 400，文案走 showError）
@@ -1037,6 +1114,13 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
    DISCOUNT-20261021（ADR-023，2026-10-21）：折扣摘要（原价总额·折后单价）复用本样式同规格 */
 .cart-amount-range {
   color: #71829a;
+  /* CART-PERF-20261021（2026-10-21）：11px（继承 .cell-hint）单行省略——
+     折扣摘要压缩文案在 200px 列宽下仍可能超长，ellipsis 截断时外层 el-tooltip hover 显示全文 */
+  display: block;
+  max-width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 /* DISCOUNT-20261021（ADR-023，2026-10-21）：金额 + 折扣并排（主内容区内，40px 行结构不变）——
    金额输入 flex:1（列宽 200 内约 126px，整数元与 placeholder 均不截断），折扣输入固定 68px，间距 6px */

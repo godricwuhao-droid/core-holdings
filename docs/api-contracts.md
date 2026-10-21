@@ -144,6 +144,16 @@
 
 ---
 
+## CART-PERF-20261021 批次：购物车行更新性能（修复输入卡顿）
+
+> 背景：行级更新（qty/amount/discountRate/service）每次 PUT 后前端全量重拉 bootstrap（含 97 条 rsItems/122 条 logs），整表重建 → 输入卡顿。改「PUT 返回更新行 → 前端本地打补丁」。
+
+1. **PUT/PATCH /cart/{id} 响应变更**：由 `{"ok": true}` 改为**返回更新后的完整 `CartItemOut`**（含最新 customer/qty/amount/serviceStart/serviceEnd/discountRate）。
+2. 前端行级写函数（setCartQty/setCartAmount/setCartService/客户更新）：成功后**用响应体本地替换 db.cartItems 对应行**（仅该行对象变更，不重拉 bootstrap）；**`afterWrite()` 全量刷新仅保留给结构性操作**（加购/批量加购/删行/清空/结算）。
+3. 购物车页输入交互：金额输入改**本地草稿**（敲字不碰共享镜像，失焦提交——与折扣输入同模式）；折扣**输入过程实时预览**（草稿合法 0<r≤10 即显示摘要与预计金额，不等失焦）；摘要文案压缩为 `原价 ¥{origPrice×qty} · 折后 ¥{rate单价}`（折后单价保留 2 位，11px 单行，超长省略 + tooltip 全文）。
+
+---
+
 ## REQUIRED-20261024 批次：购物车结算必填口径（ADR-022）
 
 > 取代 ADR-018 §3「留空按原价成交」兜底。前后端同批上线。

@@ -2,6 +2,22 @@
 
 > 记录 core-holdings 后端（FastAPI + SQLAlchemy + SQLite）的接口与行为变更。
 
+## 2026-10-21 ｜ 修改：CART-PERF-20261021 购物车行更新性能——`PATCH /cart/{id}` 返回更新后的 CartItemOut（分支 feat/pricing-discount-timelines）
+
+> 背景：行级更新（qty/amount/discountRate/service）每次写后前端全量重拉 bootstrap（含 97 条 rsItems/122 条 logs）整表重建 → 输入卡顿。改「写接口返回更新行 → 前端本地打补丁」（契约见 api-contracts.md「CART-PERF-20261021 批次」）。
+
+| 日期 | 类型 | 变更内容 | 影响文件范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-21 | 修改 | ⚠️ `PATCH /api/cart/{id}` 响应由 `{"ok": true}` 改为**更新后的完整 `CartItemOut`**（含最新 customer/qty/amount/serviceStart/serviceEnd/discountRate）：`services.patch_cart_item` 由返回 None 改为 commit 后 `db.refresh(c)` 返回行对象，路由加 `response_model=schemas.CartItemOut` 直接返回。入参/校验/400/404 文案/审计日志零变更 | `backend/src/services.py`（`patch_cart_item`）、`backend/src/routers/api.py`（`patch_cart_item`） | CART-PERF-20261021 | 前端行级写函数改用响应体本地替换对应行，`afterWrite()` 全量刷新仅保留给结构性操作（加购/批量加购/删行/清空/结算） |
+
+### 验证（dev server 8000，admin，curl 实测）
+
+- `python3 -m compileall -q src main.py` 通过；`import src.services / src.routers.api / src.schemas / src.models / main` → import ok。
+- `POST /api/cart`（asset #28，qty=1，customer=CART-PERF测试客户）→ 200，建测试行 id=6。
+- `PATCH /api/cart/6`（amount=30000000 + discountRate=0.93）→ 200，响应为完整 `CartItemOut`：`{"id":6,"userId":"1","assetId":28,"customer":"CART-PERF测试客户","qty":1,"amount":30000000.0,"itemId":null,"serviceStart":null,"serviceEnd":null,"discountRate":0.93,...}`（全字段齐全、值正确）。
+- 测试数据已清零：`DELETE /api/cart/6` → 200，未触碰任何存量业务数据。
+- 未修改 frontend/ 任何文件、未执行构建/部署、未 git commit。
+
 ## 2026-10-21 ｜ 新增：DISCOUNT-20261021 购物车折扣率输入（分支 feat/pricing-discount-timelines）
 
 > 依据 ADR-023（购物车下单处加选填折扣快捷入口，销售金额仍是权威必填值，ADR-022 不变）。前后端同批上线（契约见 api-contracts.md「DISCOUNT-20261021 批次」）。**后端只存不算**：不做金额回填计算（前端回填 amount 后一起提交，金额权威原则），amount 现有校验（必填/整数元/参考区间）完全不变。

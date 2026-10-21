@@ -2,6 +2,25 @@
 
 > 记录 core-holdings 前端（Vue3 + TS + Element Plus + Vite）的页面/组件/接口封装变更。
 
+## 2026-10-21 ｜ 修复：购物车行更新输入卡顿 + 折扣实时预览（CART-PERF-20261021）
+
+**关联任务**：CART-PERF-20261021（契约见 docs/api-contracts.md「CART-PERF-20261021 批次」）。根因（已定位）：① 主因——`api/index.ts` 行级写函数（setCartQty/setCartAmount/setCartService/patchCartItem）每次 PUT 成功后 `afterWrite()` 全量重拉 bootstrap（97 条 rsItems + 122 条 logs + 全部项目合同）→ 整表重建；② 次因——`cart/index.vue` `onAmountInput` 每敲一字直接写 `row.cart.amount`（db.cart 共享镜像）→ `cartRows` computed 重算 → el-table 整表重渲染（含固定列双渲染 + 全部 tooltip）；③ 折扣价「看不见」——摘要只在失焦提交成功、`discountRate` 落值后才渲染，且旧文案在 200px 列宽下被截断。
+
+| 日期 | 类型 | 变更内容 | 影响文件范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-21 | 修复 | ① 行级写改本地打补丁（api/index.ts）：新增 `patchCartRow(id, data)`——PUT/PATCH /cart/{id} 响应按契约改为完整 CartItemOut 后，成功用响应体**按 id 下标替换 db.cart 对应行**（数组引用保持稳定，仅该行对象变更，不重拉 bootstrap）；**兼容回退**：响应不是含 id 的对象（后端并行未就绪/旧格式 `{"ok":true}`）或本地镜像未找到该行 → 回退 `afterWrite()`（= refresh(true) 全量刷新 + 失败温和提示，保旧行为不崩），注释说明；`setCartQty`/`setCartAmount`/`setCartService`/`patchCartItem` 四个行级写函数全部改走 `patchCartRow`；**`afterWrite()` 保留给结构性操作**——加购/批量加购/删行/清空/结算（addToCart/addCartBatch/removeCartItem/clearCart/checkoutCart）调用点检查未动 | api/index.ts | CART-PERF-20261021 | 契约 §1/§2；行级 PUT 后 Network 无 GET /bootstrap（回退路径除外） |
+| 2026-10-21 | 修复 | ② 金额输入改本地草稿（cart/index.vue）：新增 `amountDrafts`（与 discountDrafts 同模式，按行 id 存）；金额输入 `:model-value` 改「草稿优先，无草稿读已提交值」（`amountDraft`）；`onAmountInput` 只写草稿**不再碰 row.cart.amount**（敲字不失效 cartRows，无整表重渲染）；失焦/回车（`onAmountChange`）改读草稿——合法（整数元>0）在 await 前同步段写入镜像并清草稿后走现有 `setCartAmount` 提交链路，缺项（空/0）保留草稿不提交（值驱动标红不变，ADR-022 必填口径），提交失败回滚时草稿也重置为后端值；标红校验 `amountInvalid` 与结算前置校验 `openOrder` 改读「草稿或已提交值」合并口径（`amountValue`）——敲了还没失焦的金额也计入校验；**结算失焦链路选择**：点结算按钮先触发输入框 blur（浏览器 mousedown→blur 先于 click），`onAmountChange` 同步段已把合法草稿写入镜像，天然失焦链路成立，草稿合并口径作双保险（注释说明）；ADR-023 一致性规则保持——金额草稿变化时同步清折扣草稿与该行 discountRate（置 null 提交 null；已为 null 时 Vue 同值 no-op，每行至多触发一次重渲染） | views/cart/index.vue | CART-PERF-20261021 | 折扣回填金额（onDiscountChange）与数量步进重算（stepQty）覆盖金额时同步清金额草稿，防 onAmountChange 读到旧草稿 |
+| 2026-10-21 | 新增 | ③ 折扣实时预览（cart/index.vue）：新增 `discountPreviewRate(row)`（0-1 小数，草稿合法 0<r≤10 取草稿——本地校验同 onDiscountChange 正则；无草稿读已提交值；草稿非法返回 null 不预览）；摘要渲染条件从 `row.cart.discountRate != null` 改为 `discountPreviewRate(row) != null`——**折扣输入过程中摘要实时出现**，不等失焦落值；`discountSummary` 按当前草稿率实时计算，文案按契约 §3 压缩为 `原价 ¥{单价×qty} · 折后 ¥{折后单价}`（折后单价保留 2 位，比旧「原价总额 ¥X · 折后单价 ¥Z」短，200px 列宽截断概率更低）；**实时回填金额预览**：`amountPlaceholder`——折扣合法且金额为空时金额输入框 placeholder 显示「预计 {round(单价×qty×rate)}」（选 placeholder 方案而非草稿预填：纯展示不进 model 值、不触发提交，失焦链路零重复提交风险，注释说明）；`amountTip` 折扣判断同步改读 previewRate | views/cart/index.vue | CART-PERF-20261021 | 契约 §3 |
+| 2026-10-21 | 修改 | ④ 摘要样式单行省略 + per-row 渲染自查（cart/index.vue）：`.cart-amount-range` 加 `display:block; max-width:100%; white-space:nowrap; overflow:hidden; text-overflow:ellipsis`（11px #71829A 继承 .cell-hint 不变）——截断时外层 el-tooltip hover 全文可触发（现结构确认）；性能自查（修复清单第 4 项）：模板单元格内调用的方法（discountDraft/discountInvalid/discountTip/discountSummary/discountPreviewRate/amountDraft/amountInvalid/amountPlaceholder/amountTip/serviceMissing/rowRangeText）均只读 per-row 状态（row.cart.* 属性 + 草稿 Record 单 id 键），不遍历 cartRows，敲字只失效本行依赖（代码注释说明）；遍历 cartRows 的 previewGroups/orderItems 仅在结算栏/弹窗渲染路径，不入表格单元格 | views/cart/index.vue | CART-PERF-20261021 | UI 布局结构（40px 主区 + 18px 提示区、列宽、行高）零改动 |
+
+### 验证
+
+- `npx vue-tsc --noEmit` 0 error（strict）；IDE 诊断 0。
+- 性能自查：`onAmountInput` 不再写 db.cart（grep 确认金额敲字路径仅写 amountDrafts）；行级 PUT 成功后走 `patchCartRow` 本地替换，无 GET /bootstrap 请求（响应非 CartItemOut 时回退 afterWrite 全量刷新，不崩）；失焦提交后仅一次行级更新渲染。
+- 功能自查（按契约推演）：折扣敲 9 过程中摘要实时出现（`原价 ¥5,100,000.00 · 折后 ¥4,590.00` 类压缩文案）、金额为空时 placeholder 实时显示「预计 4590000」、失焦金额回填 ¥4,590,000 并一次性提交 amount+0.9；手改金额 → 折扣草稿清空 + discountRate 提交 null 仍生效；数量步进后折扣按新数量重算（同步清金额草稿）；结算前置校验读草稿合并口径（敲了合法金额未失焦点结算不误拦，0/空草稿仍拦截）；加购/删行/清空/结算仍全量刷新（结构性操作路径未动）。
+- 后端并行未就绪容错：PUT 仍返回 `{"ok":true}` 时 `patchCartRow` 走 afterWrite 回退（旧行为，不崩），代码按契约写对。
+- 未修改 backend/ 下任何文件；未执行构建/部署；未 commit。
+
 ## 2026-10-21 ｜ 新增：购物车折扣率输入（选填快捷入口）+ 审核页折扣只读列（DISCOUNT-20261021 / ADR-023）
 
 **关联任务**：DISCOUNT-20261021（契约见 docs/api-contracts.md「DISCOUNT-20261021 批次」，决策 docs/adr/ADR-023.md）。销售金额仍是权威必填值（ADR-022 不变），折扣率只是快捷工具。后端并行实现（bootstrap 带出 cartItems/projectItems 的 `discountRate: number|null`，购物车写接口接受该字段，0<rate≤1 否则 400），前端按契约先行。
