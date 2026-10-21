@@ -177,6 +177,9 @@ class ProjectItem(Base):
     # 遥感行按期数 saleMonth 售卖不填期限；存量行 NULL
     serviceStart: Mapped[str | None] = mapped_column(String(10), nullable=True)
     serviceEnd: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    # 折扣率快照（DISCOUNT-20261021/ADR-023）：下单时快照购物车行值（手动建单=商务手填），
+    # **只写不改**（与 origPrice/origAmount 同级口径，审核终审改价不触碰本列）；存量订单 NULL
+    discountRate: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     project: Mapped["Project"] = relationship(back_populates="items")
     contract: Mapped["Contract | None"] = relationship(back_populates="items")
@@ -373,6 +376,10 @@ class CartItem(Base):
     # 遥感行不填期限（期数即服务时间）；存量行 NULL
     serviceStart: Mapped[str | None] = mapped_column(String(10), nullable=True)
     serviceEnd: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    # 折扣率（DISCOUNT-20261021/ADR-023）：0-1 小数（0.9=九折），选填快捷入口；
+    # 后端只存不算（金额权威原则：前端回填 amount 后一起提交，区间校验仍对 amount 生效）；
+    # NULL=无折扣；存量行 NULL
+    discountRate: Mapped[float | None] = mapped_column(Float, nullable=True)
     createdAt: Mapped[str] = mapped_column(String(32), default="")
     updatedAt: Mapped[str] = mapped_column(String(32), default="")
 

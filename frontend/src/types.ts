@@ -152,6 +152,9 @@ export interface CartItem {
   // 服务期限（ADR-020，PRICING-20261020）：YYYY-MM-DD，购物车行填写、结算透传落 project_items；遥感行不填
   serviceStart?: string | null
   serviceEnd?: string | null
+  // 折扣率（DISCOUNT-20261021 / ADR-023，2026-10-21）：0-1 小数（0.9=九折），选填；
+  // 购物车行快捷入口，下单时快照落 project_items；null/空 = 未填
+  discountRate?: number | null
   createdAt: string
   updatedAt: string
 }
@@ -269,6 +272,9 @@ export interface ProjectItem {
   // 服务期限（ADR-020，PRICING-20261020）：YYYY-MM-DD，下单人填、商务审核可改
   serviceStart?: string | null
   serviceEnd?: string | null
+  // 折扣率快照（DISCOUNT-20261021 / ADR-023，2026-10-21）：下单时购物车行 discountRate 快照（0-1 小数），
+  // 只写不改（与 origPrice 同级口径）；审核页只读展示，存量订单为空
+  discountRate?: number | null
   status: ItemStatus
   locked?: boolean // 明细下单时刻是否真实加锁（存量数据 false）
   deliveryReq: string // 交付要求

@@ -131,6 +131,19 @@
 
 ---
 
+## DISCOUNT-20261021 批次：购物车折扣率输入（ADR-023）
+
+> 选填快捷入口；销售金额仍是权威必填值（ADR-022 不变）。前后端同批上线。
+
+1. `/bootstrap` 新增字段（均可空）：`cartItems[].discountRate`、`projectItems[].discountRate`（number 0-1 小数，0.9=九折）。
+2. 购物车写接口（POST /cart、/cart/batch、PUT/PATCH /cart/{id}）接受 `discountRate`（number，0 < rate ≤ 1，后端存小数；**前端传小数**，如 9 折传 0.9）；null 允许（清空）。
+3. **一致性规则（前端执行，后端不重算金额）**：折扣率变更 → 前端自动回填 `amount = round(salePrice × qty × rate)`（整数元）后一次性提交 amount+discountRate；手动改 amount → 前端提交时 `discountRate: null`。后端只存不算（金额权威原则，区间校验仍对 amount 生效）。
+4. **checkout**：`project_items.discountRate` 快照 = 购物车行值（只写不改）；其余落库逻辑不变。
+5. 审核（review）接口不改：discountRate 只读展示（快照），终审改价仍只写 price/amount。
+6. 前端：购物车金额列内联小型「折扣」输入（折，0-10 一位小数）+ 提示行展示 `原价总额 ¥X · 折后单价 ¥Z`（11px 辅助色，超长省略+tooltip）；审核页明细行加「折扣」列（"九折"，null 不显示）。
+
+---
+
 ## REQUIRED-20261024 批次：购物车结算必填口径（ADR-022）
 
 > 取代 ADR-018 §3「留空按原价成交」兜底。前后端同批上线。

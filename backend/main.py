@@ -171,6 +171,17 @@ def _ensure_migration() -> None:
             conn.execute(text("ALTER TABLE contracts ADD COLUMN signedDate VARCHAR(10)"))
             conn.execute(text("ALTER TABLE contracts ADD COLUMN scheduledDeliveryDate VARCHAR(10)"))
         print("[migration] contracts.signedDate/scheduledDeliveryDate 列已补充（ADR-019 时间节点）")
+    # 14) DISCOUNT-20261021（ADR-023）：折扣率——cart_items.discountRate（购物车行，选填）+
+    # project_items.discountRate（下单快照，只写不改，与 origPrice 同级口径）；
+    # 全部可空、存量数据不迁移（NULL=无折扣/无快照，展示端不显示）
+    if "discountRate" not in cart_cols:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE cart_items ADD COLUMN discountRate FLOAT"))
+        print("[migration] cart_items.discountRate 列已补充（ADR-023 折扣率）")
+    if "discountRate" not in item_cols:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE project_items ADD COLUMN discountRate FLOAT"))
+        print("[migration] project_items.discountRate 列已补充（ADR-023 折扣率快照）")
     # 12) ADR-011 数据清理（幂等一次性）：删除 ADR-010 演示遥感数据产品
     #（type='遥感数据' 且带三维字段值的存量行；ADR-011 新建的父产品容器 4 列恒空，不会被误删）。
     # 删前 assert 无合同/购物车/项目明细引用（当前库应无；有引用则启动失败暴露问题，

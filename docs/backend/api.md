@@ -4,6 +4,25 @@
 
 ---
 
+## 2026-10-21 变更（DISCOUNT-20261021 购物车折扣率输入，新增可选字段 `discountRate`，依据 ADR-023）
+
+> 选填快捷入口；销售金额仍是权威必填值（ADR-022 不变）。前后端同批上线（契约见 api-contracts.md「DISCOUNT-20261021 批次」）。**后端只存不算**：不做金额回填计算（前端回填 `amount = round(salePrice × qty × rate)` 后一次性提交 amount+discountRate；手动改 amount → 前端提交 `discountRate: null`），amount 现有校验（必填/整数元/参考区间）完全不变。
+
+**字段口径**：`discountRate` = number 0-1 小数（0.9=九折，**前端传小数**），可空。
+
+| 接口 | 变更 |
+|---|---|
+| `GET /api/bootstrap` | `cartItems[].discountRate`、`projectItems[].discountRate` 新增出参（均可空，存量行/存量订单为 null） |
+| `POST /api/cart`、`POST /api/cart/batch` | 入参新增可选 `discountRate`；0 < rate ≤ 1 否则 400「折扣率须为 0 到 1 之间的正数」；null 允许=清空 |
+| `PUT /api/cart/{id}`、`PATCH /api/cart/{id}` | 入参新增可选 `discountRate`，同口径校验；null=清空（无折扣） |
+| `POST /api/cart/checkout` | 不改入参；落 `project_items.discountRate` = 购物车行值（**快照，只写不改**，与 origPrice/origAmount 同级口径） |
+| `POST /api/projects`（手动建单） | `items[].discountRate` 可选（商务手填场景），同口径校验（`_create_project_core` 统一校验，覆盖购物车结算/手动建单/直接下单/重新提交全部入口） |
+| review 接口 | **不改**：discountRate 只读展示（快照），终审改价仍只写 price/amount |
+
+400 边界（实测）：`discountRate` = 0 / 1.5 / -1 → `{"detail":"折扣率须为 0 到 1 之间的正数"}`；`null` → 200（清空）。
+
+---
+
 ## 2026-10-21 变更（PAGE-20261021 产品相关列表服务端分页，新增 3 个 GET 端点）
 
 > 抽屉/详情页的可售明细、数量流水、操作记录改服务端分页（单页默认 10 条）。**`GET /api/bootstrap` 快照字段（rsItems/flows/logs）保留不动**（RsItemPicker 树等消费方仍依赖全量镜像）。契约见 api-contracts.md「PAGE-20261021 批次」。

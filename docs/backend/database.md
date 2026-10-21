@@ -5,6 +5,26 @@
 
 ---
 
+## 2026-10-21 变更（DISCOUNT-20261021：购物车折扣率，2 表 2 列，依据 ADR-023）
+
+### 新增列（可空，存量数据不迁移——NULL 即无折扣/无快照，行为同现状）
+
+| 列 | 类型 | 说明 |
+|---|---|---|
+| `cart_items.discountRate` | FLOAT NULL | 折扣率（0-1 小数，0.9=九折），选填快捷入口（ADR-023）。写接口（POST /cart、/cart/batch、PUT/PATCH /cart/{id}）接受，0 < rate ≤ 1 否则 400；NULL=无折扣；后端只存不算（金额权威原则，区间校验仍对 amount 生效） |
+| `project_items.discountRate` | FLOAT NULL | 折扣率快照：下单时快照购物车行值（手动建单=商务手填），**只写不改**（与 origPrice/origAmount 同级口径，审核终审改价不触碰本列）；存量订单 NULL（展示端不显示） |
+
+### 迁移语句（幂等，`main.py::_ensure_migration`）
+
+```sql
+ALTER TABLE cart_items ADD COLUMN discountRate FLOAT;
+ALTER TABLE project_items ADD COLUMN discountRate FLOAT;
+```
+
+> 注：沿用 inspector + ALTER TABLE 模式（SQLite 追加可空列，存量行自动 NULL，不触碰业务数据）；列已存在时 no-op，可重复启动。
+
+---
+
 ## 2026-10-20 变更（RSITEM-RANGE-20261020：遥感售卖明细参考区间，rs_items 2 列，依据 ADR-021）
 
 ### 新增列（可空，存量 98 条明细不迁移——NULL 即不限制，行为同现状）

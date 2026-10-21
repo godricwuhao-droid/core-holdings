@@ -280,6 +280,17 @@ def _validate_service_period(start: str | None, end: str | None) -> tuple[str | 
     return s, e
 
 
+def _validate_discount_rate(rate: float | None) -> float | None:
+    """折扣率校验（DISCOUNT-20261021/ADR-023）：0 < rate ≤ 1（0.9=九折），
+    违反 400「折扣率须为 0 到 1 之间的正数」；None 允许（=清空/无折扣）。
+    后端只存不算——不做金额回填计算（金额权威原则，区间校验仍对 amount 生效）。"""
+    if rate is None:
+        return None
+    if not (0 < rate <= 1):
+        raise HTTPException(400, "折扣率须为 0 到 1 之间的正数")
+    return float(rate)
+
+
 def _item_pricing(a: models.Asset | None, it: schemas.ProjectItemInput) -> tuple[float, float]:
     """销售明细计价分支（ADR-008），返回 (price, amount)：
     - amount 模式：amount 为权威输入（整数元校验），跳过 price×qty 重算，price 为派生值；
@@ -806,6 +817,10 @@ def _create_project_core(db: Session, data: schemas.ProjectInput,
             rs = _validate_rs_item_ref(db, it)
             if rs is not None:
                 rs_map[it.itemId] = rs
+            # DISCOUNT-20261021/ADR-023：折扣率统一校验（0 < rate ≤ 1 否则 400；null=无折扣）——
+            # 覆盖购物车结算 / 手动建单 / 直接下单 / 重新提交全部入口（快照只写不改，
+            # 后端只存不算，amount 校验完全不变）
+            _validate_discount_rate(it.discountRate)
     # ADR-013：移除「记录内同主体」校验（一资产一记录天然单主体；手动建单可混合主体成一条记录）
     # H1：先整体校验数量，再统一加锁，避免部分加锁后中途失败
     # 超卖修复（H10）：校验必须**按 assetId 聚合**全项目（跨合同）需求量后再比较可售。
@@ -886,6 +901,7 @@ def _create_project_core(db: Session, data: schemas.ProjectInput,
                 price=price, amount=amount,
                 origPrice=orig_price, origAmount=orig_amount,  # ADR-018 §2：原价快照
                 serviceStart=service_start, serviceEnd=service_end,  # ADR-020：服务期限
+                discountRate=it.discountRate,  # DISCOUNT-20261021/ADR-023：折扣率快照（只写不改）
                 status=status, deliveryReq=it.deliveryReq,
                 itemId=it.itemId,  # ADR-011：遥感明细行落库（非明细行 NULL）
                 # 契约 2：落「下单时刻是否真实加锁」事实（repeatSale/明细 repeatSale 下单不加锁）
@@ -2025,6 +2041,9 @@ def _cart_add_inner(db: Session, data: schemas.CartItemInput, user_id: str = DEF
         amount = float(amt) if amt is not None else None
     # ADR-020（PRICING-20261020）：服务期限校验（YYYY-MM-DD + start ≤ end，否则 400）
     service_start, service_end = _validate_service_period(data.serviceStart, data.serviceEnd)
+    # DISCOUNT-20261021/ADR-023：折扣率校验（0 < rate ≤ 1 否则 400；null=清空/无折扣）。
+    # 后端只存不算：不做金额回填（前端回填 amount 后一起提交，金额权威原则）
+    discount_rate = _validate_discount_rate(data.discountRate)
     q = select(models.CartItem).where(
         models.CartItem.userId == user_id,
         models.CartItem.assetId == data.assetId,
@@ -2043,12 +2062,15 @@ def _cart_add_inner(db: Session, data: schemas.CartItemInput, user_id: str = DEF
         # ADR-020：服务期限（本次传了才覆盖，未传保持原值）
         if service_start is not None or service_end is not None:
             existing.serviceStart, existing.serviceEnd = service_start, service_end
+        # DISCOUNT-20261021/ADR-023：折扣率（null=清空，与契约「null 允许=清空」同口径）
+        existing.discountRate = discount_rate
         existing.updatedAt = now_str()
     else:
         existing = models.CartItem(
             userId=user_id, assetId=data.assetId, customer=customer, qty=qty,
             amount=amount, itemId=data.itemId,
             serviceStart=service_start, serviceEnd=service_end,  # ADR-020：服务期限
+            discountRate=discount_rate,  # DISCOUNT-20261021/ADR-023：折扣率（null=无折扣）
             createdAt=now_str(), updatedAt=now_str(),
         )
         db.add(existing)
@@ -2068,12 +2090,16 @@ def add_to_cart(db: Session, data: schemas.CartItemInput, user_id: str = DEFAULT
 
 def patch_cart_item(db: Session, cart_id: int, customer: str, user_id: str = DEFAULT_USER,
                     amount: float | None = None,
-                    service_start: str | None = None, service_end: str | None = None) -> None:
-    """修改购物车行级客户（ADR-007）；可选携带合同金额（ADR-008）与服务期限（ADR-020）。
+                    service_start: str | None = None, service_end: str | None = None,
+                    discount_rate: float | None = None) -> None:
+    """修改购物车行级客户（ADR-007）；可选携带合同金额（ADR-008）、服务期限（ADR-020）
+    与折扣率（DISCOUNT-20261021/ADR-023）。
 
     金额语义（ADR-018 §3，PRICING-20261020）：
     - unit / 遥感明细行：amount 传入即采信（过参考区间校验，超限 400），不传保持 NULL（原价成交）；
     - amount 模式行：整数元权威（不传保持原值，结算时必填兜底不变）。
+    折扣率语义（ADR-023）：0 < rate ≤ 1 否则 400「折扣率须为 0 到 1 之间的正数」；
+    null=清空（无折扣，与契约「null 允许=清空」同口径）。后端只存不算，amount 校验完全不变。
     目标 (userId, assetId, customer) 已存在其它行时 400（避免静默合并产生歧义，前端可先删除原行）。"""
     c = db.get(models.CartItem, cart_id)
     if not c or c.userId != user_id:
@@ -2099,7 +2125,10 @@ def patch_cart_item(db: Session, cart_id: int, customer: str, user_id: str = DEF
             service_start if service_start is not None else c.serviceStart,
             service_end if service_end is not None else c.serviceEnd)
         c.serviceStart, c.serviceEnd = new_start, new_end
-    if amount is not None or service_start is not None or service_end is not None:
+    # DISCOUNT-20261021/ADR-023：折扣率（0 < rate ≤ 1 否则 400；null=清空/无折扣）
+    c.discountRate = _validate_discount_rate(discount_rate)
+    if amount is not None or service_start is not None or service_end is not None \
+            or discount_rate is not None:
         c.updatedAt = now_str()
     new_customer = (customer or "").strip()
     if new_customer != (c.customer or ""):
@@ -2155,7 +2184,8 @@ def add_to_cart_batch(db: Session, data: schemas.CartBatchInput, user_id: str = 
         # 原子性修复：走不提交的 _cart_add_inner，整批末尾统一 commit——
         # 任一行硬 400（如 amount 模式金额校验）整体回滚，不再「加一半」
         _cart_add_inner(db, schemas.CartItemInput(assetId=it.assetId, qty=qty, customer=customer,
-                                                  amount=it.amount, itemId=it.itemId), user_id)
+                                                  amount=it.amount, itemId=it.itemId,
+                                                  discountRate=it.discountRate), user_id)  # DISCOUNT-20261021/ADR-023
         added += 1
     db.commit()
     return {
@@ -2167,12 +2197,16 @@ def add_to_cart_batch(db: Session, data: schemas.CartBatchInput, user_id: str = 
 
 def set_cart_qty(db: Session, cart_id: int, qty: int, user_id: str = DEFAULT_USER,
                  amount: float | None = None,
-                 service_start: str | None = None, service_end: str | None = None) -> None:
-    """PUT /cart/{id}：改数量；可选携带合同金额（ADR-008）与服务期限（ADR-020）。
+                 service_start: str | None = None, service_end: str | None = None,
+                 discount_rate: float | None = None) -> None:
+    """PUT /cart/{id}：改数量；可选携带合同金额（ADR-008）、服务期限（ADR-020）
+    与折扣率（DISCOUNT-20261021/ADR-023）。
 
     金额语义（ADR-018 §3，PRICING-20261020）：
     - unit / 遥感明细行：amount 传入即采信（过参考区间校验，超限 400），不传保持 NULL（原价成交）；
     - amount 模式行：整数元权威（不传保持原值）。
+    折扣率语义（ADR-023）：0 < rate ≤ 1 否则 400「折扣率须为 0 到 1 之间的正数」；
+    null=清空（无折扣）。后端只存不算，amount 校验完全不变。
     删除行仅走 DELETE /cart/{id}——PUT 语义不再兼作删除（qty<=0 直接 400，
     修复：此前 PUT 漏传 qty 会默认 0 → 静默删行，调用方极易误触发）。"""
     c = db.get(models.CartItem, cart_id)
@@ -2212,6 +2246,8 @@ def set_cart_qty(db: Session, cart_id: int, qty: int, user_id: str = DEFAULT_USE
             service_start if service_start is not None else c.serviceStart,
             service_end if service_end is not None else c.serviceEnd)
         c.serviceStart, c.serviceEnd = new_start, new_end
+    # DISCOUNT-20261021/ADR-023：折扣率（0 < rate ≤ 1 否则 400；null=清空/无折扣）
+    c.discountRate = _validate_discount_rate(discount_rate)
     c.updatedAt = now_str()
     db.commit()
 
@@ -2376,14 +2412,16 @@ def checkout(db: Session, data: schemas.CheckoutInput, user_id: str = DEFAULT_US
                 _validate_service_period(c.serviceStart, c.serviceEnd)
     if missing:
         raise HTTPException(400, "购物车存在必填缺项，请补齐后再结算：" + "；".join(missing))
-    # 按 (产品, 客户) 分组（保持购物车行序）；七元组
-    # (产品, 数量, 权威/折扣 amount, itemId, 行级客户, serviceStart, serviceEnd)
+    # 按 (产品, 客户) 分组（保持购物车行序）；八元组
+    # (产品, 数量, 权威/折扣 amount, itemId, 行级客户, serviceStart, serviceEnd, discountRate)
     # 明细行 qty 恒 1（ADR-011）；ADR-022 后 amount 恒非空且为合法整数元（上方必填校验保证）
     # ADR-018 §3（PRICING-20261020）：unit/遥感行折扣金额 checkout 时再过一次区间校验
     #（行更新时已校验，此处防绕过行更新接口直接改库/旧客户端）
+    # DISCOUNT-20261021/ADR-023：discountRate 原样透传落 project_items 快照（只写不改）
     # ADR-016（FIX-20261020-#3）：分组键由 assetId 单键升级为 (assetId, customer)——
     # 同产品多客户行不再被静默合并为一条记录（客户归属/金额串账），与前端预览口径一致
-    groups: dict[tuple[int, str], list[tuple[models.Asset, int, Decimal, int | None, str, str | None, str | None]]] = {}
+    groups: dict[tuple[int, str], list[tuple[models.Asset, int, Decimal, int | None, str,
+                                            str | None, str | None, float | None]]] = {}
     for c in cart:
         a = get_asset(db, c.assetId)
         customer = (c.customer or "").strip()
@@ -2393,7 +2431,7 @@ def checkout(db: Session, data: schemas.CheckoutInput, user_id: str = DEFAULT_US
             # ADR-021（RSITEM-RANGE-20261020）：区间取该 rs_item 自身（不再取父产品容器区间）
             amt = _check_discount_range(a, 1, c.amount, unit=a.unit, rs=rs)
             groups.setdefault((c.assetId, customer), []).append(
-                (a, 1, amt, c.itemId, customer, c.serviceStart, c.serviceEnd))
+                (a, 1, amt, c.itemId, customer, c.serviceStart, c.serviceEnd, c.discountRate))
             continue
         if _is_amount_mode(a):
             amt = _validate_amount_yuan(c.amount)  # 整数元校验（必填校验已过，幂等兜底）
@@ -2401,14 +2439,14 @@ def checkout(db: Session, data: schemas.CheckoutInput, user_id: str = DEFAULT_US
             # ADR-018 §3：unit 行折扣金额采信（过区间校验）
             amt = _check_discount_range(a, c.qty, c.amount, unit=a.unit)
         groups.setdefault((c.assetId, customer), []).append(
-            (a, c.qty, amt, None, customer, c.serviceStart, c.serviceEnd))
+            (a, c.qty, amt, None, customer, c.serviceStart, c.serviceEnd, c.discountRate))
     # 每组（产品×客户）→ 一条销售记录（ADR-016：一资产一客户一记录，customer 取分组键）
     # 计价（明细行=明细 price 权威 / amount 模式=权威金额 / unit 模式 price×qty）
     contracts_in: list[schemas.ContractInput] = []
     for (_asset_id, _customer), rows in groups.items():
         items: list[schemas.ProjectItemInput] = []
         total = Decimal("0")
-        for a, qty, amt, item_id, _cust, s_start, s_end in rows:
+        for a, qty, amt, item_id, _cust, s_start, s_end, d_rate in rows:
             # ADR-022（REQUIRED-20261024）：amt 经上方必填校验恒非空（> 0 整数元）——
             # 「留空=原价成交」兜底已删除（unit 行 salePrice×qty / 遥感行明细 price 分支作废）
             price = _derived_price(amt, qty)  # 派生展示值（遥感明细行 qty 恒 1）
@@ -2418,6 +2456,7 @@ def checkout(db: Session, data: schemas.CheckoutInput, user_id: str = DEFAULT_US
                 assetId=a.id, qty=qty, price=price, amount=float(amount),
                 deliveryReq=data.deliveryReq, itemId=item_id,
                 serviceStart=s_start, serviceEnd=s_end,  # ADR-020：服务期限透传
+                discountRate=d_rate,  # DISCOUNT-20261021/ADR-023：折扣率快照透传
             ))
         contracts_in.append(schemas.ContractInput(
             customer=_customer, items=items, contractAmount=float(total.quantize(CENT)), remark="",

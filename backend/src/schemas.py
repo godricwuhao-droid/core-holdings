@@ -208,6 +208,10 @@ class ProjectItemInput(BaseModel):
     # 遥感行不填期限（期数即服务时间）
     serviceStart: str | None = None
     serviceEnd: str | None = None
+    # 折扣率（DISCOUNT-20261021/ADR-023，可选）：0-1 小数（0.9=九折），商务手填场景；
+    # 0 < rate ≤ 1 否则 400「折扣率须为 0 到 1 之间的正数」（_create_project_core 统一校验）；
+    # 落 project_items 为快照（只写不改）；null=无折扣
+    discountRate: float | None = None
 
 
 class ProjectItemOut(_ORM):
@@ -225,6 +229,9 @@ class ProjectItemOut(_ORM):
     # 服务期限（ADR-020，PRICING-20261020）：YYYY-MM-DD；存量/遥感行为 null
     serviceStart: str | None = None
     serviceEnd: str | None = None
+    # 折扣率快照（DISCOUNT-20261021/ADR-023）：下单时快照（只写不改，与 origPrice 同级口径）；
+    # 存量订单为 null（展示端不显示「折扣」列值）
+    discountRate: float | None = None
     status: str
     deliveryReq: str
     locked: bool  # 下单时刻是否真实加锁（非 repeatSale）；前端展示/判断用
@@ -485,6 +492,8 @@ class CartItemOut(_ORM):
     # 服务期限（ADR-020，PRICING-20261020）：YYYY-MM-DD；遥感行不填；存量行为 null
     serviceStart: str | None = None
     serviceEnd: str | None = None
+    # 折扣率（DISCOUNT-20261021/ADR-023）：0-1 小数（0.9=九折）；null=无折扣；存量行为 null
+    discountRate: float | None = None
     createdAt: str
     updatedAt: str
 
@@ -503,19 +512,25 @@ class CartItemInput(BaseModel):
     # 服务期限（ADR-020，PRICING-20261020）：YYYY-MM-DD，start ≤ end 否则 400；遥感行不填
     serviceStart: str | None = None
     serviceEnd: str | None = None
+    # 折扣率（DISCOUNT-20261021/ADR-023）：0-1 小数（0.9=九折），选填；
+    # 0 < rate ≤ 1 否则 400「折扣率须为 0 到 1 之间的正数」（服务层校验）；
+    # null 允许=清空（无折扣）。后端只存不算，amount 校验完全不变
+    discountRate: float | None = None
 
 
 class CartPatchInput(BaseModel):
     """PATCH /cart/{id}：修改购物车行级客户（ADR-007）；可选携带 amount（ADR-008）
-    与服务期限（ADR-020，PRICING-20261020）。
+    与服务期限（ADR-020，PRICING-20261020）、折扣率（DISCOUNT-20261021/ADR-023）。
 
     amount 语义（ADR-018 §3）：unit/遥感明细行=折扣金额（传入即采信并过参考区间校验，
     不传保持 NULL=原价成交）；amount 模式行=权威合同金额（整数元，不传保持原值）。
+    discountRate 语义（ADR-023）：0 < rate ≤ 1 否则 400；null=清空（无折扣）。
     """
     customer: str
     amount: float | None = None
     serviceStart: str | None = None  # YYYY-MM-DD；start ≤ end 否则 400
     serviceEnd: str | None = None
+    discountRate: float | None = None  # 0-1 小数；null=清空（无折扣）
 
 
 class CartBatchInput(BaseModel):

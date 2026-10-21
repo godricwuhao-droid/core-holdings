@@ -408,7 +408,8 @@ async function submitDateDialog() {
             <div v-for="c in contracts" :key="c.id" class="contract-card" :class="`contract-${c.status}`">
               <div class="contract-head">
                 <div class="ch-left">
-                  <span class="contract-code">{{ c.code }}</span>
+                  <!-- DISCOUNT-20261021 批次（2026-10-21）：销售记录清单卡头去掉合同编号（HT-xxx）展示，
+                       保留主体徽标与状态；基本信息区「项目编号 SP-xxx」与列表页等其他页面合同编号展示不受影响 -->
                   <span class="contract-customer">{{ c.customer }}</span>
                   <el-tag v-if="c.subject" size="small" effect="plain" class="contract-subject">
                     {{ entityShort(c.subject) }}
@@ -748,12 +749,7 @@ async function submitDateDialog() {
   gap: 10px;
   flex-wrap: wrap;
 }
-.contract-code {
-  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text-primary);
-}
+/* DISCOUNT-20261021 批次（2026-10-21）：.contract-code 样式随销售记录清单卡头合同编号（HT-xxx）展示一并移除 */
 .contract-customer {
   font-size: 14px;
   font-weight: 600;

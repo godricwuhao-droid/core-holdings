@@ -49,6 +49,12 @@ function editItemName(it: { assetId?: number | null }): string {
   return getAsset(it.assetId)?.name ?? '产品已删除'
 }
 
+/** DISCOUNT-20261021（ADR-023，2026-10-21）：折扣率小数 → 展示文案（0.9→"9折"、0.85→"8.5折"，一位小数去尾零） */
+function discountRateText(rate: number): string {
+  const t = (rate * 10).toFixed(1)
+  return (t.endsWith('.0') ? t.slice(0, -2) : t) + '折'
+}
+
 // ==================== 订单审核（原编辑页面板迁移） ====================
 interface ReviewLine {
   id: number // project_items.id（审核接口 items[].itemId）
@@ -64,6 +70,9 @@ interface ReviewLine {
   origAmount: number
   price: number | null // unit 模式可编辑（实际单价）
   amount: number | null // amount 模式可编辑（实际合同金额，整数元）
+  // 折扣率快照（DISCOUNT-20261021 / ADR-023，2026-10-21）：下单时生态人员填写的折扣率（0-1 小数），
+  // 只读展示（快照不可改，review 接口不改该字段）；null 显示 -
+  discountRate: number | null
   // 服务期限（ADR-020，PRICING-20261020）：confirm 可改（start ≤ end 后端 400 兜底）
   serviceStart: string
   serviceEnd: string
@@ -91,6 +100,8 @@ watch(contracts, (cs) => {
         origPrice: it.origPrice ?? it.price, origAmount: it.origAmount ?? it.amount,
         price: it.price ?? null,
         amount: it.amount ?? null,
+        // DISCOUNT-20261021（ADR-023，2026-10-21）：折扣率快照（只读；存量订单为空 → 显示 -）
+        discountRate: it.discountRate ?? null,
         // ADR-020（PRICING-20261020）：服务期限预填（可改）
         serviceStart: it.serviceStart ?? '',
         serviceEnd: it.serviceEnd ?? '',
@@ -366,6 +377,14 @@ const pageReady = computed(() => proj.value != null)
                   </el-tooltip>
                   <span class="rv-line-qty muted">× {{ l.qty }}{{ l.unit }}</span>
                 </div>
+                <!-- DISCOUNT-20261021（ADR-023，2026-10-21）：折扣率只读展示（下单时生态人员填写的快照，不可改；
+                     null 显示 -）；与已有原单价/原金额 + 可编辑终审价并列，商务可见「原价、折扣率、折扣价」三要素 -->
+                <span class="rv-lbl rv-discount-lbl">
+                  <el-tooltip content="下单时生态人员填写的折扣率（快照，不可改）" placement="top">
+                    <span>折扣</span>
+                  </el-tooltip>
+                </span>
+                <span class="rv-orig">{{ l.discountRate != null ? discountRateText(l.discountRate) : '-' }}</span>
                 <!-- ADR-018 §2（PRICING-20261020）：原价列只读——展示下单时挂牌价快照；
                      存量订单 orig 为空时数据层已按当前 price/amount 兜底（见 reviewLines 展开逻辑），
                      故此处恒展示，无需再判空 -->
@@ -538,6 +557,10 @@ const pageReady = computed(() => proj.value != null)
   flex-shrink: 0;
   font-size: 12px;
   color: var(--text-secondary);
+}
+/* DISCOUNT-20261021（ADR-023，2026-10-21）：折扣只读列（窄列，标签带 tooltip 说明快照口径） */
+.rv-discount-lbl {
+  cursor: help;
 }
 .rv-input {
   width: 160px;

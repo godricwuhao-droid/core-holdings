@@ -795,9 +795,19 @@ export async function setCartQty(id: number, qty: number): Promise<void> {
  * - amount 模式行：权威输入，后端校验 int > 0；
  * - unit/遥感明细行：折扣金额，过产品参考区间校验（超区间 400，文案由后端给出）。
  * ⚠️ 必须同时回传该行当前 qty（后端 PUT 对 qty<=0 直接 400，且区间校验按新 qty 重算）。
+ * DISCOUNT-20261021（ADR-023，2026-10-21）：新增 discountRate 入参（0-1 小数，如 9 折传 0.9；
+ * null = 清空；undefined = 不传该字段）。一致性规则由前端执行（折扣回填 amount 后一次性提交；
+ * 手改 amount 时传 null），后端只存不算。
  */
-export async function setCartAmount(id: number, qty: number, amount: number): Promise<void> {
-  await http.put(`/cart/${id}`, { qty, amount })
+export async function setCartAmount(
+  id: number,
+  qty: number,
+  amount: number,
+  discountRate?: number | null,
+): Promise<void> {
+  const body: { qty: number; amount: number; discountRate?: number | null } = { qty, amount }
+  if (discountRate !== undefined) body.discountRate = discountRate
+  await http.put(`/cart/${id}`, body)
   await afterWrite()
 }
 

@@ -2,6 +2,27 @@
 
 > 记录 core-holdings 后端（FastAPI + SQLAlchemy + SQLite）的接口与行为变更。
 
+## 2026-10-21 ｜ 新增：DISCOUNT-20261021 购物车折扣率输入（分支 feat/pricing-discount-timelines）
+
+> 依据 ADR-023（购物车下单处加选填折扣快捷入口，销售金额仍是权威必填值，ADR-022 不变）。前后端同批上线（契约见 api-contracts.md「DISCOUNT-20261021 批次」）。**后端只存不算**：不做金额回填计算（前端回填 amount 后一起提交，金额权威原则），amount 现有校验（必填/整数元/参考区间）完全不变。
+
+| 日期 | 类型 | 变更内容 | 影响文件范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-21 | 新增 | `cart_items.discountRate` / `project_items.discountRate` 两可空列（FLOAT，0-1 小数，0.9=九折；NULL=无折扣/无快照），`main.py::_ensure_migration` 幂等补列（inspector + ALTER TABLE 模式，沿用 PRICING 批次先例）；存量数据不迁移（NULL 语义正确） | `backend/src/models.py`（CartItem/ProjectItem）、`backend/main.py` | DISCOUNT-20261021 | project_items 为**下单快照，只写不改**（与 origPrice/origAmount 同级口径，审核终审改价不触碰） |
+| 2026-10-21 | 新增 | 购物车写接口接受 `discountRate`：`POST /cart`、`POST /cart/batch`、`PUT /cart/{id}`、`PATCH /cart/{id}`。校验：0 < rate ≤ 1 否则 400「折扣率须为 0 到 1 之间的正数」（服务层 `_validate_discount_rate`）；null 允许=清空（无折扣）。加购合并既有行时 null 同样清空 | `backend/src/schemas.py`（CartItemInput/CartPatchInput/CartItemOut）、`backend/src/services.py`（`_cart_add_inner`/`set_cart_qty`/`patch_cart_item`/`add_to_cart_batch`）、`backend/src/routers/api.py`（PUT 裸 dict 透传） | DISCOUNT-20261021 | 后端只存不算：不回填 amount，区间校验仍对 amount 生效 |
+| 2026-10-21 | 新增 | checkout 快照：`_create_project_core` 落 ProjectItem 时写 `discountRate` = 购物车行值（分组透传，只写不改）；**手动建单 POST /projects 的 ProjectItemInput 同口径支持**（可选，商务手填场景，`_create_project_core` 统一校验，覆盖购物车结算/手动建单/直接下单/重新提交全部入口） | `backend/src/services.py`（`checkout`/`_create_project_core`）、`backend/src/schemas.py`（ProjectItemInput/ProjectItemOut） | DISCOUNT-20261021 | 手动建单入参改造成本小（schema 加可选字段 + core 统一校验一处），已实现 |
+| 2026-10-21 | 新增 | bootstrap 带出：`cartItems[].discountRate` / `projectItems[].discountRate`（CartItemOut/ProjectItemOut 加字段，bootstrap 序列化自动带出）；review 接口不改（discountRate 只读展示，终审改价仍只写 price/amount） | `backend/src/schemas.py` | DISCOUNT-20261021 | 存量行/存量订单为 null（前端审核页「折扣」列 null 不显示） |
+
+### 验证（dev server 8000，admin，curl 实测）
+
+- `python3 -m compileall -q src main.py` 通过；`import src.services / src.routers.api / src.schemas / src.models / main` → import ok。
+- `POST /api/cart`（asset #21，discountRate=0.9）→ 200，出参 `discountRate: 0.9`；bootstrap `cartItems[]` 带出 0.9。
+- `PUT /api/cart/4` discountRate=0 / 1.5 / -1 → 均 400 `{"detail":"折扣率须为 0 到 1 之间的正数"}`；传 `null` → 200，bootstrap 显示 `discountRate: null`（清空生效）。
+- `PATCH /api/cart/4`（amount=91980 + 服务期限 + discountRate=0.9）→ 200；`POST /api/cart/checkout` → 200，项目 pending，明细 `amount=91980.0 / origAmount=102200.0 / discountRate=0.9`（快照落库，bootstrap `projectItems[]` 带出）。
+- 手动建单 `POST /api/projects`（asset #1，discountRate=0.85）→ 200，明细 `discountRate=0.85`；discountRate=2 → 400 同文案。
+- 测试数据已清零：两个测试项目删除（projects 恢复 1 行云从项目）、购物车行恢复基线 3 行（discountRate 全 NULL）、asset #1/#21 lockedQty=0、project_items 恢复存量 3 行，库恢复现状。
+- 未修改 frontend/ 任何文件、未执行构建/部署、未 git commit。
+
 ## 2026-10-21 ｜ 新增：PAGE-20261021 产品相关列表服务端分页（分支 feat/pricing-discount-timelines）
 
 > 抽屉/详情页的可售明细、数量流水、操作记录由 bootstrap 全量下发改服务端分页（单页默认 10 条）。**bootstrap 快照字段（rsItems/flows/logs）保留不动**——RsItemPicker 树、项目页名称查找等消费方仍依赖全量镜像。契约见 api-contracts.md「PAGE-20261021 批次」，口径对齐 `GET /audit-logs` 先例（`page`/`pageSize` 参数、`{total, items}` 返回）。

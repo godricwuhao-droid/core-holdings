@@ -2,6 +2,37 @@
 
 > 记录 core-holdings 前端（Vue3 + TS + Element Plus + Vite）的页面/组件/接口封装变更。
 
+## 2026-10-21 ｜ 新增：购物车折扣率输入（选填快捷入口）+ 审核页折扣只读列（DISCOUNT-20261021 / ADR-023）
+
+**关联任务**：DISCOUNT-20261021（契约见 docs/api-contracts.md「DISCOUNT-20261021 批次」，决策 docs/adr/ADR-023.md）。销售金额仍是权威必填值（ADR-022 不变），折扣率只是快捷工具。后端并行实现（bootstrap 带出 cartItems/projectItems 的 `discountRate: number|null`，购物车写接口接受该字段，0<rate≤1 否则 400），前端按契约先行。
+
+| 日期 | 类型 | 变更内容 | 影响文件范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-21 | 新增 | ① 类型与 API：`CartItem` / `ProjectItem` 加 `discountRate?: number \| null`（0-1 小数，0.9=九折）；`setCartAmount` 加第 4 参 `discountRate?`（undefined=不传字段、null=清空、小数=提交），PUT /cart/{id} body 携带 | types.ts、api/index.ts | DISCOUNT-20261021（ADR-023） | 契约 §1/§2 |
+| 2026-10-21 | 新增 | ② 购物车金额列内联「折扣」输入（cart/index.vue）：布局红线（ADR-023）保持 `.cart-cell > .cell-main(40px) + .cell-hint(18px)` 统一结构——折扣输入放**主内容区内**与金额输入并排（新增 `.cart-amount-row` flex：金额 flex:1 + 折扣固定 68px、同高 size=small、间距 6px，列宽 200 不变、全表总宽零增加），不加新行不改行高；placeholder「折扣」，输入仅保留数字与一位小数（`onDiscountInput` 清洗） | views/cart/index.vue | DISCOUNT-20261021（ADR-023） | 普通/遥感/包量行均可用，原价单价来源 = row.price（明细价/挂牌价/挂牌价，与现有口径一致） |
+| 2026-10-21 | 新增 | ③ 折扣交互三规则（cart/index.vue）：a) 合法（0<r≤10）→ `amount = Math.round(row.price × qty × r/10)`（整数元）回填金额输入框，走现有 `onAmountChange` 提交链路（一次性提交 amount + discountRate 小数，后端只存不算）；b) 非法（0/超10/非数字）→ 输入框值驱动标红（复用 `.cart-customer-error` 描边样式）不回填、金额不受影响；c) **手动编辑销售金额 → 该行 discountRate 清空（提交 null）并清空折扣输入框显示**（`onAmountInput` 内执行，ADR-023 一致性规则——金额权威，防止「显示 9 折但金额已被手改」）；另：数量变更（`stepQty`）后若该行有 discountRate → 按新数量重算 amount 并提交（折扣语义跟随数量，`onQtyChange` 改返回成功标记）；清空折扣输入 → discountRate 提交 null（金额保持当前值） | views/cart/index.vue | DISCOUNT-20261021（ADR-023） | 折扣输入用本地草稿 `discountDrafts`（按行 id 存「折」文案）而非直接 v-model 后端小数——避免输入中间态（"8."、"0"）被 model 覆盖；无草稿时由后端值派生（`rateToText` 一位小数去尾零） |
+| 2026-10-21 | 新增 | ④ 填了折扣后的展示（四个数字全可见且不重复占位）：原价单价=单价列（不动）；金额列 `.cell-hint` 显示折扣摘要 `原价总额 ¥{price×qty} · 折后单价 ¥{price×r/10 保留2位}`（11px 辅助色 #71829A，复用 `.cart-amount-range`，超长省略 + el-tooltip 全文）；折扣总价=金额输入框值+小计列（不动）；**展示优先级：折扣与参考区间同时存在时提示行优先显示折扣摘要，区间移到金额输入框 hover tooltip 合并展示**（`amountTip` 追加区间文案，注释说明）；未填折扣 → 提示行维持现状（参考区间或空）、折扣输入框留空 | views/cart/index.vue | DISCOUNT-20261021（ADR-023） | 折扣回填金额仍走现有全部校验（整数元>0、参考区间后端 400 文案 showError + 回滚） |
+| 2026-10-21 | 新增 | ⑤ 审核页折扣只读列（review.vue）：`ReviewLine` 加 `discountRate`（展开映射 `it.discountRate ?? null`）；明细行在已有「原单价/原金额（只读）+ 可编辑终审价」基础上新增「折扣」只读项——有值显示 `{r×10}折`（`discountRateText`：0.9→"9折"、0.85→"8.5折"，一位小数去尾零），null 显示 `-`；标签带 tooltip「下单时生态人员填写的折扣率（快照，不可改）」（窄列，`.rv-discount-lbl` cursor:help） | views/sales/projects/review.vue | DISCOUNT-20261021（ADR-023） | 契约 §5：review 接口不改——discountRate 只读快照，终审改价仍只写 price/amount，提交 items 不含该字段 |
+
+### 验证
+
+- `npx vue-tsc --noEmit` 0 error（strict）；IDE 诊断 0。
+- 场景自查：普通行（如 9 折 × ¥5,100,000 × 1 → 回填 ¥4,590,000 并一次性提交 amount+0.9）、遥感行（原价单价=明细价 row.price 口径）、包量行（挂牌价口径）、达上限行（+ 号禁用不触发重算）四类行型折扣输入均可用；手改金额 → 折扣率清 null + 折扣框清空；数量 ±1 后折扣行金额按新数量重算；未填折扣时提示行维持参考区间现状；`.cart-cell/.cell-main(40px)/.cell-hint(18px)` 样式 grep 确认未动（行高不变）。
+- 后端接口并行未就绪：discountRate 提交 400/忽略均按契约容错（showError + 回滚），代码按契约写对即可。
+- 未修改 backend/ 下任何文件；未执行构建/部署；未 commit。
+
+## 2026-10-21 ｜ 修改：项目详情「销售记录清单」卡头去掉合同编号（HT-xxx）展示
+
+| 日期 | 类型 | 变更内容 | 影响文件范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-21 | 修改 | 销售记录清单每个合同卡头部去掉合同编号（HT-xxx）展示（删除 `.contract-code` span 及对应样式），保留客户名、主体徽标与状态标签（如「[蜂云星座] 待审核」+ 右侧「待审核（等商务确认）」）；**基本信息区「项目编号 SP-xxx」与页头「编号 SP-xxx」保留**（用户只要求清单不展示编号）；列表页等其他页面合同编号展示不动；交付/终止确认弹窗与成功提示中的 c.code 文案为操作确认语境，非清单卡头展示，保留 | views/sales/projects/detail.vue | 用户反馈 | grep 确认 detail.vue 内 HT 编号渲染点仅卡头一处，其余区域编号展示自查未受影响 |
+
+### 验证
+
+- `npx vue-tsc --noEmit` 0 error（strict）；IDE 诊断 0。
+- 自查：销售记录清单卡头无 HT 编号、主体徽标/状态/右侧操作区不变；基本信息区「项目编号 SP-xxx」正常展示。
+- 未修改 backend/ 下任何文件；未执行构建/部署；未 commit。
+
 ## 2026-10-21 ｜ 修改：产品抽屉/详情页列表服务端分页（4 处 UI）+ 已售次数改后端 soldCount（PAGE-20261021）
 
 **关联任务**：PAGE-20261021（契约见 docs/api-contracts.md「PAGE-20261021 批次」）。抽屉/详情页的可售明细、数量流水、操作记录此前随 bootstrap 全量下发前端渲染（遥感明细 97 条、日志随时间累积），改服务端分页（单页 10 条，`layout="total, prev, pager, next"` 照 settings/users.vue 先例）。**bootstrap 快照字段（db.rsItems/db.flows/db.logs）保留不动**——RsItemPicker 树、项目页名称查找（create/detail/review）、列表页「N 期」摘要等消费方仍用全量镜像，本次仅改 4 处渲染的数据源。
