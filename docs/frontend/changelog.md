@@ -2,6 +2,26 @@
 
 > 记录 core-holdings 前端（Vue3 + TS + Element Plus + Vite）的页面/组件/接口封装变更。
 
+## 2026-10-21 ｜ 修复：购物车仍卡顿——客户输入草稿化 + 草稿存储 ref→reactive 根因修复（CART-PERF2-20261021）
+
+**关联任务**：CART-PERF2-20261021。用户反馈 CART-PERF-20261021（金额/折扣草稿化）后**仍卡**。架构师定位剩余根因：`cart/index.vue` 客户输入框 `v-model="row.cart.customer"` 每敲一字直接写 db.cart 共享镜像 → `cartRows` computed 重算 → 新数组+新行对象 → el-table `:data` 身份变化 → 整表重渲染（fixed 列双份 + 全部 tooltip）——与 CART-PERF 修金额时同一缺陷模式，客户字段漏了。**验证过程中另发现 CART-PERF 遗留根因缺陷**：三个草稿存储均为 `ref(Record)`，而代码以 `drafts[id]` 直接索引读写——`ref(plainObject)` 的索引访问落在 RefImpl 实例自身（绕过响应式代理，浏览器实测确认：写入后 `ref.value` 键为空、读回一致但零响应式），导致草稿更新**不触发任何重渲染**（显示/标红/摘要不跟随草稿，提交/回滚后 `= ''` 清草稿还会让显示错误地停在空串）。
+
+| 日期 | 类型 | 变更内容 | 影响文件范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-21 | 修复 | ① 客户输入草稿化（完全复刻 amountDrafts 模式）：新增 `customerDrafts` + `customerDraft(row)`（草稿优先，无草稿读 row.cart.customer）+ `customerValue(row)`（合并口径 trim 后）；模板客户输入 `v-model` 改 `:model-value="customerDraft(row)"` + `@input="onCustomerInput"`（只写草稿，敲字不 trim，提交时才 trim）；`@change="onCustomerChange"` 保留但提交值改读 `customerValue(row)`；提交成功（patchCartRow 已更新镜像）与 400 回滚（refresh(true)）均**删草稿**使显示回退后端值 | views/cart/index.vue | CART-PERF2-20261021 | 逐字输入不再写 db.cart，cartRows 不重算、无整表重建 |
+| 2026-10-21 | 修复 | ② ⚠️ 草稿存储 ref→reactive（CART-PERF 遗留根因，浏览器实测定位）：`customerDrafts`/`amountDrafts`/`discountDrafts` 全部 `ref<Record<number,string>>({})` → `reactive<Record<number,string>>({})`——ref(plainObject) 的 `drafts[id]` 索引读写绕过响应式代理（写落 RefImpl 实例自身），草稿更新零重渲染（显示/标红/摘要不跟随草稿）；reactive 按属性追踪后敲字仅失效本行单元格渲染，cartRows（:data）仍不重算。配套：所有「清草稿」点（onCustomerChange 成功/回滚、onAmountChange 成功/回滚、onAmountInput 清折扣草稿、onDiscountChange 回填清金额草稿、stepQty 重算清金额草稿）由 `= ''` 改 `delete`——`''` 是合法草稿值（用户清空未失焦需显示空+标红），delete 后显示才正确回退已提交值（修复提交/回滚后输入框错误显示空串的问题） | views/cart/index.vue | CART-PERF2-20261021 | 行为变化：金额/折扣提交成功后输入框正确显示已提交值（原 ref 缺陷下显示空串）；标红/placeholder/折扣摘要开始真正实时跟随草稿 |
+| 2026-10-21 | 修改 | ③ 读「当前客户值」位置统一合并口径：标红 class 与 placeholder 改 `customerValue(row) === ''` 口径（实时跟随草稿）；`openOrder` 结算前置校验 `missingCustomer` 改读 `customerValue(r)`（敲了没失焦的客户名不误拦，与金额同口径，天然失焦链路+草稿合并双保险）；`previewGroups` **保持读已提交值不动**（点结算先触发失焦提交，预览仅在弹窗打开后展示，草稿窗口期不存在，注释说明）；全页 grep 确认其余 `row.cart.customer` 读点仅 previewGroups 一处（读已提交值口径正确） | views/cart/index.vue | CART-PERF2-20261021 | 提交链路语义零变更 |
+| 2026-10-21 | 修改 | ④ 收敛金额首字的全表重渲染：`onAmountInput` 的 `row.cart.discountRate = null` 改 `if (row.cart.discountRate != null) row.cart.discountRate = null`——已为 null 时不再触碰镜像（避免敲金额首字时多余的镜像写触发一次全表重渲染），注释更新 | views/cart/index.vue | CART-PERF2-20261021 | 一致性规则语义不变（非 null→null 仍清空） |
+| 2026-10-21 | 修改 | ⑤ 全页输入链路终审：grep 确认逐字输入（客户/金额/折扣）全部走 `@input` 只写草稿，**无任何逐字写 db.cart 路径**；剩余 `v-model` 仅日期 picker ×2（change 提交非逐字，保留，模板注释说明）与对话框 `orderVisible`（无关）；行内注释留「逐字输入只写草稿」约定说明 | views/cart/index.vue | CART-PERF2-20261021 | — |
+
+### 验证
+
+- `npx vue-tsc --noEmit` 0 error；IDE 诊断 0。
+- **性能证据（浏览器实测，dev server 5173，临时给 cartRows computed 加重算计数器，验证后已删除）**：基线 counter=2；客户输入框逐字敲 5 字（「测试客户名」，beforeinput+input 完整事件链路）→ counter 2→**2 不增长**，输入框实时显示草稿「原客户A测试客户名」；金额逐字敲 5 字（「12345」）→ 2→**2**，实时显示且标红实时解除；折扣逐字敲「8.5」→ 2→**2**，折扣摘要实时出现（`原价 ¥32,560,000.00 · 折后 ¥27676000.00`）；清空客户 → placeholder 实时变「必填」+ 标红 class 实时出现（wrapper 实测含 `cart-customer-error`），counter 仍 2。失焦提交时才重算 1 次（镜像写触发，符合预期）。
+- 功能自查（浏览器实测）：客户敲字实时显示 ✅；失焦提交成功（后端 bootstrap 回读 = 提交值，显示回退镜像）✅；缺项标红/placeholder 跟随草稿 ✅；结算前置校验——金额敲「12345」未失焦点结算，warning 仅报「服务期限」，客户/金额均放行（草稿合并口径生效）✅；400 回滚——同产品两行，把 B 行客户改成 A 行客户提交 → 后端 400 toast「购物车中该产品在客户「回滚测试A」下已有行，无法修改客户（请先删除原行）」，输入框回滚显示「回滚测试B」，后端行值未变 ✅；viewer 场景——新建 viewer 账号登录，加购后逐字输入/清空标红链路正常（counter 不增长）✅。
+- 验证中发现并修复的 CART-PERF 遗留缺陷（ref 索引绕过响应式）以浏览器运行时实测为证：`ref({})` 直写 `r[6]='hello'` 后 `r.value` 键为空；组件 setupState 中三个草稿 reactive 对象键全空（写入落在 RefImpl 实例）；改 reactive 后显示/标红/摘要实时跟随草稿。
+- 测试数据已清理（测试购物车行全部删除、临时 viewer 账号已删）；未修改 backend/ 下任何文件；未执行构建/部署；未 commit。
+
 ## 2026-10-21 ｜ 修复：购物车行更新输入卡顿 + 折扣实时预览（CART-PERF-20261021）
 
 **关联任务**：CART-PERF-20261021（契约见 docs/api-contracts.md「CART-PERF-20261021 批次」）。根因（已定位）：① 主因——`api/index.ts` 行级写函数（setCartQty/setCartAmount/setCartService/patchCartItem）每次 PUT 成功后 `afterWrite()` 全量重拉 bootstrap（97 条 rsItems + 122 条 logs + 全部项目合同）→ 整表重建；② 次因——`cart/index.vue` `onAmountInput` 每敲一字直接写 `row.cart.amount`（db.cart 共享镜像）→ `cartRows` computed 重算 → el-table 整表重渲染（含固定列双渲染 + 全部 tooltip）；③ 折扣价「看不见」——摘要只在失焦提交成功、`discountRate` 落值后才渲染，且旧文案在 200px 列宽下被截断。

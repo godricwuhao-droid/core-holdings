@@ -8,7 +8,7 @@
  * 交付（扣数量 + 交付记录）在项目详情页对合同执行「交付」后触发。
  * 数据预留 userId 维度（当前默认 admin），为后续账号权限管控做准备。
  */
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Delete, InfoFilled, ShoppingCart } from '@element-plus/icons-vue'
@@ -56,12 +56,42 @@ const totalAmount = computed(() => cartRows.value.reduce((s, r) => s + r.subtota
 // 2026-10-24（ADR-022）：客户/金额/服务期限统一「必填」口径——缺项标红改为值驱动
 //（字段为空即标红，与列头红星同口径），不再维护 error id 集合（原 customerErrors/amountErrors 删除）
 
+/** CART-PERF2-20261021（2026-10-21）：客户输入本地草稿（与 amountDrafts 同模式，按行 id 存）——
+ *  剩余卡顿根因：原 v-model 每敲一字直接写 row.cart.customer（db.cart 共享镜像）→ cartRows computed 重算
+ *  → 新数组 + 新行对象 → el-table :data 身份变化 → 整表重渲染（fixed 列双份 + 全部 tooltip）。
+ *  改敲字只写草稿（不碰镜像、cartRows 不重算），失焦/回车经 onCustomerChange 提交（提交时才 trim）；
+ *  无草稿时显示由已提交值派生（刷新后仍一致）。
+ *  约定：本页逐字输入只写草稿（客户/金额/折扣均草稿化），日期 picker 为 change 提交非逐字（见模板注释）。
+ *  CART-PERF2-20261021 修复：草稿存储必须用 reactive(Record) 而非 ref(Record)——
+ *  ref(plainObject) 的索引读写（drafts[id]）落在 RefImpl 实例自身（绕过响应式代理），
+ *  草稿更新不触发任何重渲染（显示/标红不跟随草稿，CART-PERF 遗留缺陷）；
+ *  reactive 对象按属性追踪，敲字仅失效本行单元格渲染，cartRows（:data）仍不重算 */
+const customerDrafts = reactive<Record<number, string>>({})
+
+/** 客户输入框当前显示值（草稿优先，无草稿读已提交值） */
+function customerDraft(row: CartRow): string {
+  return customerDrafts[row.cart.id] ?? (row.cart.customer ?? '')
+}
+
+/** 客户有效值（「草稿或已提交值」合并口径，trim 后）——标红校验与结算前置校验共用：
+ *  用户敲了还没失焦的客户名也计入校验（草稿优先），与金额（amountValue）同口径 */
+function customerValue(row: CartRow): string {
+  return customerDraft(row).trim()
+}
+
+/** 客户输入：CART-PERF2-20261021：只写草稿，不再碰 row.cart.customer（敲字不 trim，提交时才 trim） */
+function onCustomerInput(row: CartRow, v: string) {
+  customerDrafts[row.cart.id] = v ?? ''
+}
+
 // ==================== 行级销售金额（ADR-008 包量定价行权威输入；ADR-022 起所有行必填） ====================
 /** CART-PERF-20261021（2026-10-21）：金额输入本地草稿（与 discountDrafts 同模式，按行 id 存）——
  *  卡顿次因：原每敲一字直接写 row.cart.amount（db.cart 共享镜像）→ cartRows computed 重算 →
  *  el-table 整表重渲染（含固定列双渲染 + 全部 tooltip）。改敲字只写草稿（不碰镜像、cartRows 不重算），
- *  失焦/回车经 onAmountChange 提交；无草稿时显示由已提交值派生（刷新后仍一致）。 */
-const amountDrafts = ref<Record<number, string>>({})
+ *  失焦/回车经 onAmountChange 提交；无草稿时显示由已提交值派生（刷新后仍一致）。
+ *  CART-PERF2-20261021（2026-10-21）：ref → reactive（同 customerDrafts，见其注释——
+ *  ref(plainObject) 索引读写绕过响应式代理，草稿更新不触发重渲染） */
+const amountDrafts = reactive<Record<number, string>>({})
 
 /** 金额输入框当前显示值（草稿优先，无草稿读已提交值） */
 function amountDraft(row: CartRow): string {
@@ -81,10 +111,11 @@ function onAmountInput(row: CartRow, v: string) {
   amountDrafts[row.cart.id] = digits
   // DISCOUNT-20261021（ADR-023）一致性规则：手动编辑销售金额 → 清空该行折扣草稿（显示）
   // 并置 discountRate 为 null（失焦提交 null）——金额是权威值，防止「显示 9 折但金额已被手改」。
-  // 注：discountRate 已为 null 时再置 null 是 Vue 响应式 no-op（同值不触发），
-  // 故每行至多触发一次重渲染（首次敲字），不会每 keystroke 整表重渲染
-  discountDrafts[row.cart.id] = ''
-  row.cart.discountRate = null
+  // CART-PERF2-20261021（2026-10-21）：仅当 discountRate 非 null 时才置 null——
+  // 已为 null 时不再触碰镜像（避免敲金额首字时多余的镜像写触发一次全表重渲染）
+  // 清折扣草稿用 delete（而非置 ''）：rate 置 null 后显示回退本就为 ''，delete 语义更准（无草稿）
+  delete discountDrafts[row.cart.id]
+  if (row.cart.discountRate != null) row.cart.discountRate = null
 }
 
 /** 2026-10-24（ADR-022）：金额缺项（空 / 0 / 非整数）→ 标红，与客户列同一「必填缺项」样式
@@ -136,7 +167,9 @@ async function onAmountChange(row: CartRow) {
   const n = amountValue(row)
   if (n === undefined || !Number.isInteger(n) || n <= 0) return // 缺项不提交（标红由值驱动，草稿保留）
   row.cart.amount = n
-  amountDrafts[row.cart.id] = ''
+  // CART-PERF2-20261021（2026-10-21）：清草稿用 delete（而非置 ''）——'' 是合法草稿值（用户清空未失焦），
+  // delete 后显示回退已提交值（镜像已写入 n）
+  delete amountDrafts[row.cart.id]
   try {
     // 回传该行当前 qty：后端 PUT 对 qty<=0 直接 400，且区间校验按新 qty 重算
     // DISCOUNT-20261021（ADR-023，2026-10-21）：amount + discountRate（0-1 小数）一次性提交；
@@ -145,15 +178,16 @@ async function onAmountChange(row: CartRow) {
   } catch (e) {
     showError(e, '销售金额更新失败')
     await refresh(true)
-    amountDrafts[row.cart.id] = '' // 回滚：草稿重置为后端值（显示改由刷新后的镜像派生）
+    delete amountDrafts[row.cart.id] // 回滚：删草稿 → 显示回退刷新后的镜像（后端值）
   }
 }
 
 // ==================== 行级折扣率（DISCOUNT-20261021 / ADR-023，2026-10-21：选填快捷入口，金额仍权威必填） ====================
 /** 折扣输入本地草稿（「折」单位，0-10 一位小数，如 9 / 8.5）——
  *  不直接 v-model 到 row.cart.discountRate（0-1 小数）：输入中间态（"8."、"0"）
- *  若回写后端值会被 model 覆盖；草稿按行 id 存，无草稿时由后端值派生（刷新后仍一致） */
-const discountDrafts = ref<Record<number, string>>({})
+ *  若回写后端值会被 model 覆盖；草稿按行 id 存，无草稿时由后端值派生（刷新后仍一致）。
+ *  CART-PERF2-20261021（2026-10-21）：ref → reactive（同 customerDrafts，见其注释） */
+const discountDrafts = reactive<Record<number, string>>({})
 
 // CART-PERF-20261021（2026-10-21）性能自查（修复清单第 4 项）：模板单元格内调用的方法
 // （discountDraft/discountInvalid/discountTip/discountSummary/discountPreviewRate/amountDraft/
@@ -252,7 +286,8 @@ async function onDiscountChange(row: CartRow) {
     row.cart.amount = Math.round(row.price * row.cart.qty * rate) // 回填金额输入框（整数元）
     // CART-PERF-20261021（2026-10-21）：回填覆盖金额 → 清金额草稿，
     // 防止 onAmountChange 读到用户先前未失焦的旧金额草稿（草稿优先口径）
-    amountDrafts[row.cart.id] = ''
+    // CART-PERF2-20261021（2026-10-21）：清草稿用 delete（显示回退已回填的镜像金额）
+    delete amountDrafts[row.cart.id]
   }
   await onAmountChange(row)
 }
@@ -283,6 +318,9 @@ const previewGroups = computed(() => {
   const idx = new Map<string, number>()
   const svcSets = new Map<number, Set<string>>()
   for (const r of cartRows.value) {
+    // CART-PERF2-20261021（2026-10-21）：保持读已提交值（r.cart.customer），不用草稿合并口径——
+    // 点「结算下单」会先触发客户输入框失焦（change 先于 click，onCustomerChange 已提交并更新镜像），
+    // 预览仅在结算弹窗打开后展示，草稿窗口期不存在，读镜像即最新值
     const customer = (r.cart.customer ?? '').trim()
     if (!customer) continue
     const key = `${r.cart.assetId}::${customer}`
@@ -306,16 +344,24 @@ const previewGroups = computed(() => {
   return groups
 })
 
-/** 行内编辑客户：失焦 / 回车提交；400（同产品同客户已有行）弹后端文案并回滚 */
+/** 行内编辑客户：失焦 / 回车提交；400（同产品同客户已有行）弹后端文案并回滚
+ *  CART-PERF2-20261021（2026-10-21）：提交值改读草稿优先的合并值（customerValue，trim 后）——
+ *  镜像不再逐字更新，草稿是输入权威；成功后 patchCartItem（patchCartRow）已把镜像替换为后端值，
+ *  清草稿即可（显示由镜像派生）；400 回滚（refresh(true)）后同样清草稿——
+ *  草稿重置为后端值口径（与金额草稿回滚同写法，显示改由刷新后的镜像派生） */
 async function onCustomerChange(row: CartRow) {
   const id = row.cart.id
-  const next = (row.cart.customer ?? '').trim()
+  const next = customerValue(row)
   // 2026-10-24（ADR-022）：缺项标红为值驱动（空即红），无需维护 error 集合
   try {
     await patchCartItem(id, next)
+    // CART-PERF2-20261021：清草稿用 delete（而非置 ''）——'' 是合法草稿值（用户清空未失焦），
+    // delete 后显示回退已提交值（镜像已由 patchCartRow 更新为后端值）
+    delete customerDrafts[id]
   } catch (e) {
     showError(e, '客户修改失败')
     await refresh(true) // 回滚到后端值
+    delete customerDrafts[id] // 回滚：删草稿 → 显示回退刷新后的镜像（后端值），与金额草稿回滚同口径
   }
 }
 
@@ -396,7 +442,7 @@ async function stepQty(row: CartRow, delta: number) {
   if (ok && row.cart.discountRate != null) {
     const amount = Math.round(row.price * row.cart.qty * row.cart.discountRate)
     row.cart.amount = amount
-    amountDrafts[row.cart.id] = '' // CART-PERF-20261021（2026-10-21）：重算覆盖金额 → 清金额草稿（显示由镜像派生）
+    delete amountDrafts[row.cart.id] // CART-PERF2-20261021（2026-10-21）：重算覆盖金额 → 删金额草稿（显示回退镜像，delete 而非置 ''）
     try {
       await setCartAmount(row.cart.id, row.cart.qty, amount, row.cart.discountRate)
     } catch (e) {
@@ -460,10 +506,13 @@ const orderItems = computed<OrderItem[]>(() =>
  *  缺项输入框本身已值驱动标红（amountInvalid / serviceMissing / 客户空值），用户可直接定位
  *  CART-PERF-20261021（2026-10-21）：金额校验读「草稿或已提交值」合并口径（amountInvalid → amountValue）——
  *  点结算按钮本身会先触发金额输入框 blur（change 先于 click，onAmountChange 同步段已把合法草稿写入镜像），
- *  天然失焦链路 + 草稿合并口径双保险：敲了还没失焦的合法金额不会被误拦，非法草稿（0/空）仍拦截 */
+ *  天然失焦链路 + 草稿合并口径双保险：敲了还没失焦的合法金额不会被误拦，非法草稿（0/空）仍拦截
+ *  CART-PERF2-20261021（2026-10-21）：客户校验改读合并口径（customerValue，草稿优先 trim 后）——
+ *  点结算按钮同样先触发客户输入框 blur（onCustomerChange 已提交），天然失焦链路 + 草稿合并口径
+ *  双保险：敲了还没失焦的客户名不会被误拦（与金额同口径） */
 function openOrder() {
   if (!db.cart.length) return
-  const missingCustomer = cartRows.value.filter((r) => !(r.cart.customer ?? '').trim())
+  const missingCustomer = cartRows.value.filter((r) => customerValue(r) === '')
   const missingAmount = cartRows.value.filter((r) => amountInvalid(r))
   const missingService = cartRows.value.filter(
     (r) => !r.rsItem && (!r.cart.serviceStart || !r.cart.serviceEnd || r.cart.serviceStart > r.cart.serviceEnd),
@@ -586,13 +635,18 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
               <div class="cart-cell">
                 <div class="cell-main">
                   <!-- 行级客户对三角色均可编辑（含生态人员）；
-                       2026-10-24（ADR-022）：空值即标红（值驱动，与列头红星同口径） -->
+                       2026-10-24（ADR-022）：空值即标红（值驱动，与列头红星同口径）
+                       CART-PERF2-20261021（2026-10-21）：客户输入改本地草稿——
+                       :model-value 草稿优先（无草稿读已提交值），敲字只写草稿不碰 db.cart 镜像
+                       （cartRows 不重算、无整表重建）；标红/placeholder 改读合并口径 customerValue
+                       （草稿优先 trim 后），标红跟随输入草稿实时变化 -->
                   <el-tooltip content="结算时按「产品 + 客户」分组生成销售记录" placement="top">
                     <el-input
-                      v-model="row.cart.customer"
+                      :model-value="customerDraft(row)"
                       size="small"
-                      :placeholder="(row.cart.customer ?? '').trim() ? '填写客户' : '必填'"
-                      :class="{ 'cart-customer-error': !(row.cart.customer ?? '').trim() }"
+                      :placeholder="customerValue(row) ? '填写客户' : '必填'"
+                      :class="{ 'cart-customer-error': customerValue(row) === '' }"
+                      @input="onCustomerInput(row, $event)"
                       @change="onCustomerChange(row)"
                     />
                   </el-tooltip>
@@ -748,6 +802,8 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
               <div class="cart-cell">
                 <div class="cell-main cell-main-center">
                   <template v-if="!row.rsItem">
+                    <!-- CART-PERF2-20261021（2026-10-21）全页输入链路终审：日期 picker 保留 v-model——
+                         日期选择是 change 提交（选中即落值）而非逐字输入，不构成逐字写镜像路径 -->
                     <div class="cart-service-row">
                       <el-date-picker
                         v-model="row.cart.serviceStart"
