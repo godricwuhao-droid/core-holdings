@@ -11,11 +11,10 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { ArrowLeft, EditPen, Folder, Tickets } from '@element-plus/icons-vue'
+import { ArrowLeft, EditPen, Folder, InfoFilled, Tickets } from '@element-plus/icons-vue'
 import {
   PROJECT_STATUS,
   derivedUnitPrice,
-  entityShort,
   formatDate,
   formatMoney,
   formatTokens,
@@ -24,12 +23,14 @@ import {
   tagInfo,
   type Contract,
 } from '@/types'
-import { allUserOptions, changeContractStatus, claimProject, db, getAsset, patchContractFields, refresh, showError, type UserOption } from '@/api'
+import { allUserOptions, changeContractStatus, claimProject, db, getAsset, patchContractFields, refillProjectCart, refresh, showError, type UserOption } from '@/api'
 import TransferDialog from '@/components/TransferDialog.vue'
+import WithdrawProjectDialog from '@/components/WithdrawProjectDialog.vue'
 import { canWrite, isViewer, isAdmin, currentUser, NO_PERM_TIP } from '@/auth'
 
 // 生态人员（viewer）：数据已按「自己下单」在后端过滤，能进入本页即自己项目——
-// 允许编辑基本信息 + 终止合同（含撤销 delivered 交付）；交付仍仅商务/管理员。
+// ADR-028（2026-10-21）：订单提交后禁编辑（头部「编辑」不渲染 + goEdit 兜底拦截），
+// 权限退化为「只读 + 撤销 / 终止 / 重新提交（回购物车）」；交付、编辑仍仅商务/管理员。
 // 越权 URL 访问他人项目时 bootstrap 无该项目 → 上方 el-empty「未找到该销售项目」
 const canOwn = computed(() => canWrite.value || isViewer.value)
 
@@ -77,6 +78,50 @@ function openTransfer() {
   transferVisible.value = true
 }
 
+/**
+ * 撤销待审核订单（ADR-026 / TASK-FE-029）：仅 `pending` 且「本人下单（creator==当前登录）或 admin」可见。
+ * 商务（editor）不显示——商务走「驳回」；viewer 他人单不可见（后端 creator 归属守卫兜底）。
+ * 注：`ProjectOut` 自 2026-10-21 起已输出 `creator`（bootstrap 同步），按账号精确比对；
+ * 存量项目 creator 为空时按「可见即本人单」兜底（后端归属守卫兜底）。
+ */
+const canWithdraw = computed(() => {
+  const p = project.value
+  if (!p || p.status !== 'pending') return false
+  if (isAdmin.value) return true
+  if (canWrite.value) return false // 商务（editor）不显示，走驳回
+  const creator = (p.creator || '').trim()
+  return !creator || creator === currentUser.value?.username
+})
+const withdrawVisible = ref(false)
+/** 撤销成功后：刷新镜像（项目转 terminated + 购物车回填）后跳 /cart 改单重提 */
+async function onWithdrawn() {
+  await refresh()
+  router.push('/cart')
+}
+
+/**
+ * 重新提交（ADR-027 / TASK-FE-031）：已终止项目不再跳 create 页 copy 模式——
+ * 调 POST /projects/{id}/refill-cart 确保明细在下单人购物车（幂等）→ `refresh()` → 跳 /cart 改单重提。
+ * 失败 showError 并停留本页，不跳转。
+ */
+const refilling = ref(false)
+async function handleResubmit() {
+  const p = project.value
+  if (!p || refilling.value) return
+  refilling.value = true
+  try {
+    const res = await refillProjectCart(p.id)
+    await refresh()
+    const base = res.alreadyRefilled ? '明细已在购物车，可直接修改后提交' : '明细已回填购物车，可修改后提交'
+    ElMessage.success(res.skipped > 0 ? `${base}（${res.skipped} 行未能回填，请核对明细）` : base)
+    router.push('/cart')
+  } catch (e) {
+    showError(e, '重新提交失败')
+  } finally {
+    refilling.value = false
+  }
+}
+
 const route = useRoute()
 const router = useRouter()
 const projectId = computed(() => Number(route.params.id))
@@ -111,11 +156,16 @@ function goBack() {
 }
 
 function goEdit() {
+  // ADR-028（2026-10-21）：生态人员订单提交后禁编辑——兜底拦截（按钮已不渲染、路由也不放行 edit，
+  // 此判断仅防程序化调用/未来入口遗漏；后端 PUT 对 viewer 一律 403，双保险）
+  if (isViewer.value) {
+    ElMessage.warning('订单已提交，不可编辑，如需修改请「撤销」后重新下单')
+    return
+  }
   const p = project.value
   if (!p) return
-  // 2026-10-19：订单审核独立页——商务/管理员的 pending 单 → /review（仅订单审核+备注）；
-  // viewer 自己单始终 → /edit（可改基本信息 + 取消订单）；其余状态 → /edit
-  const toReview = !isViewer.value && p.status === 'pending'
+  // 2026-10-19：订单审核独立页——商务/管理员的 pending 单 → /review（仅订单审核+备注）；其余状态 → /edit
+  const toReview = p.status === 'pending'
   router.push(`/sales/projects/${p.id}/${toReview ? 'review' : 'edit'}`)
 }
 
@@ -185,6 +235,7 @@ async function terminateContract(c: Contract) {
 }
 
 async function changeContract(c: Contract, status: 'delivered' | 'terminated') {
+  if (actingContractId.value != null) return // BUG-10：已有合同状态变更在飞，忽略连点（按钮同时 loading+禁用）
   actingContractId.value = c.id
   try {
     await changeContractStatus(c.id, status)
@@ -277,61 +328,89 @@ async function submitDateDialog() {
               {{ tagInfo(PROJECT_STATUS, project.status).label }}
             </el-tag>
           </div>
-          <div class="desc" v-if="project">
-            编号 {{ project.code }} · 客户 {{ customerText }}
-            <template v-if="contracts.length"> · {{ contracts.length }} 份销售记录</template>
-          </div>
         </div>
+        <!-- FIX-20261022 / BUG-39：原 tooltip 包裹了整块动作按钮（hover 撤销/重新提交也会弹「已完成/已终止不可编辑」），
+             现收窄到「编辑 / 审核订单」按钮本身 -->
         <div class="head-actions" v-if="project">
-          <el-tooltip
-            :content="project.status === 'active' || project.status === 'pending' ? '' : '已完成 / 已终止项目不可编辑'"
-            :disabled="project.status === 'active' || project.status === 'pending'"
-            placement="top"
-          >
-            <span>
-              <!-- ADR-012 §5.1 纯移交制：无主→「接手」；有主→仅负责人「转交」（下拉选人）或 admin 越过；
-                   他人负责的单据对普通商务不显示（审核订单按钮仅接手人可见） -->
-              <el-button
-                v-if="canWrite && (project.status === 'pending' || project.status === 'active')
-                     && (!project.businessOwner
-                         || project.businessOwner === currentUser?.username
-                         || isAdmin)"
-                :type="project.businessOwner ? 'info' : 'success'"
-                @click="project.businessOwner ? openTransfer() : handleClaim()"
-              >
-                {{ project.businessOwner ? '转交' : '接手' }}
-              </el-button>
-              <!-- ADR-012 §5.1：pending 项目仅负责人/admin 可审核；2026-10-19：viewer 自己单可进编辑页
-                   （可改基本信息 + 取消订单），商务/管理员进独立审核页；无权限者显示禁用（禁止态）按钮 -->
-              <el-button
-                v-if="project.status === 'active' || (project.status === 'pending' && (canReview || isViewer))"
-                :icon="EditPen"
-                :type="project.status === 'pending' && !isViewer ? 'warning' : 'primary'"
-                :disabled="!canOwn"
-                @click="goEdit"
-              >
-                {{ project.status === 'pending' && !isViewer ? '审核订单' : '编辑' }}
-              </el-button>
-              <el-tooltip v-else-if="project.status !== 'pending'" content="含已交付或已终止的项目不可编辑" placement="top">
-                <el-button :icon="EditPen" disabled>编辑</el-button>
-              </el-tooltip>
-              <!-- 2026-10-20：重新提交——已终止（驳回/取消）项目由下单账号（或商务/管理员）
-                   预填原单明细（可改）重新下单，旧单保留终止历史（驳回原因可查） -->
-              <el-button
-                v-if="project.status === 'terminated' && (canWrite || isViewer)"
-                type="warning"
-                plain
-                @click="router.push(`/sales/projects/create?copy=${project.id}`)"
-              >
-                重新提交
-              </el-button>
-              <!-- 2026-10-19 排查修复：viewer 不能接手（claim 需 editor），换用不误导的文案 -->
-              <el-tooltip v-else :content="'待审核项目仅商务负责人（或管理员）可进入，请先接手'" placement="top">
-                <el-button :icon="EditPen" type="warning" disabled>审核订单</el-button>
-              </el-tooltip>
-            </span>
-          </el-tooltip>
+          <span>
+            <!-- ADR-012 §5.1 纯移交制：无主→「接手」；有主→仅负责人「转交」（下拉选人）或 admin 越过；
+                 他人负责的单据对普通商务不显示（审核订单按钮仅接手人可见） -->
+            <el-button
+              v-if="canWrite && (project.status === 'pending' || project.status === 'active')
+                   && (!project.businessOwner
+                       || project.businessOwner === currentUser?.username
+                       || isAdmin)"
+              :type="project.businessOwner ? 'info' : 'success'"
+              @click="project.businessOwner ? openTransfer() : handleClaim()"
+            >
+              {{ project.businessOwner ? '转交' : '接手' }}
+            </el-button>
+            <!-- ADR-012 §5.1：pending 项目仅负责人/admin 可审核（走独立审核页 /review）；active 可编辑基本信息。
+                 ADR-028（2026-10-21）：生态人员订单提交后禁编辑 → 头部「编辑」入口整块不渲染
+                 （连禁用态也不给；viewer 唯一改单路径 =「撤销」→ 购物车重下，后端 PUT 对 viewer 一律 403）
+                 FIX-20261022 / BUG-21：「交付中」纳入可编辑（与列表页 canEditProject / 后端 PUT 一致，
+                 原实现把 delivering 归到「不可编辑」分支，与列表页口径相反） -->
+            <el-tooltip
+              v-if="!isViewer && (project.status === 'active' || project.status === 'delivering'
+                   || (project.status === 'pending' && canReview))"
+              :content="canOwn ? '' : NO_PERM_TIP"
+              :disabled="canOwn"
+              placement="top"
+            >
+              <span>
+                <el-button
+                  :icon="EditPen"
+                  :type="project.status === 'pending' ? 'warning' : 'primary'"
+                  :disabled="!canOwn"
+                  @click="goEdit"
+                >
+                  {{ project.status === 'pending' ? '审核订单' : '编辑' }}
+                </el-button>
+              </span>
+            </el-tooltip>
+            <!-- ADR-026：待审核订单撤销（本人下单 / admin 可见）——终止原单 + 明细回填购物车 -->
+            <el-button
+              v-if="canWithdraw"
+              type="danger"
+              plain
+              @click="withdrawVisible = true"
+            >
+              撤销
+            </el-button>
+            <!-- ADR-028：viewer 不渲染任何「编辑」入口（含禁用态），故该只读提示按钮同样对 viewer 隐藏。
+                 FIX-20261022 / BUG-21：delivering 已可编辑，禁用态只保留「已完成」 -->
+            <el-tooltip v-if="!isViewer && project.status === 'delivered'" content="已完成项目不可编辑" placement="top">
+              <el-button :icon="EditPen" disabled>编辑</el-button>
+            </el-tooltip>
+            <!-- ADR-027（2026-10-21）：重新提交——已终止（驳回/终止）项目由下单账号（或商务/管理员）
+                 回填购物车（幂等）后跳 /cart 改单重提，旧单保留终止历史（驳回原因可查） -->
+            <el-button
+              v-if="project.status === 'terminated' && (canWrite || isViewer)"
+              type="warning"
+              plain
+              :loading="refilling"
+              :disabled="refilling"
+              @click="handleResubmit"
+            >
+              重新提交
+            </el-button>
+            <!-- 2026-10-19 排查修复：viewer 不能接手（claim 需 editor），换用不误导的文案
+                 FIX-20261021：改为独立 v-if——原 v-else 挂到了「重新提交」的 v-if 上，
+                 待审核项目会同时渲染「审核订单」与禁用态「审核订单」两个按钮 -->
+            <el-tooltip v-if="project.status === 'pending' && !canReview && !isViewer" :content="'待审核项目仅商务负责人（或管理员）可进入，请先接手'" placement="top">
+              <el-button :icon="EditPen" type="warning" disabled>审核订单</el-button>
+            </el-tooltip>
+          </span>
         </div>
+      </div>
+
+      <!-- ADR-028 Decision 5（2026-10-21）：撤销留痕可见性——撤销导致的终止单（terminated && cartRefilled）
+           在头部下方给一行浅色提示（复用全局 .info-bar 浅蓝底信息条，不新造配色/不加新布局块）；
+           撤销原因由合同 remark（「撤销：{原因}」）在下方销售记录卡片内展示，
+           「重新提交」入口复用头部既有按钮 -->
+      <div v-if="project && project.status === 'terminated' && project.cartRefilled" class="info-bar revoked-bar">
+        <el-icon aria-hidden="true"><InfoFilled /></el-icon>
+        <span>该订单已撤销，历史记录已保留；撤销原因见下方销售记录备注</span>
       </div>
 
       <el-empty v-if="!project" description="未找到该销售项目" :image-size="80" />
@@ -356,10 +435,6 @@ async function submitDateDialog() {
             <div class="info-item">
               <span class="il">客户名称</span>
               <span class="iv">{{ customerText }}</span>
-            </div>
-            <div class="info-item">
-              <span class="il">行业</span>
-              <span class="iv">{{ project.industry || '-' }}</span>
             </div>
             <div class="info-item">
               <span class="il">生态人员</span>
@@ -398,9 +473,6 @@ async function submitDateDialog() {
             <span class="bh-icon" aria-hidden="true"><el-icon><Tickets /></el-icon></span>
             <div>
               <div class="bh-title">销售记录清单</div>
-              <div class="bh-sub">
-                共 {{ contracts.length }} 份销售记录；项目状态由销售记录状态自动派生（待审核→待审核；进行中→进行中；交付中→交付中；全部完成→已完成；全部终止→已终止）。
-              </div>
             </div>
           </div>
 
@@ -408,12 +480,15 @@ async function submitDateDialog() {
             <div v-for="c in contracts" :key="c.id" class="contract-card" :class="`contract-${c.status}`">
               <div class="contract-head">
                 <div class="ch-left">
-                  <!-- DISCOUNT-20261021 批次（2026-10-21）：销售记录清单卡头去掉合同编号（HT-xxx）展示，
-                       保留主体徽标与状态；基本信息区「项目编号 SP-xxx」与列表页等其他页面合同编号展示不受影响 -->
-                  <span class="contract-customer">{{ c.customer }}</span>
-                  <el-tag v-if="c.subject" size="small" effect="plain" class="contract-subject">
-                    {{ entityShort(c.subject) }}
-                  </el-tag>
+                  <!-- 2026-10-21：卡头改为「甲方：客户名称；乙方：签约主体全称」文本式——
+                       甲方 = 生态人员下单时输入的客户名称；乙方 = 该项目签约主体全称（不再用简称徽标）。
+                       状态标签保留在右侧。 -->
+                  <span class="contract-party">
+                    <span class="cp-label">甲方：</span>{{ c.customer || '-' }}
+                  </span>
+                  <span v-if="c.subject" class="contract-party">
+                    <span class="cp-label">乙方：</span>{{ c.subject }}
+                  </span>
                   <el-tag :type="tagInfo(PROJECT_STATUS, c.status).tag" size="small" effect="light">
                     {{ tagInfo(PROJECT_STATUS, c.status).label }}
                   </el-tag>
@@ -440,7 +515,7 @@ async function submitDateDialog() {
                           type="primary"
                           size="small"
                           :loading="actingContractId === c.id"
-                          :disabled="!canWrite"
+                          :disabled="!canWrite || actingContractId === c.id"
                           @click="deliverContract(c)"
                         >
                           交付
@@ -455,7 +530,7 @@ async function submitDateDialog() {
                           plain
                           size="small"
                           :loading="actingContractId === c.id"
-                          :disabled="!canOwn"
+                          :disabled="!canOwn || actingContractId === c.id"
                           @click="terminateContract(c)"
                         >
                           终止
@@ -487,7 +562,7 @@ async function submitDateDialog() {
                           type="primary"
                           size="small"
                           :loading="actingContractId === c.id"
-                          :disabled="!canWrite"
+                          :disabled="!canWrite || actingContractId === c.id"
                           @click="deliverContract(c)"
                         >
                           交付
@@ -501,7 +576,7 @@ async function submitDateDialog() {
                           plain
                           size="small"
                           :loading="actingContractId === c.id"
-                          :disabled="!canOwn"
+                          :disabled="!canOwn || actingContractId === c.id"
                           @click="terminateContract(c)"
                         >
                           终止
@@ -568,7 +643,8 @@ async function submitDateDialog() {
               </div>
 
               <el-table v-if="c.items.length" :data="c.items" border size="small" class="contract-items">
-                <el-table-column label="产品" min-width="220">
+                <!-- TASK-FE-030：行高固定 36px 后产品列单行显示，超长名称（含编号）用 tooltip 兜底不丢信息 -->
+                <el-table-column label="产品" min-width="220" show-overflow-tooltip>
                   <template #default="{ row }">
                     <a class="link" @click="goAssetDetail(row.assetId)">{{ itemAssetName(row.assetId) }}</a>
                   </template>
@@ -684,6 +760,9 @@ async function submitDateDialog() {
 
       <!-- ADR-012 §5.1 纯移交制：转交对话框（负责人/admin，下拉选新负责人） -->
       <TransferDialog v-model="transferVisible" :project="transferTarget" />
+
+      <!-- ADR-026：撤销待审核订单（统一对话框；成功后刷新镜像并跳 /cart 改单重提） -->
+      <WithdrawProjectDialog v-model="withdrawVisible" :project="project" @done="onWithdrawn" />
     </div>
   </div>
 </template>
@@ -700,6 +779,10 @@ async function submitDateDialog() {
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
+}
+/* ADR-028：撤销提示条——只补间距，配色/边框/字号全部沿用全局 .info-bar（浅底 #f0f6ff / 边框 #e0ecff） */
+.revoked-bar {
+  margin-bottom: 16px;
 }
 .link {
   color: var(--primary-color);
@@ -749,14 +832,23 @@ async function submitDateDialog() {
   gap: 10px;
   flex-wrap: wrap;
 }
-/* DISCOUNT-20261021 批次（2026-10-21）：.contract-code 样式随销售记录清单卡头合同编号（HT-xxx）展示一并移除 */
-.contract-customer {
-  font-size: 14px;
-  font-weight: 600;
+/* 2026-10-21：卡头「甲方：客户 / 乙方：主体全称」文本式（甲方值加粗，标签次要色） */
+.contract-party {
+  font-size: 13px;
   color: var(--text-primary);
+  white-space: nowrap;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
-.contract-subject {
-  font-weight: 400;
+.cp-label {
+  color: var(--text-secondary);
+}
+/* 甲乙方之间的「；」分隔（用伪元素，不额外增加 DOM 文案） */
+.contract-party + .contract-party::before {
+  content: '；';
+  color: var(--text-secondary);
+  margin-right: 2px;
 }
 .op-actions {
   display: flex;
@@ -789,5 +881,22 @@ async function submitDateDialog() {
 }
 .contract-items {
   margin-top: 4px;
+}
+/* TASK-FE-030：明细表「表头行 / 数据行」行高统一 36px（多张卡片一致）。
+   只作用于本页 .contract-items，不改全局 .el-table；外框/分隔线/hover 沿用全局规范。
+   加高来源：size="small" 的 .el-table__cell padding:4px 0 与 .cell line-height:23px 叠加，
+   导致含换行/不同内容的数据行高于表头 —— 这里统一 padding:0 + 固定行高。 */
+.contract-items :deep(.el-table__header th.el-table__cell),
+.contract-items :deep(.el-table__body td.el-table__cell) {
+  height: 36px;
+  padding: 0;
+}
+/* 单元格文字：字号维持现有 13px（th 继承全局 13px），行高固定、单行省略 —— 不受继承行高差异影响，
+   22px 行高居中于 36px 单元格内，不裁切文字 */
+.contract-items :deep(.el-table__cell .cell) {
+  line-height: 22px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 </style>

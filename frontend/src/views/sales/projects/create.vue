@@ -48,7 +48,6 @@ import {
   getAsset,
   refresh,
   db,
-  resubmitProject,
   updateProject,
   allUserOptions,
   showError,
@@ -58,19 +57,15 @@ import {
 } from '@/api'
 import { canWrite, currentUser, isViewer, isAdmin, NO_PERM_TIP } from '@/auth'
 import TransferDialog from '@/components/TransferDialog.vue'
+import WithdrawProjectDialog from '@/components/WithdrawProjectDialog.vue'
 
 const route = useRoute()
 const router = useRouter()
 
 const isEdit = computed(() => route.path.endsWith('edit'))
 const projectId = computed(() => Number(route.params.id))
-/** 重新提交模式（2026-10-20）：?copy=<已终止项目id> → 预填原单明细（可改）→ 走 /resubmit 新建订单 */
-const copyProjectId = computed(() => Number(route.query.copy) || 0)
-// 2026-10-20 FIX-RESUBMIT：copy 模式预填守卫（viewer 归属 / 项目 terminated）全部通过并预填完成后置 true
-const copyPrefillOk = ref(false)
-// 2026-10-20 FIX-RESUBMIT：可提交口径对齐后端 /projects/{id}/resubmit（require_order + creator 归属校验）——
-// viewer 对自己下单的 terminated 项目可重新提交；普通新建（无 copy）viewer 仍禁用
-const canSubmit = computed(() => canWrite.value || (copyProjectId.value > 0 && copyPrefillOk.value))
+// 2026-10-21（ADR-027）：本页的「重新提交（原单明细预填）」模式已移除——
+// 「重新提交」改为回填购物车后跳 /cart，本页仅保留「新建」（无 id）与「编辑」（:id/edit）两种形态。
 
 const formRef = ref()
 const submitting = ref(false)
@@ -208,8 +203,12 @@ function onItemAssetChange(c: ContractDraft, it: ContractDraftItem) {
   if (it.itemId != null && !(a?.type === '遥感数据' && db.rsItems.some((r) => r.id === it.itemId && r.assetId === it.assetId))) {
     it.itemId = undefined
   }
-  // ADR-008：包量定价产品单价为参考值，不作为明细单价预填（单价由合同金额派生）
-  if (a && !isAmountMode(a) && !it.price && a.salePrice) it.price = a.salePrice
+  // FIX-20261022 / BUG-07：切换产品必须重置上一产品的单价/金额——原实现「仅 price 为空才预填」会让
+  // 上一产品的 price/amount 原样带到新产品（后端 unit 行直接采信前端 price → 错误单价/金额落库）。
+  // 重置即视为「未手改过」：旧产品下手改过的价格随产品切换一并丢弃（安全侧），再按新产品预填。
+  const amountMode = !!a && isAmountMode(a)
+  it.amount = 0 // amount 模式：合同金额必须人工重新录入；unit 模式：由 qty × price 重算
+  it.price = amountMode ? 0 : (a?.salePrice ?? 0)
   calcItemAmount(c, it)
 }
 
@@ -285,8 +284,9 @@ const canReviewEdit = computed(() => {
   return isAdmin.value || owner === currentUser.value?.username
 })
 /** 基本信息表单可编辑性（与后端 PUT 守卫同口径）：
- *  - viewer：可编辑**自己下单**的项目（2026-10-19 放开：pending/active 均可改基本信息，
- *    rep 锁本人不可改、负责人只读；审核改价仍仅限商务——已拆独立审核页）；
+ *  - viewer：ADR-028（2026-10-21）已收回编辑权——后端 PUT 对 viewer 一律 403，
+ *    本页对 viewer 的编辑访问在 onMounted 即被拦截（提示 + 回详情页），故下方 viewer 分支
+ *    实际不可达（保留为页面级兜底，视图仍按 creator 判定只读）；
  *  - 商务/管理员：pending 项目仅负责人/admin 可编辑（审核走独立审核页）；active 均可编辑 */
 const canEditForm = computed(() => {
   if (isViewer.value) {
@@ -355,16 +355,40 @@ async function handleClaimInPanel() {
 /** 2026-10-19：确认下单/驳回已迁至独立审核页 review.vue（reviewBusy 保留供本页接手按钮 loading） */
 const reviewBusy = ref(false)
 
+/**
+ * 撤销待审核订单（ADR-026 / TASK-FE-029）：仅 `pending` 且「本人下单（creator==当前登录）或 admin」可见。
+ * 商务（editor）不显示——商务走「驳回」；viewer 他人单不可见（后端 creator 归属守卫兜底）。
+ * 待审核单的「取消订单（终止）」由本动作取代（撤销 = 终止 + 明细回填购物车）。
+ * 注：`ProjectOut` 自 2026-10-21 起已输出 `creator`（bootstrap 同步），按账号精确比对；
+ * 存量项目 creator 为空时按「可见即本人单」兜底（后端归属守卫兜底）。
+ */
+const canWithdraw = computed(() => {
+  const p = editProject.value
+  if (!p || !isPendingEdit.value) return false
+  if (isAdmin.value) return true
+  if (canWrite.value) return false // 商务（editor）不显示，走驳回
+  const creator = (p.creator || '').trim()
+  return !creator || creator === currentUser.value?.username
+})
+const withdrawVisible = ref(false)
+/** 撤销成功后：刷新镜像（项目转 terminated + 购物车回填）后跳 /cart 改单重提 */
+async function onWithdrawn() {
+  await refresh()
+  router.push('/cart')
+}
+
 /** 终止项目（2026-10-19 生态放开）：项目级批量终止——非删除，记录留存、状态 terminated 后不可再编辑；
- *  pending 单 = 取消订单（释放锁定）；active 单 = 批量终止进行中销售记录。
+ *  active 单 = 批量终止进行中销售记录（pending 单的「取消订单」已由撤销取代，ADR-026）。
  *  后端 change_project_status 守卫：viewer 仅自己下单的项目；商务/admin 对 pending 仅走审核接口 */
 const terminating = ref(false)
 async function handleTerminateProject() {
   const p = editProject.value
-  if (!p) return
+  if (!p || terminating.value) return // BUG-10：请求期间按钮 loading+禁用，此处再兜一次
+  // FIX-20261022 / BUG-21：终止批量口径纳入「交付中」（与后端 change_project_status 的
+  // targets = active + delivering 一致，原只数 active 会把交付中记录漏掉，文案计数偏小）
   const n = isPendingEdit.value
     ? editContracts.value.length
-    : editContracts.value.filter((c) => c.status === 'active').length
+    : editContracts.value.filter((c) => c.status === 'active' || c.status === 'delivering').length
   const msg = isPendingEdit.value
     ? `取消该订单后项目将终止：数量锁定释放，记录留存、不可再编辑。确定取消？`
     : `终止项目「${p.name}」将终止名下 ${n} 份进行中销售记录（释放锁定数量，已交付不受影响）。记录留存、不可再编辑。确定终止？`
@@ -392,13 +416,21 @@ function validContracts(): ContractDraft[] {
   return contracts.filter((c) => c.items.some((it) => it.assetId))
 }
 
-/** 创建校验：≥1 份有效合同；每份客户必填；明细数量 > 0 且不超可售上限（可重复售卖不限制） */
+/**
+ * 创建校验：≥1 份有效合同；每份客户必填；明细数量 > 0；
+ * 数量上限按「同产品合计」口径（可重复售卖不限制）。
+ *
+ * FIX-20261022 / BUG-22：原逐行与可售数量比较，而后端 `_create_project_core` 是「先按 assetId 聚合
+ * demand 再与可售比较」——同一产品拆到多行/多份销售记录时，逐行校验会放过越界组合（只能靠后端 400 回滚）。
+ * 现改为先按 assetId 汇总，再逐产品与可售比较；遥感明细行数量仍恒 1。
+ */
 function validateContracts(): boolean {
   const valid = validContracts()
   if (!valid.length) {
     ElMessage.warning('请至少添加一份销售记录并选择产品')
     return false
   }
+  const demand = new Map<number, number>()
   for (const c of valid) {
     if (!c.customer.trim()) {
       ElMessage.warning('请为每份销售记录填写客户')
@@ -415,11 +447,6 @@ function validateContracts(): boolean {
         ElMessage.warning('遥感数据明细行数量固定为 1')
         return false
       }
-      const max = itemMax(it)
-      if (max !== undefined && it.qty > max) {
-        ElMessage.warning(`「${itemAsset(it)?.name ?? '产品'}」本单数量超出可售上限（可售 ${max}）`)
-        return false
-      }
       // ADR-008：包量定价行合同金额必须为正整数元
       const a = itemAsset(it)
       if (a && isAmountMode(a) && (!it.amount || !Number.isInteger(it.amount) || it.amount <= 0)) {
@@ -431,6 +458,17 @@ function validateContracts(): boolean {
         ElMessage.warning('服务开始日期不能晚于结束日期')
         return false
       }
+      demand.set(it.assetId, (demand.get(it.assetId) ?? 0) + it.qty)
+    }
+  }
+  // 「同产品合计 ≤ 可售」——与后端聚合口径一致（可重复售卖跳过）
+  for (const [assetId, qty] of demand) {
+    const a = getAsset(assetId)
+    if (!a || a.repeatSale) continue
+    const avail = availableQty(a) ?? 0
+    if (qty > avail) {
+      ElMessage.warning(`「${a.name}」本单数量合计 ${qty} 超出可售上限（可售 ${avail}）`)
+      return false
     }
   }
   return true
@@ -481,17 +519,23 @@ function buildPayload(withContracts: boolean): ProjectInput {
   return base
 }
 
-/** 预填：编辑模式带出项目基本信息；重新提交模式带出原单合同明细 */
+/** 预填：编辑模式带出项目基本信息；新建模式初始化 1 份空合同卡片 */
 onMounted(async () => {
   await refresh()
-  // 生态人员（viewer）：仅可编辑自己下单的项目；新建仅「重新提交」模式放行（?copy=，
-  // 且目标须为自己下单的已终止项目——页面内预填前再校验）；普通新建仍禁止（下单走产品下单入口）
+  // 生态人员（viewer）：新建一律禁止（下单走产品下单入口，「重新提交」已改为回填购物车跳 /cart，
+  // 见 ADR-027）；编辑亦已禁止（ADR-028，见下方拦截）
   if (isViewer.value && !isEdit.value) {
-    if (!copyProjectId.value) {
-      ElMessage.warning('生态人员新建项目请通过产品下单入口；已终止的自己的订单可「重新提交」')
-      router.replace('/sales/projects')
-      return
-    }
+    ElMessage.warning('生态人员新建项目请通过产品下单入口；已终止的自己的订单可「重新提交」')
+    router.replace('/sales/projects')
+    return
+  }
+  // ADR-028（2026-10-21）：生态人员订单提交后禁编辑——编辑模式对 viewer 一律请回详情页
+  // （路由守卫已不放行 /:id/edit，此处为页面级兜底；置于项目查找之前，避免无谓加载）。
+  // viewer 唯一改单路径 =「撤销」（明细回购物车）→ 重新下单
+  if (isEdit.value && isViewer.value) {
+    ElMessage.warning('订单已提交，不可编辑，如需修改请「撤销」后重新下单')
+    router.replace(`/sales/projects/${projectId.value}/detail`)
+    return
   }
   if (isEdit.value) {
     const p = db.projects.find((x) => x.id === projectId.value)
@@ -537,62 +581,6 @@ onMounted(async () => {
   }
   // 新建模式：默认 1 份合同卡片
   addContract()
-  // 2026-10-20：重新提交（?copy=）——预填原单合同明细（客户/产品/数量/金额/遥感明细行均可改）；
-  // 守卫：目标须为已终止项目（进行中/待审核请走取消/终止）；viewer 须为自下单（后端 creator 守卫兜底）
-  if (copyProjectId.value) {
-    const cp = db.projects.find((x) => x.id === copyProjectId.value)
-    if (!cp) {
-      ElMessage.warning('原项目不存在或无查看权限')
-      router.replace('/sales/projects')
-      return
-    }
-    if (isViewer.value && cp.creator && cp.creator !== currentUser.value?.username) {
-      ElMessage.warning('生态人员仅可重新提交自己下单的项目')
-      router.replace(`/sales/projects/${cp.id}/detail`)
-      return
-    }
-    if (cp.status !== 'terminated') {
-      ElMessage.warning('仅已终止的项目可重新提交（待审核/进行中请先取消或终止）')
-      router.replace(`/sales/projects/${cp.id}/detail`)
-      return
-    }
-    const oldContracts = db.contracts.filter((c) => c.projectId === cp.id)
-    contracts.splice(0, contracts.length)
-    oldContracts.forEach((c) => {
-      const draft: ContractDraft = {
-        customer: c.customer,
-        contractAmount: 0,
-        remark: '',
-        items: c.items.map((it) => ({
-          assetId: it.assetId,
-          itemId: it.itemId ?? undefined, // 遥感明细行保留（qty 恒 1）
-          qty: it.qty,
-          price: it.price,
-          amount: it.amount,
-          deliveryReq: it.deliveryReq ?? '',
-          // ADR-020（PRICING-20261020）：服务期限带出旧值可改
-          serviceStart: it.serviceStart ?? '',
-          serviceEnd: it.serviceEnd ?? '',
-          // ADR-018 §2：原价快照带出旧单值（仅展示，不提交；新单 orig 由后端下单时重新快照）
-          origPrice: it.origPrice ?? null,
-          origAmount: it.origAmount ?? null,
-        })),
-      }
-      contracts.push(draft)
-      // 2026-10-20（问题12d）：合同金额只读 = 明细合计，预填后按明细重算
-      recalcContractAmount(draft)
-    })
-    Object.assign(form, {
-      name: cp.name,
-      // viewer 静默本人（与下单口径一致）；商务沿用原单生态人员（姓名→账号归一）
-      rep: isViewer.value ? (currentUser.value?.username ?? form.rep) : normalizeRep(cp.rep),
-      expectedSignDate: cp.expectedSignDate,
-      lastFollowDate: cp.lastFollowDate,
-      remark: '', // 不继承旧备注（驳回原因在旧单合同留痕中）
-    })
-    // 2026-10-20 FIX-RESUBMIT：守卫全部通过且预填完成 → 放开提交按钮（校验失败跳回的路径不置位）
-    copyPrefillOk.value = true
-  }
   // 从「登记销售」等入口带客户预填时：首份合同客户 = 预填客户，项目名同步跟随
   const preCustomer = typeof route.query.customer === 'string' ? route.query.customer : ''
   if (preCustomer) {
@@ -603,12 +591,19 @@ onMounted(async () => {
   //（产品详情/列表下单入口统一收口购物车，router 已无该 query 入口，无其他调用路径）
 })
 
-/** 保存草稿：仅要求项目名称，后端强制状态为「待审核」（ADR-012 修订：所有角色建单统一 pending） */
+/**
+ * 保存草稿：项目名称必填 + **复用同一套合同校验**（FIX-20261022 / BUG-26）。
+ * 后端建单即「待审核」（ADR-012：所有角色统一 pending，无草稿态），若跳过合同校验会产出
+ * 0 明细 0 元的 pending 空单（审核必 400 且 pending 不可编辑 → 单据无出口）。
+ * FIX-20261022 / BUG-09：写操作补 catch（400/422 不再静默）。
+ */
 async function saveDraft() {
+  if (submitting.value) return // 双按钮共用 submitting：请求在飞期间忽略重复点击
   if (!form.name.trim()) {
     ElMessage.warning('请先填写项目名称再保存草稿')
     return
   }
+  if (!isEdit.value && !validateContracts()) return
   submitting.value = true
   try {
     if (isEdit.value) {
@@ -618,12 +613,15 @@ async function saveDraft() {
     }
     ElMessage.success('已保存草稿，项目状态为「待审核」（商务接手确认后生效）')
     router.push('/sales/projects')
+  } catch (e) {
+    showError(e, '保存失败')
   } finally {
     submitting.value = false
   }
 }
 
 async function handleSubmit() {
+  if (submitting.value) return // 双按钮共用 submitting：请求在飞期间忽略重复点击
   try {
     await formRef.value?.validate()
   } catch {
@@ -635,15 +633,14 @@ async function handleSubmit() {
     if (isEdit.value) {
       await updateProject(projectId.value, buildPayload(false))
       ElMessage.success('更新成功')
-    } else if (copyProjectId.value) {
-      // 2026-10-20：重新提交——新建 pending 订单（新编号），旧单保留终止历史
-      const created = await resubmitProject(copyProjectId.value, buildPayload(true))
-      ElMessage.success(`重新提交成功，新订单编号 ${created.code}（待审核）`)
     } else {
       const created = await createProject(buildPayload(true))
       ElMessage.success(`创建成功，项目编号 ${created.code}（${created.contractCount ?? validContracts().length} 份销售记录）`)
     }
     router.push('/sales/projects')
+  } catch (e) {
+    // FIX-20261022 / BUG-09：后端 400/422（库存不足、区间越界、服务期限非法…）此前完全静默
+    showError(e, '提交失败')
   } finally {
     submitting.value = false
   }
@@ -666,8 +663,7 @@ function handleCancel() {
             <el-icon><ArrowLeft /></el-icon>
             返回销售项目
           </a>
-          <!-- 2026-10-20：重新提交模式（?copy=）标题区分 -->
-          <h1>{{ isEdit ? '编辑销售项目' : (copyProjectId ? '重新提交销售项目' : '新建销售项目') }}</h1>
+          <h1>{{ isEdit ? '编辑销售项目' : '新建销售项目' }}</h1>
           <div class="desc">
             {{
               isEdit
@@ -821,17 +817,28 @@ function handleCancel() {
 
         <!-- 底部操作区：右对齐，不悬浮
              2026-10-19：确认下单/驳回/转交迁至独立审核页 /review；
-             新增「审核订单」跳转入口（商务/管理员 + 待审核）与「取消订单/终止项目」（生态自己单） -->
+             新增「审核订单」跳转入口（商务/管理员 + 待审核）与「撤销订单 / 终止项目」（生态自己单）；
+             ADR-026：待审核单的「取消订单（终止）」由「撤销订单」取代（终止 + 明细回填购物车），
+             非待审核的「终止项目」口径不变 -->
         <div class="bottom-actions">
           <el-button @click="handleCancel">返回</el-button>
           <el-button
-            v-if="isViewer && editProject?.creator === currentUser?.username"
+            v-if="canWithdraw"
+            type="danger"
+            plain
+            @click="withdrawVisible = true"
+          >
+            撤销订单
+          </el-button>
+          <el-button
+            v-if="isViewer && editProject?.creator === currentUser?.username && !isPendingEdit"
             type="danger"
             plain
             :loading="terminating"
+            :disabled="terminating"
             @click="handleTerminateProject"
           >
-            {{ isPendingEdit ? '取消订单（终止）' : '终止项目' }}
+            终止项目
           </el-button>
           <el-button v-if="canWrite && isPendingEdit" type="primary" plain @click="router.push(`/sales/projects/${projectId}/review`)">
             审核订单
@@ -968,12 +975,13 @@ function handleCancel() {
                     <span v-if="itemAsset(row) && isAmountMode(itemAsset(row)!)" class="muted">
                       {{ derivedUnitPrice(row.amount, row.qty, itemAsset(row)?.unit) }}
                     </span>
+                    <!-- FIX-20261022 / BUG-44（§6 硬约束）：金额类 el-input-number 一律 :controls="false"（无步进按钮） -->
                     <el-input-number
                       v-else
                       v-model="row.price"
                       :min="0"
                       :precision="2"
-                      controls-position="right"
+                      :controls="false"
                       style="width: 100%;"
                       @change="calcItemAmount(c, row)"
                     />
@@ -1130,17 +1138,15 @@ function handleCancel() {
         <!-- 底部操作区：右对齐，不悬浮 -->
         <div class="bottom-actions">
           <template v-if="!isEdit">
-            <!-- 2026-10-20 FIX-RESUBMIT：copy（重新提交）模式隐藏「保存草稿」——saveDraft 走 createProject 会丢旧单关联与双向留痕，只允许正式重新提交 -->
-            <el-tooltip v-if="!copyProjectId" :content="NO_PERM_TIP" :disabled="canWrite" placement="top">
+            <el-tooltip :content="NO_PERM_TIP" :disabled="canWrite" placement="top">
               <span>
                 <el-button plain :loading="submitting" :disabled="!canWrite" @click="saveDraft">保存草稿</el-button>
               </span>
             </el-tooltip>
-            <!-- 2026-10-20 FIX-RESUBMIT：提交口径用 canSubmit（对齐后端 resubmit 权限）；copy 模式文案改「重新提交」 -->
-            <el-tooltip :content="NO_PERM_TIP" :disabled="canSubmit" placement="top">
+            <el-tooltip :content="NO_PERM_TIP" :disabled="canWrite" placement="top">
               <span>
-                <el-button type="primary" :icon="CircleCheck" :loading="submitting" :disabled="!canSubmit" @click="handleSubmit">
-                  {{ copyProjectId ? '重新提交' : '创建项目' }}
+                <el-button type="primary" :icon="CircleCheck" :loading="submitting" :disabled="!canWrite" @click="handleSubmit">
+                  创建项目
                 </el-button>
               </span>
             </el-tooltip>
@@ -1160,6 +1166,9 @@ function handleCancel() {
 
       <!-- ADR-012 §5.1 纯移交制：转交对话框（负责人/admin，下拉选新负责人） -->
       <TransferDialog v-model="transferVisible" :project="transferTarget" />
+
+      <!-- ADR-026：撤销待审核订单（统一对话框；成功后刷新镜像并跳 /cart 改单重提） -->
+      <WithdrawProjectDialog v-model="withdrawVisible" :project="editProject ?? null" @done="onWithdrawn" />
     </div>
   </div>
 </template>

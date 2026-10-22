@@ -41,7 +41,7 @@ class AssetOut(_ORM):
     # 后端按类型权威决定（卫星Token → 'amount'），不接受前端入参。
     pricingMode: str = "unit"
     # 注：ADR-010 的 province/city/resolution/imageDate 出参已移除（ADR-011，列保留不删）；
-    # 遥感数据售卖粒度见 bootstrap.rsItems（RsItemOut[]）
+    # 遥感数据售卖粒度见 bootstrap.rsItems（RsItemOutWithSold[]，FIX-20261022-FOLLOWUP 起含派生 soldCount）
 
 
 class AssetInput(BaseModel):
@@ -58,7 +58,9 @@ class AssetInput(BaseModel):
     priceMin: float | None = Field(default=None, ge=0)
     priceMax: float | None = Field(default=None, ge=0)
     status: str
-    inboundDate: str
+    # ADR-036 §1（FORMS-20261022）：登记时间不再必填——不传/空 → 后端自动生成当天
+    # YYYY-MM-DD；传值仍走 _validate_date_str 校验（编辑页只读展示是前端约束）
+    inboundDate: str = ""
     expiryDate: str
     perpetual: bool
     spec: str
@@ -133,6 +135,15 @@ class ClaimInput(BaseModel):
     """POST /projects/{id}/claim（ADR-012 §5.1 纯移交制）：newOwner 空=接手给自己；
     非空=转交给该账号（仅当前负责人或 admin 可传，目标须为启用的商务/管理员账号）。"""
     newOwner: str = ""
+
+
+class WithdrawInput(BaseModel):
+    """POST /projects/{id}/withdraw（ADR-026）：生态人员撤销自己提交的待审核订单。
+
+    reason：必填，1–200 字（服务层 strip 后校验，空白 → 400「请填写撤销原因」，
+    超长 → 400「撤销原因不能超过 200 字」）。缺省空串（而非 422）便于统一 400 文案。
+    """
+    reason: str = ""
 
 
 # ============================================================
@@ -317,6 +328,9 @@ class ProjectOut(_ORM):
     customer: str
     industry: str
     rep: str
+    # 下单账号（username；存量项目为空串）。ADR-026：生态人员「撤销」按 creator 判定归属，
+    # 前端也需要该字段做「本人单」按钮显隐（此前 ProjectOut 漏输出，导致前端只能靠可见性兜底）
+    creator: str = ""
     businessOwner: str  # 商务负责人（存量项目为空，前端显示 "-"）
     subject: str
     status: str
@@ -329,6 +343,8 @@ class ProjectOut(_ORM):
     remark: str
     items: list[ProjectItemOut]
     contractCount: int = 0  # 合同数量（ADR-007 派生，Project.contractCount 属性）
+    # 明细是否已回填购物车（ADR-027 幂等标记）：前端「重新提交」据此提示「明细已在购物车」
+    cartRefilled: bool = False
     createdAt: str
     updatedAt: str
 
@@ -390,28 +406,46 @@ class BaseRecordOut(_ORM):
 
 
 # ============================================================
-# 交付物
+# 资产主体（ADR-035，ENTITIES-20261022）
 # ============================================================
-class DeliverableTemplateInput(BaseModel):
+class EntityInput(BaseModel):
+    # 长度校验在服务层 trim 后进行（name 2–64 字、short 1–32 字，400）
     name: str
-    category: str
-    required: bool
-    note: str = ""
+    short: str
 
 
-class DeliverableTemplateOut(_ORM):
+class EntityOut(_ORM):
     id: int
     name: str
-    category: str
-    required: bool
-    note: str
+    short: str
+    createdAt: str
+    updatedAt: str
 
 
+# ============================================================
+# 交付物（ADR-024：模板体系下线，实例完全手动维护；每项可挂单文件附件 file）
+# ============================================================
 class AssetDeliverableInput(BaseModel):
     name: str
     category: str
     required: bool
     note: str = ""
+
+
+class AssetDeliverableUpdate(BaseModel):
+    """PUT /assets/{id}/deliverables/{did} 入参（BUG-20 / FIX-20261022：裸 dict → Pydantic）。
+
+    全部字段可选，语义为**部分更新**：未传 = 保持原值（路由层按 `model_fields_set` 取 patch）。
+    非法类型 422（此前裸 dict + setattr 可写脏值）。`file`：散列文件名；`""`/null = 清空附件。
+    """
+    name: str | None = None
+    category: str | None = None
+    required: bool | None = None
+    note: str | None = None
+    version: str | None = None
+    meta: str | None = None
+    status: str | None = None
+    file: str | None = None
 
 
 class AssetDeliverableOut(_ORM):
@@ -423,6 +457,7 @@ class AssetDeliverableOut(_ORM):
     version: str
     meta: str
     status: str
+    file: str | None = None  # ADR-024：单文件附件散列名（空/NULL=无附件）
     updatedAt: str
 
 
@@ -533,6 +568,25 @@ class CartPatchInput(BaseModel):
     discountRate: float | None = None  # 0-1 小数；null=清空（无折扣）
 
 
+class CartQtyUpdate(BaseModel):
+    """PUT /cart/{id} 入参（BUG-20 / FIX-20261022：裸 dict → Pydantic）。
+
+    语义与 CART-PATCH-20261021 一致：`qty` 必传；其余字段**未传 = 保持原值，显式 null = 清空**
+    （路由层用 `model_fields_set` 判断）。非法类型（如 `{"qty":"abc"}`）由 Pydantic 422 拦截，
+    不再 500 或写脏值。
+    """
+    qty: int
+    amount: float | None = None
+    serviceStart: str | None = None
+    serviceEnd: str | None = None
+    discountRate: float | None = None
+
+
+class OutboundRevertInput(BaseModel):
+    """POST /outbounds/{id}/revert 入参（BUG-20：裸 dict → Pydantic）。reason 选填。"""
+    reason: str = ""
+
+
 class CartBatchInput(BaseModel):
     items: list[CartItemInput]
 
@@ -554,6 +608,9 @@ class CheckoutInput(BaseModel):
     """购物车下单（ADR-007）：按购物车行级 customer 分组，每客户一个合同。
 
     customer 字段保留兼容（可选，不再参与分组）——行级 customer 为空直接 400。
+    requestId（BUG-10 / ADR-033 §1，可选）：前端 `crypto.randomUUID()`，同一次提交重试沿用；
+    后端以 `(userId, requestId)` 唯一记录 24h，重复请求返回首次项目（`idempotent: true`）。
+    不传 = 退化旧行为（无幂等保护，不做任何校验变更）。
     """
     projectName: str = ""
     customer: str = ""  # 兼容保留，不参与分组（行级 customer 为准）
@@ -563,6 +620,7 @@ class CheckoutInput(BaseModel):
     expectedSignDate: str = ""
     remark: str = ""
     deliveryReq: str = ""
+    requestId: str | None = None  # 幂等键（可选，建议 UUID；≤64 字符）
 
 
 class SaleOrderItemInput(BaseModel):

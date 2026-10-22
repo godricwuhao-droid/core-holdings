@@ -2,8 +2,14 @@
 
 实现约束（架构决策，禁止偏离）：
 - JWT HS256 自实现，仅用标准库 hmac/hashlib/base64/json，不引入新依赖；
-  exp 7 天；secret 取环境变量 JWT_SECRET，默认值仅用于本地开发，
-  **生产环境必须通过环境变量更换 JWT_SECRET**。
+  exp 7 天。**JWT_SECRET 缺失/等于内置开发值时（BUG-11 / ADR-034 §1）**：
+  `APP_ENV != "dev"` → 启动 fail-fast（RuntimeError，进程不启动）；
+  dev → **持久化开发密钥文件**（`backend/.jwt_secret`，0600，内容 64 字节 urlsafe
+  随机串）：文件存在即复用 → `--reload` 热重载/重启不再使全部 token 失效
+  （FIX-20261022-FOLLOWUP；此前为进程内随机密钥，每次重启集体掉登录）。
+  该文件被 `.gitignore` 忽略，禁止提交；生产必须走环境变量 `JWT_SECRET`。
+- JWT 携带 `ver`（users.tokenVersion）；`get_current_user` 每请求比对，不一致 → 401。
+  改密/禁用/改角色时 tokenVersion += 1（旧 token 立即失效）。**不提供 /auth/logout**（ADR-034 §3）。
 - 密码：hashlib.pbkdf2_hmac('sha256', pwd, salt, 100_000) + 16 字节随机 salt，
   存储格式 `pbkdf2$<salt_hex>$<hash_hex>`；明文密码不出现在任何响应体/日志中。
 - 固定三角色：admin（管理）/ editor（可编辑）/ viewer（只读），不做动态权限表。
@@ -15,6 +21,7 @@ import json
 import os
 import secrets
 import time
+from collections import OrderedDict
 from datetime import datetime
 
 from fastapi import Depends, HTTPException
@@ -24,9 +31,128 @@ from sqlalchemy.orm import Session
 from . import models
 from .database import get_db
 
-# 默认值仅供本地开发；生产必须设置环境变量 JWT_SECRET 更换
-JWT_SECRET = os.getenv("JWT_SECRET", "core-holdings-local-dev-secret-change-in-production")
+# ---- JWT 密钥（BUG-11 / ADR-034 §1；FIX-20261022-FOLLOWUP 起 dev 持久化）----
+DEV_DEFAULT_SECRET = "core-holdings-local-dev-secret-change-in-production"
+APP_ENV = (os.getenv("APP_ENV") or "dev").strip().lower()
 JWT_EXPIRE_DAYS = 7
+
+# backend/ 目录（与默认 SQLite `backend/core_holdings.db` 同级）——不存在则自动创建
+BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# 开发密钥文件：内容 = 64 字节 urlsafe 随机串，权限 0600，已在 .gitignore 中忽略
+DEV_SECRET_FILE = os.path.join(BACKEND_DIR, ".jwt_secret")
+
+
+def _read_dev_secret(path: str) -> str:
+    """读开发密钥文件；不存在 / 不可读 / 空内容一律返回 ""（由调用方重新生成）。"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
+def _chmod_private(path: str) -> None:
+    """尽力把密钥文件收敛到 0600（仅属主可读写）；失败不阻塞启动。"""
+    try:
+        if os.stat(path).st_mode & 0o077:
+            os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def _atomic_write_secret(path: str, secret: str) -> None:
+    """原子落盘：同目录临时文件（0600 创建）→ os.replace，避免并发读到半截内容。"""
+    tmp = f"{path}.{os.getpid()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(secret)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    _chmod_private(path)
+
+
+def _load_or_create_dev_secret(path: str) -> tuple[str, str]:
+    """返回 (secret, 来源)；来源 ∈ reuse / create / regenerate / ephemeral。
+
+    - 文件存在且非空 → **复用**（重复启动 / `--reload` 热重载不换密钥 → token 不再集体失效）
+    - 文件不存在 → `O_CREAT|O_EXCL` 原子创建（0600），写入 64 字节 urlsafe 随机串
+    - 已存在但为空 / 不可读 → 原子覆盖重新生成（不让空文件把服务钉死在随机密钥上）
+    - 目录不可写（只读 FS / 权限不足）→ 退回进程内随机密钥（等价旧行为，仅 dev）
+    """
+    existing = _read_dev_secret(path)
+    if existing:
+        _chmod_private(path)
+        return existing, "reuse"
+    fresh = secrets.token_urlsafe(48)  # 48 字节 → 64 字节 urlsafe 串（无填充）
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        # 并发启动（另一进程刚创建）或「存在但为空」：复读一次，仍空才覆盖
+        again = _read_dev_secret(path)
+        if again:
+            _chmod_private(path)
+            return again, "reuse"
+        try:
+            _atomic_write_secret(path, fresh)
+            return fresh, "regenerate"
+        except OSError:
+            return fresh, "ephemeral"
+    except OSError:
+        return fresh, "ephemeral"
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(fresh)
+            f.flush()
+            os.fsync(f.fileno())
+    except OSError:
+        try:
+            os.remove(path)  # 清掉可能写了一半的文件
+        except OSError:
+            pass
+        return fresh, "ephemeral"
+    _chmod_private(path)
+    return fresh, "create"
+
+
+_SECRET_SOURCE_TEXT = {
+    "reuse": "读取已有密钥文件，重启/热重载不换密钥",
+    "create": "首次生成并落盘",
+    "regenerate": "文件为空/不可读，已重新生成",
+    "ephemeral": "密钥文件不可写，退回进程内随机密钥",
+}
+
+
+def _resolve_jwt_secret() -> str:
+    """密钥优先级：`JWT_SECRET` 环境变量（非默认值）> 开发密钥文件 > 生成并落盘。"""
+    env_secret = (os.getenv("JWT_SECRET") or "").strip()
+    if env_secret and env_secret != DEV_DEFAULT_SECRET:
+        return env_secret
+    reason = "未设置 JWT_SECRET" if not env_secret else "JWT_SECRET 等于内置开发默认值"
+    if APP_ENV != "dev":
+        raise RuntimeError(
+            f"[security] 启动中止：{reason}。生产环境（APP_ENV={APP_ENV}）必须通过环境变量 "
+            "JWT_SECRET 指定强随机密钥（否则任何拿到源码的人都可离线签发管理员 token）。"
+        )
+    secret, source = _load_or_create_dev_secret(DEV_SECRET_FILE)
+    print(
+        f"[security] {reason}（APP_ENV=dev）：JWT 密钥使用持久化开发密钥文件 "
+        f"{DEV_SECRET_FILE}（{_SECRET_SOURCE_TEXT[source]}，权限 0600）；"
+        "生产部署必须改用环境变量 JWT_SECRET。"
+    )
+    if source == "ephemeral":
+        print("[security] ⚠️  密钥文件无法落盘：重启后全部 token 失效、需重新登录。")
+    return secret
+
+
+JWT_SECRET = _resolve_jwt_secret()
 
 ROLES = ("admin", "editor", "viewer")
 EDITOR_ROLES = ("admin", "editor")
@@ -77,6 +203,8 @@ def jwt_encode(user: models.User) -> str:
     payload = _b64url_encode(json.dumps({
         "sub": str(user.id),
         "username": user.username,
+        # 凭据版本（BUG-11 / ADR-034 §2）：改密/禁用/改角色时 +1，旧 token 立即失效
+        "ver": int(user.tokenVersion or 0),
         "iat": now,
         "exp": now + JWT_EXPIRE_DAYS * 86400,
     }, separators=(",", ":")).encode())
@@ -108,14 +236,13 @@ def jwt_decode(token: str) -> dict:
 # ============================================================
 # 认证 / 角色依赖
 # ============================================================
-def get_current_user(
-    credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
-    db: Session = Depends(get_db),
-) -> models.User:
-    """所有受保护端点的认证依赖：解析 JWT → 查用户（不存在/禁用 → 401）"""
-    if credentials is None or not credentials.credentials:
-        raise HTTPException(401, "未登录或登录已过期")
-    payload = jwt_decode(credentials.credentials)
+def user_from_token(db: Session, raw_token: str) -> models.User:
+    """JWT → 用户（唯一解析实现，Bearer 头与 `?token=` 双通道共用）。
+
+    校验链：签名/过期（jwt_decode）→ sub 查用户（不存在/禁用 401）→
+    **tokenVersion 比对**（BUG-11：改密/禁用/改角色后旧 token 立即失效）。
+    """
+    payload = jwt_decode(raw_token)
     try:
         user_id = int(payload.get("sub") or 0)
     except (TypeError, ValueError):
@@ -123,7 +250,19 @@ def get_current_user(
     user = db.get(models.User, user_id)
     if user is None or not user.enabled:
         raise HTTPException(401, "未登录或登录已过期")
+    if int(payload.get("ver", 0) or 0) != int(user.tokenVersion or 0):
+        raise HTTPException(401, "登录状态已失效，请重新登录")
     return user
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
+    db: Session = Depends(get_db),
+) -> models.User:
+    """所有受保护端点的认证依赖：解析 JWT → 查用户（不存在/禁用/tokenVersion 不符 → 401）"""
+    if credentials is None or not credentials.credentials:
+        raise HTTPException(401, "未登录或登录已过期")
+    return user_from_token(db, credentials.credentials)
 
 
 def require_editor(user: models.User = Depends(get_current_user)) -> models.User:
@@ -184,29 +323,70 @@ def user_out(user: models.User) -> dict:
 
 
 # ============================================================
-# 登录失败限流（进程内计数，标准库实现，无新依赖）
-# 同一用户名 15 分钟内连续失败 ≥ 10 次 → 锁定 15 分钟（防撞库；
-# 单实例部署够用；多 worker 部署下为每进程独立计数，保守但仍有效）。
+# 登录失败限流（BUG-12 / ADR-034 §4；进程内计数，标准库实现，无新依赖）
+# 双维度，均 15 分钟滑动窗口：
+# - `(ip, username)` 维度：10 次 → 拦截（防针对性撞库）；
+# - 纯 IP 维度：30 次 → 拦截（防换用户名喷洒）。
+# 超限返回 429「登录尝试过于频繁，请稍后再试」；**不做全局封账号**（不因单账号计数锁死他人）。
+# 结构有界：最多 10k 键，LRU 淘汰最旧键（防内存无界增长）。
+# 单实例部署够用；多 worker 部署下为每进程独立计数，保守但仍有效。
 # ============================================================
-_LOGIN_FAIL_WINDOW = 15 * 60   # 秒
-_LOGIN_FAIL_LIMIT = 10
-_login_fails: dict[str, list[float]] = {}
+_LOGIN_WINDOW = 15 * 60          # 秒
+_LOGIN_PAIR_LIMIT = 10           # (ip, username) 维度阈值
+_LOGIN_IP_LIMIT = 30             # 纯 IP 维度阈值
+_LOGIN_MAX_KEYS = 10_000         # 计数结构上界（LRU）
+_login_fails: "OrderedDict[str, list[float]]" = OrderedDict()
 
 
-def login_locked(username: str) -> bool:
-    """该用户名当前是否处于登录失败锁定中"""
-    now = time.time()
-    fails = [t for t in _login_fails.get(username, []) if now - t < _LOGIN_FAIL_WINDOW]
-    _login_fails[username] = fails
-    return len(fails) >= _LOGIN_FAIL_LIMIT
+def _login_key(ip: str, username: str = "") -> str:
+    return f"{ip}|{(username or '').strip().lower()}"
 
 
-def login_failed(username: str) -> None:
-    now = time.time()
-    fails = [t for t in _login_fails.get(username, []) if now - t < _LOGIN_FAIL_WINDOW]
+def _recent(key: str, now: float) -> list[float]:
+    fails = [t for t in _login_fails.get(key, []) if now - t < _LOGIN_WINDOW]
+    if fails:
+        _login_fails[key] = fails
+        _login_fails.move_to_end(key)
+    else:
+        _login_fails.pop(key, None)
+    return fails
+
+
+def _remember(key: str, now: float) -> None:
+    fails = _recent(key, now)
     fails.append(now)
-    _login_fails[username] = fails
+    _login_fails[key] = fails
+    _login_fails.move_to_end(key)
+    while len(_login_fails) > _LOGIN_MAX_KEYS:
+        _login_fails.popitem(last=False)  # LRU 淘汰最旧键
 
 
-def login_succeeded(username: str) -> None:
-    _login_fails.pop(username, None)
+def login_blocked(ip: str, username: str) -> bool:
+    """当前来源是否应被拦截（(ip, username) ≥10 或 纯 IP ≥30，15 分钟窗口）"""
+    now = time.time()
+    if len(_recent(_login_key(ip, username), now)) >= _LOGIN_PAIR_LIMIT:
+        return True
+    return len(_recent(_login_key(ip), now)) >= _LOGIN_IP_LIMIT
+
+
+def login_failed(ip: str, username: str) -> None:
+    now = time.time()
+    _remember(_login_key(ip, username), now)
+    _remember(_login_key(ip), now)
+
+
+def login_succeeded(ip: str, username: str) -> None:
+    # 成功只清 `(ip, username)` 计数；纯 IP 计数保留（避免用一次成功登录洗白喷洒计数）
+    _login_fails.pop(_login_key(ip, username), None)
+
+
+# 用户不存在时用于「恒定时间」的一次 PBKDF2（BUG-12：时间差不可用于枚举账号）
+_DUMMY_PASSWORD_HASH = hash_password(secrets.token_urlsafe(16))
+
+
+def verify_password_or_dummy(password: str, stored: str | None) -> bool:
+    """用户不存在（stored 为 None）时仍执行一次同参数 PBKDF2，抹平响应时间差。"""
+    if not stored:
+        verify_password(password, _DUMMY_PASSWORD_HASH)
+        return False
+    return verify_password(password, stored)

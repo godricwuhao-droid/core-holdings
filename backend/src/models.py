@@ -89,6 +89,11 @@ class Project(Base):
     expectedSignDate: Mapped[str] = mapped_column(String(32), default="")
     lastFollowDate: Mapped[str] = mapped_column(String(32), default="")
     remark: Mapped[str] = mapped_column(Text, default="")
+    # 明细是否已回填购物车（ADR-027 幂等标记，默认 False）：
+    # withdraw（撤销待审核订单）回填成功后置 True；POST /projects/{id}/refill-cart
+    # （「重新提交」收口购物车）见 True 直接返回 alreadyRefilled=true，不再重复回填
+    # （避免同一明细在购物车翻倍）。被驳回的历史项目保持 False（首次点重新提交才回填）。
+    cartRefilled: Mapped[bool] = mapped_column(Boolean, default=False)
     createdAt: Mapped[str] = mapped_column(String(32), default="")
     updatedAt: Mapped[str] = mapped_column(String(32), default="")
 
@@ -242,6 +247,10 @@ class OpLog(Base):
     time: Mapped[str] = mapped_column(String(32), default="")
     # 关联产品 id（target='asset' 时记录，便于按产品追溯操作日志）；存量数据为 NULL
     assetId: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 关联项目 id（target='project' 时记录；FIX-20261022/BUG-13，ADR-030 §4）：
+    # 生态人员（viewer）日志可见性**唯一依据 = 结构化外键**，不再用 detail 文本正则/项目名匹配。
+    # 存量 project 日志为 NULL（对 viewer 一律过滤，宁可保守不漏放）。
+    projectId: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # 字段级变更描述（如「销售单价: 330,000 元 → 3,200,000 元；产品总数: 10 → 12 台」，金额单位=元）；
     # 仅 update_asset 有实际变更时写入，其余日志点为空
     changes: Mapped[str] = mapped_column(String(512), default="")
@@ -279,15 +288,25 @@ class BaseRecord(Base):
     remark: Mapped[str] = mapped_column(String(255), default="")
 
 
-class DeliverableTemplate(Base):
-    __tablename__ = "deliverable_templates"
+class Entity(Base):
+    """资产主体（ADR-035，ENTITIES-20261022）：我司签约主体清单，单一事实来源。
+
+    - name = 公司全称（UNIQUE），与 `assets.subject` 存储口径一致；
+    - short = 展示简称（前端 entityShort 映射，改简称不动代码）；
+    - 存量回填：`INSERT ... SELECT DISTINCT subject FROM assets WHERE subject<>''`
+      （main.py 标记化一次性动作 ADR035_entities_backfill，short 默认取 name）。
+    """
+
+    __tablename__ = "entities"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    type: Mapped[str] = mapped_column(String(64), index=True)
-    name: Mapped[str] = mapped_column(String(128), default="")
-    category: Mapped[str] = mapped_column(String(32), default="install")
-    required: Mapped[bool] = mapped_column(Boolean, default=False)
-    note: Mapped[str] = mapped_column(String(255), default="")
+    name: Mapped[str] = mapped_column(String(128), unique=True, index=True)  # 公司全称
+    short: Mapped[str] = mapped_column(String(64), default="")  # 展示简称（默认=name）
+    createdAt: Mapped[str] = mapped_column(String(32), default="")
+    updatedAt: Mapped[str] = mapped_column(String(32), default="")
+
+
+# ADR-024：交付物模板体系（模型与表）已下线删除，旧表物理清理见 main.py 迁移
 
 
 class AssetDeliverable(Base):
@@ -302,6 +321,7 @@ class AssetDeliverable(Base):
     version: Mapped[str] = mapped_column(String(32), default="V1.0")
     meta: Mapped[str] = mapped_column(String(255), default="")
     status: Mapped[str] = mapped_column(String(16), default="ready")
+    file: Mapped[str | None] = mapped_column(String(255), nullable=True)  # ADR-024：单文件附件（散列名，空/NULL=无附件）
     updatedAt: Mapped[str] = mapped_column(String(32), default="")
 
     asset: Mapped["Asset"] = relationship(back_populates="deliverables")
@@ -329,6 +349,44 @@ class User(Base):
     name: Mapped[str] = mapped_column(String(50), default="")
     role: Mapped[str] = mapped_column(String(20), default="viewer")  # admin / editor / viewer
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    # 凭据版本（BUG-11 / ADR-034 §2）：写入 JWT payload 的 ver 字段，get_current_user 每请求比对；
+    # 改密 / 禁用 / 改角色时 +1 → 旧 token 立即失效（无需 refresh token 机制）。
+    # 存量账号由启动迁移补列并置 0（旧 token 无 ver 字段按 0 处理，仍然有效直至过期）。
+    tokenVersion: Mapped[int] = mapped_column(Integer, default=0)
+    createdAt: Mapped[str] = mapped_column(String(32), default="")
+
+
+class SchemaMigration(Base):
+    """迁移执行标记（BUG-01 / ADR-031）：所有**数据类**一次性动作必须先查标记、执行后写标记。
+
+    启动期只允许结构迁移（CREATE TABLE/INDEX、ALTER TABLE ADD COLUMN、幂等 DROP 废弃表）；
+    禁止对业务表执行无标记的 DELETE/UPDATE——「一次性」不能靠「业务状态为空」当幂等条件。
+    """
+
+    __tablename__ = "schema_migrations"
+
+    name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    appliedAt: Mapped[str] = mapped_column(String(32), default="")
+    note: Mapped[str] = mapped_column(String(255), default="")
+
+
+class IdempotencyRecord(Base):
+    """请求幂等键（BUG-10 / ADR-033 §1）：`POST /cart/checkout` 的 `(userId, requestId)` 唯一。
+
+    首次请求建单后写入记录（projectId 指向首次生成的项目）；同一键在保留期（24h）内重复请求
+    直接返回首次项目（`idempotent: true`），不重复建单/锁量/清购物车。
+    """
+
+    __tablename__ = "idempotency"
+    __table_args__ = (
+        UniqueConstraint("userId", "scope", "requestId", name="uq_idempotency_key"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    userId: Mapped[str] = mapped_column(String(64), default="", index=True)  # cart/下单口径 = users.id 字符串
+    scope: Mapped[str] = mapped_column(String(32), default="checkout")  # 幂等作用域（当前仅 checkout）
+    requestId: Mapped[str] = mapped_column(String(64), default="")  # 前端 crypto.randomUUID()
+    projectId: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 首次请求生成的项目 id
     createdAt: Mapped[str] = mapped_column(String(32), default="")
 
 

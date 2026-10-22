@@ -13,6 +13,7 @@ import {
   OUTBOUND_TYPES,
   availableQty,
   defaultOutboundType,
+  formatAssetQty,
   formatMoney,
   formatWan,
   noSellableStock,
@@ -75,6 +76,17 @@ const createDialog = reactive({
 
 function typeLabel(t: string): string {
   return OUTBOUND_TYPES[t as OutboundType] || t
+}
+
+/**
+ * 数量/额度展示（FIX-20261022 / BUG-37）：按产品 `pricingMode` 选口径——
+ * 包量定价（amount，卫星 Token）走 `formatTokens`（300000000 → 「3 亿」），
+ * 其余走 `formatWan`（千分位原数）。原实现一律 `formatWan`，Token 交付记录显示 300,000,000。
+ * 产品已删除（getAsset 取不到）时回退 formatWan。
+ */
+function qtyText(o: Pick<Outbound, 'assetId' | 'qty'>): string {
+  const a = getAsset(o.assetId)
+  return a ? formatAssetQty(a, o.qty) : formatWan(o.qty)
 }
 
 /** 页面统计（仅统计未撤销记录） */
@@ -141,7 +153,8 @@ async function confirmCreate() {
     if (a && !a.repeatSale) {
       const avail = availableQty(a) ?? 0
       if (f.qty > avail) {
-        ElMessage.warning(`「${a.name}」可售 ${formatWan(avail)}${a.unit}，本次交付 ${f.qty} 超出可售数量，请调整数量或改选“历史补录”`)
+        // FIX-20261022 / BUG-37：可售副文案同口径（amount 模式走 formatTokens）
+        ElMessage.warning(`「${a.name}」可售 ${formatAssetQty(a, avail)}${a.unit}，本次交付 ${f.qty} 超出可售数量，请调整数量或改选“历史补录”`)
         return
       }
     }
@@ -177,7 +190,7 @@ async function handleRevert(o: Outbound) {
   let reason = ''
   try {
     const { value } = await ElMessageBox.prompt(
-      `撤销交付 ${o.code}（${o.assetName} ${formatWan(o.qty)}${o.unit}）将反向更新产品数量${o.contractId ? '，并把销售记录回退到「交付中」（ADR-019：签订时间保留，可再次交付）' : ''}，请填写撤销原因。`,
+      `撤销交付 ${o.code}（${o.assetName} ${qtyText(o)}${o.unit}）将反向更新产品数量${o.contractId ? '，并把销售记录回退到「交付中」（ADR-019：签订时间保留，可再次交付）' : ''}，请填写撤销原因。`,
       '撤销交付',
       {
         inputPattern: /\S+/,
@@ -190,10 +203,15 @@ async function handleRevert(o: Outbound) {
   } catch {
     return
   }
-  await revertOutbound(o.id, reason)
-  // 2026-10-19：撤销合同交付会联动回滚合同（项目状态同步重算），提示中体现；
-  // ADR-019（PRICING-20261020）：回退目标由「进行中」改为「交付中」（signedDate 仍在，合同回 delivering）
-  ElMessage.success(o.contractId ? '已撤销：产品数量已回退，销售记录已回退「交付中」' : '已撤销并生成调整流水')
+  // FIX-20261022 / BUG-09：补 catch（后端 400「已撤销过/无产品」等此前完全静默）
+  try {
+    await revertOutbound(o.id, reason)
+    // 2026-10-19：撤销合同交付会联动回滚合同（项目状态同步重算），提示中体现；
+    // ADR-019（PRICING-20261020）：回退目标由「进行中」改为「交付中」（signedDate 仍在，合同回 delivering）
+    ElMessage.success(o.contractId ? '已撤销：产品数量已回退，销售记录已回退「交付中」' : '已撤销并生成调整流水')
+  } catch (e) {
+    showError(e, '撤销失败')
+  }
 }
 </script>
 
@@ -312,8 +330,9 @@ async function handleRevert(o: Outbound) {
         </el-table-column>
         <el-table-column prop="customer" label="客户" width="140" show-overflow-tooltip />
         <el-table-column prop="assetName" label="产品" min-width="180" show-overflow-tooltip />
+        <!-- FIX-20261022 / BUG-37：数量列按产品 pricingMode 走 formatTokens（amount）/ formatWan（其余） -->
         <el-table-column label="数量/额度" width="110" align="right">
-          <template #default="{ row }">{{ formatWan(row.qty) }} {{ row.unit }}</template>
+          <template #default="{ row }">{{ qtyText(row) }} {{ row.unit }}</template>
         </el-table-column>
         <el-table-column label="销售金额" width="120" align="right">
           <template #default="{ row }">{{ formatMoney(row.amount) }}</template>

@@ -26,7 +26,6 @@ import {
   type FileMeta,
   type CartItem,
   type AssetDeliverable,
-  type DeliverableTemplateItem,
   type FeatureModule,
   type OpLog,
   type Outbound,
@@ -36,6 +35,7 @@ import {
   type ProjectItem,
   type Contract,
   type Board,
+  type Entity,
   type RsItem,
   type RsItemWithSold,
 } from '@/types'
@@ -149,38 +149,61 @@ export const db = reactive({
   customers: [] as BaseRecord[],
   flows: [] as AssetFlow[],
   logs: [] as OpLog[],
-  deliverableTemplates: {} as Record<string, DeliverableTemplateItem[]>,
   assetDeliverables: {} as Record<number, AssetDeliverable[]>,
   files: [] as FileMeta[],
   rsItems: [] as RsItem[], // 遥感数据可售明细（ADR-011，bootstrap 顶层字段）
+  entities: [] as Entity[], // 公司主体（FORMS-20261022 / ADR-036 起由「资产主体」改名；ENTITIES-20261022 / ADR-035，bootstrap 全量下发，无角色过滤）
 })
 
 let refreshing: Promise<void> | null = null
+/** 请求序号（FIX-20261022 / BUG-24）：仅接受「最新一次」请求的响应，避免旧快照覆盖新快照 */
+let refreshSeq = 0
+/** ENTITIES-20261022：bootstrap 缺 entities 字段（旧后端并行期）仅提示一次，避免每次刷新都弹 */
+let entityListWarned = false
 
-/** 拉取后端全量，填充 db（幂等、防并发） */
+/**
+ * 拉取后端全量，填充 db（幂等、防并发）。
+ *
+ * FIX-20261022 / BUG-24（并发语义修复）：
+ *  - **请求序号**：每次请求递增 `refreshSeq`，响应回来时若已不是最新序号则直接丢弃
+ *    （原实现下 `refresh(true)` 与在飞请求并发时，先发后到的旧快照会把新快照覆盖回旧值）；
+ *  - **`finally` 只清自己持有的 promise**：原实现在任何一次请求结束时无条件 `refreshing = null`，
+ *    会把并发中「更新一次请求」的锁提前释放掉（防重入失效）；
+ *  - **`force` 不再无条件绕过**：`force` 仍会发起新请求（写操作后必须拿最新快照），
+ *    但不再牺牲序号校验，旧响应一律作废。
+ */
+async function fetchBootstrap(): Promise<void> {
+  const seq = ++refreshSeq
+  const { data } = await http.get('/bootstrap')
+  if (seq !== refreshSeq) return // 已有更新请求在飞/已完成：本响应已过期，丢弃（不写镜像）
+  db.assets = data.assets
+  db.projects = data.projects
+  db.contracts = data.contracts ?? []
+  db.outbounds = data.outbounds
+  db.cart = data.cart
+  db.suppliers = data.suppliers
+  db.customers = data.customers
+  db.flows = data.flows
+  db.logs = data.logs
+  db.assetDeliverables = data.assetDeliverables
+  db.files = data.files ?? []
+  db.rsItems = data.rsItems ?? []
+  // ENTITIES-20261022 / ADR-035：旧后端快照缺 entities 字段时回退空数组（下拉/设置页优雅降级），仅提示一次
+  db.entities = data.entities ?? []
+  if (data.entities === undefined && !entityListWarned) {
+    entityListWarned = true
+    ElMessage.warning('主体清单未加载，请刷新页面')
+  }
+}
+
 export function refresh(force = false): Promise<void> {
   if (!force && refreshing) return refreshing
-  refreshing = (async () => {
-    try {
-      const { data } = await http.get('/bootstrap')
-      db.assets = data.assets
-      db.projects = data.projects
-      db.contracts = data.contracts ?? []
-      db.outbounds = data.outbounds
-      db.cart = data.cart
-      db.suppliers = data.suppliers
-      db.customers = data.customers
-      db.flows = data.flows
-      db.logs = data.logs
-      db.deliverableTemplates = data.deliverableTemplates
-      db.assetDeliverables = data.assetDeliverables
-      db.files = data.files ?? []
-      db.rsItems = data.rsItems ?? []
-    } finally {
-      refreshing = null
-    }
-  })()
-  return refreshing
+  const p = fetchBootstrap()
+  refreshing = p
+  return p.finally(() => {
+    // 只清自己持有的锁：并发下旧请求结束不得清掉新请求登记的 promise
+    if (refreshing === p) refreshing = null
+  })
 }
 
 /**
@@ -362,10 +385,6 @@ export function projectItemsOfAsset(assetId: number) {
   )
 }
 
-export function getDeliverableTemplate(type: string): DeliverableTemplateItem[] {
-  return db.deliverableTemplates[type] ?? []
-}
-
 export function getAssetDeliverables(assetId: number): AssetDeliverable[] {
   return db.assetDeliverables[assetId] ?? []
 }
@@ -493,6 +512,12 @@ export async function uploadFile(
   return data
 }
 
+/** 删除上传文件（DELETE /upload/{filename}，require_editor）：
+ * 仍被产品清单/功能清单/交付物附件引用时 400（detail 为可读中文），由调用方 catch 后提示并仅清空字段 */
+export async function deleteUploadFile(filename: string): Promise<void> {
+  await http.delete(`/upload/${encodeURIComponent(filename)}`)
+}
+
 // ============================================================
 // 写操作（调用后端 REST + refresh 同步镜像）
 // ============================================================
@@ -518,10 +543,30 @@ export async function createProject(input: ProjectInput): Promise<Project> {
   return data
 }
 
-/** 重新提交（2026-10-20）：已终止项目按（可修改的）明细新建 pending 订单，旧项目保留终止历史 */
-export async function resubmitProject(id: number, input: ProjectInput): Promise<Project> {
-  const { data } = await http.post<Project>(`/projects/${id}/resubmit`, input)
-  await afterWrite()
+/** 重新提交回填购物车响应（ADR-027）：alreadyRefilled=此前已回填过（幂等，本次不重复回填）；
+ *  restored=回填行数；amountFallback=金额降级为原价成交的行数；
+ *  skipped/skippedReasons=回填失败被跳过的行数及原因类别（回填本身不中断） */
+export interface RefillCartResult {
+  ok: boolean
+  alreadyRefilled: boolean
+  restored: number
+  amountFallback: number
+  skipped: number
+  skippedReasons: string[]
+}
+
+/**
+ * 重新提交（ADR-027 / TASK-FE-031）：POST /projects/{id}/refill-cart（无 body）
+ * 语义 = 确保**已终止**项目明细在**下单人**购物车（`cartRefilled` 幂等标记：已回填过则不重复回填），
+ * 前端随后跳 /cart 改单重提（与撤销同动线）。权限与 resubmit 同口径（下单人本人 / admin / editor）。
+ * 错误文案由后端 detail 给出（403 非本人下单 / 400 仅已终止项目可重新提交、下单账号不存在 / 404），
+ * 经响应拦截器解析进 Error.message 后由调用方 showError 展示。
+ *
+ * 不做 afterWrite 全量刷新：由调用方 `await refresh()` 后再跳 /cart（保证购物车镜像先就位）。
+ * 注：后端 POST /projects/{id}/resubmit 保留（已 deprecated，无前端入口），前端封装已随之删除。
+ */
+export async function refillProjectCart(id: number): Promise<RefillCartResult> {
+  const { data } = await http.post<RefillCartResult>(`/projects/${id}/refill-cart`)
   return data
 }
 
@@ -627,6 +672,30 @@ export async function claimProject(id: number, newOwner = ''): Promise<void> {
   await afterWrite()
 }
 
+/** 撤销待审核订单响应（ADR-026）：restored=已回填行数；amountFallback=降级为原价成交行数；
+ *  skipped/skippedReasons=回填失败被跳过的行数及原因类别（撤销本身不中断） */
+export interface WithdrawResult {
+  ok: boolean
+  restored: number
+  amountFallback: number
+  skipped: number
+  skippedReasons: string[]
+}
+
+/**
+ * 撤销待审核订单（ADR-026 / TASK-FE-029）：POST /projects/{id}/withdraw
+ * 语义 = 终止原单（释放锁定、留痕）+ 全部明细回填下单人购物车；仅 pending 可撤销，
+ * 权限 creator==登录账号 或 admin（商务走驳回）。错误文案由后端 detail 给出（403/400/404），
+ * 经响应拦截器解析进 Error.message 后由调用方 showError 展示。
+ *
+ * 不做 afterWrite 全量刷新：撤销同时改项目/合同/明细/购物车多表且失败会有部分降级，
+ * 由调用方在成功后 `await refresh()`（保证 refresh 先于跳 /cart）。
+ */
+export async function withdrawProject(id: number, reason: string): Promise<WithdrawResult> {
+  const { data } = await http.post<WithdrawResult>(`/projects/${id}/withdraw`, { reason })
+  return data
+}
+
 /** 删除项目：后端先回滚（释放锁定 / 撤销该项目交付）再硬删 */
 export async function deleteProject(id: number): Promise<void> {
   await http.delete(`/projects/${id}`)
@@ -655,28 +724,6 @@ export async function updateBase(kind: BaseKind, id: number, rec: Omit<BaseRecor
 
 export async function deleteBase(kind: BaseKind, id: number): Promise<void> {
   await http.delete(`/bases/${kind}/${id}`)
-  await afterWrite()
-}
-
-export async function addTemplateItem(
-  type: string,
-  item: Omit<DeliverableTemplateItem, 'id'>,
-): Promise<void> {
-  await http.post('/deliverable-templates', item, { params: { type } })
-  await afterWrite()
-}
-
-export async function updateTemplateItem(
-  type: string,
-  id: number,
-  item: Omit<DeliverableTemplateItem, 'id'>,
-): Promise<void> {
-  await http.put(`/deliverable-templates/${id}`, item, { params: { type } })
-  await afterWrite()
-}
-
-export async function deleteTemplateItem(type: string, id: number): Promise<void> {
-  await http.delete(`/deliverable-templates/${id}`, { params: { type } })
   await afterWrite()
 }
 
@@ -729,6 +776,35 @@ export async function updateRsItem(id: number, data: RsItemInput): Promise<void>
 /** 删除明细：后端 400「该明细存在销售关联，无法删除」（任一 project_items.itemId 引用，含已完成合同） */
 export async function deleteRsItem(id: number): Promise<void> {
   await http.delete(`/rs-items/${id}`)
+  await afterWrite()
+}
+
+// ============================================================
+// 公司主体（FORMS-20261022 / ADR-036 起由「资产主体」改名；ENTITIES-20261022 / ADR-035：entities 表 + 设置页维护；
+// 读走 bootstrap 镜像 db.entities（全量、无角色过滤），写走 REST + afterWrite 同步镜像）
+// ============================================================
+/** 主体清单（登录即可；按 createdAt 正序）——设置页/需要最新清单时调用，常规展示读 db.entities */
+export async function listEntities(): Promise<Entity[]> {
+  const { data } = await http.get<Entity[]>('/entities')
+  return data
+}
+
+/** 新增主体（require_editor）：name 2–64 字、short 1–32 字；name 重复 → 400「主体已存在」 */
+export async function createEntity(name: string, short: string): Promise<void> {
+  await http.post('/entities', { name, short })
+  await afterWrite()
+}
+
+/** 编辑主体（require_editor）：name 与其他主体重复 → 400「主体已存在」；
+ * 改 name（全称）不回写 assets.subject（存量产品仍挂旧名称，前端改名前二次确认） */
+export async function updateEntity(id: number, name: string, short: string): Promise<void> {
+  await http.put(`/entities/${id}`, { name, short })
+  await afterWrite()
+}
+
+/** 删除主体（require_editor）：被产品引用 → 400「该主体下存在 N 个产品，不可删除」；不存在 → 404 */
+export async function deleteEntity(id: number): Promise<void> {
+  await http.delete(`/entities/${id}`)
   await afterWrite()
 }
 
@@ -883,8 +959,14 @@ export interface OrderFields {
  * 购物车结算入参（ADR-008/ADR-018 §3）：后端 `CheckoutInput` 无 items 字段——
  * 行级销售金额（包量定价权威值 / unit 与遥感行折扣金额）与服务期限均已由
  * PUT/PATCH /cart/{id} 持久化到 cart_items，结算不再携带（行级值随 cart_items 透传落库）。
+ *
+ * FIX-20261022 / BUG-10（ADR-033 幂等）：新增可选 `requestId`——同一次提交（含失败重试）沿用同一 id，
+ * 后端按 (userId, requestId) 24h 内幂等返回首次生成的项目，避免双击/重试重复建单与重复锁量。
+ * 成功后由调用方丢弃（下次结算重新生成）。
  */
-export type CheckoutInput = OrderFields
+export interface CheckoutInput extends OrderFields {
+  requestId?: string
+}
 
 export interface ProjectOut {
   id: number
@@ -892,10 +974,13 @@ export interface ProjectOut {
   name: string
   status: string
   contractCount?: number // ADR-007：合同数量（=客户组数）
+  /** ADR-033：true = 命中幂等键，返回的是首次创建的项目（本次未重复建单/锁量/清购物车） */
+  idempotent?: boolean
 }
 
 /** 购物车下单（ADR-020，PRICING-20261020：购物车为唯一下单链路）：
- * 生成「待审核」销售项目并锁定数量（不自动交付），随后清空购物车 */
+ * 生成「待审核」销售项目并锁定数量（不自动交付），随后清空购物车。
+ * FIX-20261022 / BUG-10：payload 可带 `requestId`（幂等键，ADR-033）。 */
 export async function checkoutCart(data: CheckoutInput): Promise<ProjectOut> {
   const { data: d } = await http.post<ProjectOut>('/cart/checkout', data)
   await afterWrite()

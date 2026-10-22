@@ -91,14 +91,15 @@ const routes: RouteRecordRaw[] = [
 
       // ---------- 基础设置 ----------
       {
-        path: 'settings/deliverables',
-        name: 'SettingsDeliverables',
-        component: () => import('@/views/settings/deliverables.vue'),
-      },
-      {
         path: 'settings/users',
         name: 'SettingsUsers',
         component: () => import('@/views/settings/users.vue'),
+      },
+      // ENTITIES-20261022 / ADR-035；FORMS-20261022（ADR-036）：文案「资产主体」→「公司主体」（路径不变，仅 admin/editor；viewer 直达被守卫拦回）
+      {
+        path: 'settings/entities',
+        name: 'SettingsEntities',
+        component: () => import('@/views/settings/entities.vue'),
       },
 
       // ---------- 预留 ----------
@@ -122,14 +123,17 @@ const router = createRouter({
 
 /** viewer（生态人员）可访问路由：/assets/**（排除创建/编辑等写页面）+ /sales/projects（仅自己下单，后端过滤）+ /cart；默认落地 /assets/embodied */
 const VIEWER_HOME = '/assets/embodied'
-function viewerAllowedPath(path: string, query: Record<string, unknown> = {}): boolean {
+/** ADR-028：viewer 禁入的销售项目编辑页（`/sales/projects/:id/edit`）——守卫拦截后提示并回详情页 */
+const VIEWER_BLOCKED_PROJECT_EDIT = /^\/sales\/projects\/(\d+)\/edit\/?$/
+function viewerAllowedPath(path: string): boolean {
   if (path === '/cart') return true
-  // 销售项目：列表 + 详情 + 编辑（仅限自己下单的项目；新建/交付记录不放行）
+  // 销售项目：列表 + 详情（仅限自己下单的项目；新建/审核/编辑/交付记录不放行）
   if (path === '/sales/projects') return true
-  if (/^\/sales\/projects\/\d+\/(detail|edit)$/.test(path)) return true
-  // 2026-10-20：重新提交（resubmit）——仅带 ?copy=<已终止项目id> 时放行（页面内再校验归属/状态）；
-  // 不带参数直连新建页仍拦截（生态新建入口维持移除策略）
-  if (path === '/sales/projects/create' && Number(query.copy)) return true
+  // ADR-028（2026-10-21）：生态人员订单提交后禁编辑——edit 页不再对 viewer 放行，仅放行 detail
+  // （改单唯一路径 =「撤销」→ 明细回购物车 → 重新下单，见 ADR-026/027）
+  if (/^\/sales\/projects\/\d+\/detail$/.test(path)) return true
+  // 2026-10-21（ADR-027）：原「按 query 参数放行新建页」的重新提交通道已移除——
+  // 重新提交改为列表/详情页调 refill-cart 后跳 /cart；生态新建页维持整体拦截。
   if (!path.startsWith('/assets/')) return false
   if (path === '/assets/create') return false
   if (/^\/assets\/\d+\/edit$/.test(path)) return false
@@ -142,9 +146,11 @@ function viewerAllowedPath(path: string, query: Record<string, unknown> = {}): b
 //  - 有 token 访问 /login：回 /
 //  - token 在但 currentUser 缺失（新标签页刷新）：fetchMe 校验，
 //    401 由响应拦截器清态跳登录
-//  - viewer（生态人员）：仅 /assets/**（排除创建/编辑页）与 /cart，
+//  - viewer（生态人员）：仅 /assets/**（排除创建/编辑页）、/sales/projects(+/:id/detail) 与 /cart，
 //    其余路由（看板/销售/交付/基础设置/产品创建编辑）→ 静默重定向 /assets/embodied
-//  - /settings/*（users/deliverables）仅 admin，非 admin 直接访问 → 提示并回 /
+//  - ADR-028：viewer 禁入销售项目编辑页 → 提示「订单已提交，不可编辑…」并回该单详情页
+//  - /settings/users 仅 admin，非 admin 直接访问 → 提示并回 /
+//  - /settings/entities（ENTITIES-20261022）仅 admin/editor，viewer 直接访问 → 提示并回产品首页
 // ============================================================
 router.beforeEach(async (to) => {
   if (to.path === '/login') {
@@ -161,16 +167,25 @@ router.beforeEach(async (to) => {
       return false
     }
   }
-  // viewer（生态人员）：菜单/路由收窄——仅产品浏览 + 购物车，其余静默回产品首页
-  if (currentUser.value?.role === 'viewer' && !viewerAllowedPath(to.path, to.query)) {
+  // ENTITIES-20261022 / ADR-035；FORMS-20261022（ADR-036）：公司主体（原「资产主体」）仅 admin/editor——viewer 直达提示后回产品首页
+  // （须置于下方 viewer 静默收窄之前，否则会被无提示重定向抢先拦截）
+  if (to.path === '/settings/entities' && currentUser.value?.role === 'viewer') {
+    ElMessage.warning('仅商务人员/管理员可访问「公司主体」')
     return VIEWER_HOME
+  }
+  // viewer（生态人员）：菜单/路由收窄——仅产品浏览 + 购物车，其余静默回产品首页
+  if (currentUser.value?.role === 'viewer') {
+    // ADR-028（2026-10-21）：订单提交后禁编辑——直达 /sales/projects/:id/edit 时提示并回该单详情页
+    // （create 页 onMounted 的同名兜底不会执行到，故提示放在守卫；detail 在白名单内，无重定向死循环）
+    const blockedEdit = VIEWER_BLOCKED_PROJECT_EDIT.exec(to.path)
+    if (blockedEdit) {
+      ElMessage.warning('订单已提交，不可编辑，如需修改请「撤销」后重新下单')
+      return `/sales/projects/${blockedEdit[1]}/detail`
+    }
+    if (!viewerAllowedPath(to.path)) return VIEWER_HOME
   }
   if (to.path === '/settings/users' && currentUser.value?.role !== 'admin') {
     ElMessage.warning('仅管理员可访问「账号与审计」')
-    return '/'
-  }
-  if (to.path === '/settings/deliverables' && currentUser.value?.role !== 'admin') {
-    ElMessage.warning('仅管理员可访问「基础设置」')
     return '/'
   }
   return true

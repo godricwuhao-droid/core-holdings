@@ -1,14 +1,16 @@
 """REST API 路由（前缀 /api），字段契约对齐前端 src/api/index.ts
 
-权限管控（2026-10-15；2026-10-16 文件端点补鉴权）：
+权限管控（2026-10-15；2026-10-16 文件端点补鉴权；FIX-20261022 收口）：
 - 除 POST /auth/login、GET /health 外，所有端点均需
   `Authorization: Bearer <jwt>`（依赖逐个明确挂载，不用 router 级全挂）。
 - GET /files/{filename} 走双通道认证（get_file_user）：优先 Bearer 头，
-  无头时接受 `?token=<jwt>` 查询参数（iframe/img 无法带请求头）。
+  无头时接受 `?token=<jwt>` 查询参数（iframe/img 无法带请求头）；
+  **对象级 ACL**（BUG-02/ADR-030 §3）：不可见一律 404（不返回 403，避免探测文件名）。
 - 读接口三角色均可（get_current_user）；业务写接口 admin+editor（require_editor）；
-  账号管理/审计查询仅 admin（require_admin）。
-- 下单链路（2026-10-16 权限矩阵调整）：购物车全部 7 端点 + POST /sales/order 用
-  require_order（已认证即可，viewer/生态人员放行）。
+  账号管理/审计查询仅 admin（require_admin）；`GET /users/options` 自 FIX-20261022 起
+  为 require_editor（内部人员清单不对 viewer 暴露，BUG-32/ADR-030 §5）。
+- 下单链路：购物车全部端点 require_order（已认证即可，viewer/生态人员放行）；
+  `POST /sales/order`、`POST /projects/{id}/resubmit` 已下线（**410 Gone**，ADR-029 §3）。
 - 审计在 router 层统一 record_audit（业务 services 不动，降低回归风险）。
 """
 import mimetypes
@@ -16,10 +18,9 @@ import os
 import urllib.parse
 import uuid
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPAuthorizationCredentials
-from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from .. import models, schemas, security, services
@@ -34,8 +35,10 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 # UPLOAD_DIR 可用环境变量覆盖（本地验收用临时目录）；默认 backend/uploads
 UPLOAD_DIR = os.getenv("UPLOAD_DIR") or os.path.join(BASE_DIR, "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
-ALLOWED_EXT = {"pdf", "doc", "docx", "png", "jpg", "jpeg", "gif", "webp", "xlsx"}
+# `.doc` 已从白名单移除（BUG-31 / api-contracts §7：与 ADR-024 前端 accept 一致，禁上传 .doc）
+ALLOWED_EXT = {"pdf", "docx", "png", "jpg", "jpeg", "gif", "webp", "xlsx"}
 MAX_SIZE = 20 * 1024 * 1024  # 20MB
+_CHUNK = 1024 * 1024  # 流式写入块大小（1MB）
 
 
 @router.get("/health")
@@ -46,22 +49,32 @@ def health():
 # ============================================================
 # 认证
 # ============================================================
+_LOGIN_FAIL_MSG = "用户名或密码错误"
+_LOGIN_TOO_MANY_MSG = "登录尝试过于频繁，请稍后再试"
+
+
 @router.post("/auth/login")
-def login(data: schemas.LoginInput, db: Session = Depends(get_db)):
-    # 登录失败限流：同一用户名 15 分钟内失败 ≥10 次锁定（防撞库）
-    if security.login_locked(data.username):
-        security.record_audit(db, None, "auth", "登录拦截", "auth", data.username, "失败次数过多，临时锁定")
-        raise HTTPException(429, "登录失败次数过多，请 15 分钟后再试")
+def login(data: schemas.LoginInput, request: Request, db: Session = Depends(get_db)):
+    """登录（BUG-12 / ADR-034 §4 加固）。
+
+    - 失败文案**统一**「用户名或密码错误」（不再区分「账号已被禁用」，避免账号枚举）；
+    - 用户不存在时仍执行一次 PBKDF2（恒定时间，抹平响应时间差）；
+    - 失败计数双维度：`(ip, username)` 10/15min + 纯 IP 30/15min，超限 **429**；
+      不再因单账号计数全局封号（避免定向锁死管理员）。
+    """
+    ip = (request.client.host if request.client else "") or ""
+    username = (data.username or "").strip()
+    if security.login_blocked(ip, username):
+        security.record_audit(db, None, "auth", "登录拦截", "auth", username, "失败次数过多，来源限流")
+        raise HTTPException(429, _LOGIN_TOO_MANY_MSG)
     user = db.query(models.User).filter(models.User.username == data.username).first()
-    if user is not None and not user.enabled:
-        security.login_failed(data.username)
-        security.record_audit(db, None, "auth", "登录失败", "auth", data.username, "账号已被禁用")
-        raise HTTPException(401, "账号已被禁用")
-    if user is None or not security.verify_password(data.password, user.passwordHash):
-        security.login_failed(data.username)
-        security.record_audit(db, None, "auth", "登录失败", "auth", data.username, "用户名或密码错误")
-        raise HTTPException(401, "用户名或密码错误")
-    security.login_succeeded(data.username)
+    ok = security.verify_password_or_dummy(data.password, user.passwordHash if user is not None else None)
+    if user is None or not ok or not user.enabled:
+        security.login_failed(ip, username)
+        reason = "用户名或密码错误" if user is None or not ok else "账号已被禁用"
+        security.record_audit(db, None, "auth", "登录失败", "auth", username, reason)
+        raise HTTPException(401, _LOGIN_FAIL_MSG)
+    security.login_succeeded(ip, username)
     security.record_audit(db, user, "auth", "登录成功", "auth", user.username)
     return {"token": security.jwt_encode(user), "user": security.user_out(user)}
 
@@ -80,9 +93,13 @@ def list_users(db: Session = Depends(get_db), _: models.User = Depends(security.
 
 
 @router.get("/users/options", response_model=list[schemas.UserOut])
-def user_options(db: Session = Depends(get_db), _: models.User = Depends(security.get_current_user)):
+def user_options(db: Session = Depends(get_db), _: models.User = Depends(security.require_editor)):
     """商务账号选项（ADR-012 §5.1）：editor + admin 有效账号，
-    供「商务负责人」筛选/接手转交下拉与商务 username→姓名 展示映射（商务负责人与角色账号的关联查询）"""
+    供「商务负责人」筛选/接手转交下拉与商务 username→姓名 展示映射（商务负责人与角色账号的关联查询）。
+
+    BUG-32 / ADR-030 §5（FIX-20261022）：权限由「任意登录」提升为 **require_editor**——
+    内部商务/管理员名单不再对 viewer 暴露（同口径的 /users/options/all 早已收敛）；
+    前端「商务负责人」筛选对 viewer 不渲染。"""
     return (
         db.query(models.User)
         .where(models.User.role.in_(("editor", "admin")), models.User.enabled == True)  # noqa: E712
@@ -157,6 +174,10 @@ def update_user(user_id: int, data: schemas.UserUpdate, db: Session = Depends(ge
     if data.password is not None:
         u.passwordHash = security.hash_password(data.password)
         changes.append("password")
+    # BUG-11 / ADR-034 §2：改密 / 禁用 / 改角色 → tokenVersion+1，旧 token 立即失效
+    #（登出仍为前端清 token，不新增 /auth/logout 端点，ADR-034 §3）
+    if data.password is not None or data.role is not None or data.enabled is not None:
+        u.tokenVersion = int(u.tokenVersion or 0) + 1
     db.commit()
     db.refresh(u)
     security.record_audit(db, user, "user_mgmt", "编辑用户", "user", u.username,
@@ -300,24 +321,16 @@ def list_rs_items(
     """PAGE-20261021：可售明细分页（id ASC）。items = RsItemOut + 派生 soldCount。
     soldCount 口径：该明细被 delivered 状态合同的项目明细计数
     （project_items.itemId == rs_item.id 且所属合同 status='delivered'），
-    一条聚合查询按当页 id 批量计算，避免逐行查。"""
+    一条聚合查询按当页 id 批量计算，避免逐行查。
+    FIX-20261022-FOLLOWUP：聚合逻辑抽到 `services._rs_item_sold_counts`，
+    与 `bootstrap.rsItems` 共用**同一实现**（不复制两份口径）。"""
     a = db.get(models.Asset, asset_id)
     if a is None:
         raise HTTPException(404, "产品不存在")
     q = db.query(models.RsItem).filter(models.RsItem.assetId == asset_id)
     total = q.count()
     items = q.order_by(models.RsItem.id.asc()).offset((page - 1) * pageSize).limit(pageSize).all()
-    sold: dict[int, int] = {}
-    if items:
-        ids = [i.id for i in items]
-        rows = (
-            db.query(models.ProjectItem.itemId, func.count(models.ProjectItem.id))
-            .join(models.Contract, models.ProjectItem.contractId == models.Contract.id)
-            .filter(models.Contract.status == "delivered", models.ProjectItem.itemId.in_(ids))
-            .group_by(models.ProjectItem.itemId)
-            .all()
-        )
-        sold = {item_id: cnt for item_id, cnt in rows}
+    sold: dict[int, int] = services._rs_item_sold_counts(db, [i.id for i in items])
     out = []
     for i in items:
         d = schemas.RsItemOut.model_validate(i).model_dump()
@@ -332,16 +345,27 @@ def list_asset_flows(
     page: int = Query(1, ge=1),
     pageSize: int = Query(10, ge=1, le=100),  # PAGE-20261021：默认 10
     db: Session = Depends(get_db),
-    _: models.User = Depends(security.get_current_user),
+    user: models.User = Depends(security.get_current_user),
 ):
     """PAGE-20261021：产品级数量流水分页（id DESC，仅该 assetId）。
-    asset 级流水对 viewer 全量放行是现状口径，保持一致。"""
+
+    BUG-13 / ADR-030 §4（FIX-20261022）：viewer **复用 `Visibility.flow_visible()`**，
+    与 bootstrap 同一口径——此前该分页端点完全不过滤，可绕过 bootstrap 拿到他人
+    销售记录编号/数量/金额。`total` 按过滤后的集合计算（对 viewer 先过滤再分页）。
+    """
     a = db.get(models.Asset, asset_id)
     if a is None:
         raise HTTPException(404, "产品不存在")
+    vis = services.build_visibility(db, user)
     q = db.query(models.AssetFlow).filter(models.AssetFlow.assetId == asset_id)
-    total = q.count()
-    items = q.order_by(models.AssetFlow.id.desc()).offset((page - 1) * pageSize).limit(pageSize).all()
+    if vis.restricted:
+        rows = [f for f in q.order_by(models.AssetFlow.id.desc()).all() if vis.flow_visible(f)]
+        total = len(rows)
+        items = rows[(page - 1) * pageSize: (page - 1) * pageSize + pageSize]
+    else:
+        total = q.count()
+        items = q.order_by(models.AssetFlow.id.desc()).offset(
+            (page - 1) * pageSize).limit(pageSize).all()
     return {"total": total, "items": [schemas.FlowOut.model_validate(i).model_dump() for i in items]}
 
 
@@ -384,7 +408,10 @@ def create_project(data: schemas.ProjectInput, db: Session = Depends(get_db),
 @router.put("/projects/{project_id}")
 def update_project(project_id: int, data: schemas.ProjectInput, db: Session = Depends(get_db),
                    user: models.User = Depends(security.require_order)):
-    # viewer（生态人员）可编辑自己下单的项目——归属/rep 不可改约束在 services.update_project 内
+    # ADR-028 §1：viewer（生态人员）一律 403「订单已提交，不可编辑；如需修改请「撤销」后重新下单」
+    #（订单提交即冻结，改单唯一路径 = 撤销 → 回填购物车 → 重下）；
+    # 商务/管理员既有约束（pending 仅负责人或 admin、已交付/已终止不可编辑、名称非空）不变。
+    # 权限判定一律在 services.update_project 内收口，路由层不重复判断。
     services.update_project(db, project_id, data, operator=user.username, user=user)
     p = db.get(models.Project, project_id)
     security.record_audit(db, user, "sale", "编辑销售项目", "project", p.name if p else str(project_id))
@@ -434,19 +461,58 @@ def claim_project(project_id: int, data: schemas.ClaimInput = schemas.ClaimInput
     return {"ok": True}
 
 
-@router.post("/projects/{project_id}/resubmit", response_model=schemas.ProjectOut)
-def resubmit_project(project_id: int, data: schemas.ProjectInput, db: Session = Depends(get_db),
+@router.post("/projects/{project_id}/withdraw")
+def withdraw_project(project_id: int, data: schemas.WithdrawInput, db: Session = Depends(get_db),
                      user: models.User = Depends(security.require_order)):
-    """重新提交（2026-10-20）：已终止项目（驳回/取消/终止）按（可修改的）明细新建 pending 订单，
-    旧项目保留终止历史。viewer 仅自己下单的项目（后端 creator 守卫兜底）。"""
-    p = services.resubmit_project(db, project_id, data, operator=user.username, user=user)
-    security.record_audit(db, user, "sale", "重新提交销售项目", "project", p.name)
-    return p
+    """撤销待审核订单（ADR-026，下单生态人员本人或 admin）。
+
+    语义 = 终止原单（释放锁定 + cancel_release 流水 + 合同 remark 留痕） **+ 全部明细
+    自动回填下单人购物车**（保留客户/数量/金额/服务期限/折扣率/遥感明细 itemId），
+    原单保留 terminated 历史（可查原因），不删除、不新增「草稿」状态。
+    守卫：仅 pending 可撤销（否则 400）；非本人且非 admin → 403；reason 必填 1–200 字。
+    回填容错：单行无法回填时降级「原价成交 / 跳过」，在响应 restored/amountFallback/
+    skipped/skippedReasons 中返回，绝不中断整体撤销。
+    不改现有终止/驳回/重新提交口径（PATCH status / review / resubmit 行为不变）。"""
+    result = services.withdraw_project(db, project_id, data.reason, user)
+    security.record_audit(db, user, "sale", "撤销订单", "project",
+                          str(project_id), f"reason={data.reason}")
+    return result
+
+
+@router.post("/projects/{project_id}/refill-cart")
+def refill_project_cart(project_id: int, db: Session = Depends(get_db),
+                        user: models.User = Depends(security.require_order)):
+    """「重新提交」收口购物车（ADR-027）：把已终止项目的明细回填**下单人**购物车，
+    前端随后跳 `/cart` 改单再结算（不再走 create 页 copy 模式）。
+
+    无 body；守卫：仅 `terminated` 项目（否则 400），viewer 仅自己下单的项目（403），
+    admin/editor 放行（admin 代操作同样回填到**下单人**购物车）。
+    幂等：`Project.cartRefilled` 为 True 时直接返回 `alreadyRefilled: true`，不重复回填
+    （购物车行数不增加、不写日志）。回填容错口径与 withdraw 完全一致（共享实现）：
+    单行失败降级「原价成交」重试，仍失败计入 skipped/skippedReasons，绝不中断。
+    副作用：首次回填仅新增 cart_items 行（不锁量、不改项目/合同状态）+ 1 条 OpLog。"""
+    result = services.refill_project_cart(db, project_id, user)
+    if not result["alreadyRefilled"]:
+        security.record_audit(db, user, "sale", "重新提交（回填购物车）", "project",
+                              str(project_id), f"restored={result['restored']}")
+    return result
+
+
+@router.post("/projects/{project_id}/resubmit")
+def resubmit_project(project_id: int):  # noqa: ARG001 - 下线端点，仅保留路径参数签名
+    """⚠️ **已下线（BUG-08/ADR-029 §3，FIX-20261022）**：一律 410 Gone。
+
+    原因：该入口对 viewer 开放且**完全不做**参考区间/服务期限校验（可绕过购物车直接建单）。
+    「重新提交」唯一路径 = `POST /projects/{id}/refill-cart`（明细回填购物车 → `/cart` 改单 → 结算）。
+    """
+    raise HTTPException(410, "该接口已下线，请使用购物车结算")
 
 
 @router.delete("/projects/{project_id}")
 def delete_project(project_id: int, db: Session = Depends(get_db),
                    user: models.User = Depends(security.require_editor)):
+    # ADR-028 §3：撤销留痕护栏（terminated && cartRefilled → 403）在 services.delete_project 内收口，
+    # 路由层不重复判断；其他终态（被驳回且从未回填）仍可删除
     p = db.get(models.Project, project_id)
     name = p.name if p else str(project_id)
     services.delete_project(db, project_id, operator=user.username)
@@ -501,11 +567,14 @@ def create_outbound(data: schemas.OutboundInput, db: Session = Depends(get_db),
 
 
 @router.post("/outbounds/{outbound_id}/revert")
-def revert_outbound(outbound_id: int, request: dict, db: Session = Depends(get_db),
+def revert_outbound(outbound_id: int, data: schemas.OutboundRevertInput,
+                    db: Session = Depends(get_db),
                     user: models.User = Depends(security.require_editor)):
+    """撤销交付（BUG-20：裸 dict → Pydantic；非法入参 422，不再 500）。
+    BUG-14：产品/明细已不存在时 400（不允许「静默成功、零回滚」）。"""
     ob = db.get(models.Outbound, outbound_id)
     name = ob.assetName if ob else str(outbound_id)
-    services.revert_outbound(db, outbound_id, request.get("reason", ""), operator=user.username)
+    services.revert_outbound(db, outbound_id, data.reason, operator=user.username)
     security.record_audit(db, user, "outbound", "撤销交付", "outbound", name)
     return {"ok": True}
 
@@ -526,17 +595,28 @@ def add_to_cart_batch(data: schemas.CartBatchInput, db: Session = Depends(get_db
 
 
 @router.put("/cart/{cart_id}", response_model=schemas.CartItemOut)
-def set_cart_qty(cart_id: int, request: dict, db: Session = Depends(get_db),
+def set_cart_qty(cart_id: int, data: schemas.CartQtyUpdate, db: Session = Depends(get_db),
                  user: models.User = Depends(security.require_order)):
-    # ADR-008/ADR-018 §3：可选携带 amount（unit/遥感行=折扣金额过区间校验；amount 行=整数元权威）
-    # ADR-020：可选携带 serviceStart/serviceEnd（服务期限）
-    # DISCOUNT-20261021/ADR-023：可选携带 discountRate（0-1 小数，0 < rate ≤ 1 否则 400；null=清空）
-    # CART-PERF-20261021：响应由 {"ok": true} 改为更新后的完整 CartItemOut（前端本地打补丁，免全量重拉）
-    item = services.set_cart_qty(db, cart_id, int(request.get("qty", 0)), user_id=str(user.id),
-                                 amount=request.get("amount"),
-                                 service_start=request.get("serviceStart"),
-                                 service_end=request.get("serviceEnd"),
-                                 discount_rate=request.get("discountRate"))
+    """改数量（`qty` 必传）+ 可选金额/服务期限/折扣率（BUG-20：裸 dict → Pydantic，非法入参 422）。
+
+    - ADR-008/ADR-018 §3：可选携带 amount（unit/遥感行=折扣金额过区间校验；amount 行=整数元权威）；
+    - ADR-020：可选携带 serviceStart/serviceEnd（服务期限）；
+    - ADR-023：可选携带 discountRate（0-1 小数，0 < rate ≤ 1 否则 400；null=清空）；
+    - CART-PERF-20261021：响应为更新后的完整 CartItemOut（前端本地打补丁，免全量重拉）；
+    - CART-PATCH-20261021：其余字段**未传 = 保持原值**（按 `model_fields_set` 判断），显式 null = 清空；
+    - ADR-037 §3（FORMS-20261022）：区间校验分角色——viewer 只校验下限（上限放开），
+      editor/admin 双向（角色取当前登录用户，与 checkout 同函数）。
+    """
+    provided = data.model_fields_set
+    item = services.set_cart_qty(db, cart_id, data.qty, user_id=str(user.id),
+                                 amount=data.amount if "amount" in provided else services.UNSET,
+                                 service_start=(data.serviceStart if "serviceStart" in provided
+                                                else services.UNSET),
+                                 service_end=(data.serviceEnd if "serviceEnd" in provided
+                                              else services.UNSET),
+                                 discount_rate=(data.discountRate if "discountRate" in provided
+                                                else services.UNSET),
+                                 viewer=(user.role == "viewer"))
     return item
 
 
@@ -546,10 +626,19 @@ def patch_cart_item(cart_id: int, data: schemas.CartPatchInput, db: Session = De
     """修改购物车行级客户（ADR-007）；可选携带合同金额（ADR-008/ADR-018 §3）、
     服务期限（ADR-020，PRICING-20261020）与折扣率（DISCOUNT-20261021/ADR-023，
     0 < rate ≤ 1 否则 400；null=清空）。
-    CART-PERF-20261021：响应由 {"ok": true} 改为更新后的完整 CartItemOut（前端本地打补丁，免全量重拉）。"""
-    item = services.patch_cart_item(db, cart_id, data.customer, user_id=str(user.id), amount=data.amount,
-                                    service_start=data.serviceStart, service_end=data.serviceEnd,
-                                    discount_rate=data.discountRate)
+    CART-PERF-20261021：响应由 {"ok": true} 改为更新后的完整 CartItemOut（前端本地打补丁，免全量重拉）。
+    ADR-037 §3（FORMS-20261022）：区间校验分角色——viewer 只校验下限（上限放开），
+    editor/admin 双向（角色取当前登录用户，与 PUT /cart/{id} / checkout 同函数）。"""
+    # CART-PATCH-20261021：按 Pydantic model_fields_set 判断字段是否真的传了——
+    # 未传 = 保持原值（不改），显式 null = 清空（修复改客户时金额/服务期限/折扣被误清空）
+    provided = data.model_fields_set
+    item = services.patch_cart_item(
+        db, cart_id, data.customer, user_id=str(user.id),
+        amount=data.amount if "amount" in provided else services.UNSET,
+        service_start=data.serviceStart if "serviceStart" in provided else services.UNSET,
+        service_end=data.serviceEnd if "serviceEnd" in provided else services.UNSET,
+        discount_rate=data.discountRate if "discountRate" in provided else services.UNSET,
+        viewer=(user.role == "viewer"))
     security.record_audit(db, user, "sale", "修改购物车客户", "cart", str(cart_id), f"customer={data.customer}")
     return item
 
@@ -563,37 +652,46 @@ def remove_cart_item(cart_id: int, db: Session = Depends(get_db),
 
 @router.delete("/cart")
 def clear_cart(db: Session = Depends(get_db), user: models.User = Depends(security.require_order)):
+    """清空购物车（BUG-33：成功体统一为 `{"ok": true}`，此前返回空 body/null）。"""
     services.clear_cart(db, user_id=str(user.id))
+    return {"ok": True}
 
 
-@router.post("/cart/checkout", response_model=schemas.ProjectOut)
+@router.post("/cart/checkout")
 def checkout(data: schemas.CheckoutInput, db: Session = Depends(get_db),
              user: models.User = Depends(security.require_order)):
     """购物车结算：按产品分组 → 每个产品一条销售记录（ADR-013）。
     【核心业务规则 ADR-012 修订 2026-10-19】所有角色结算统一建 **pending（待审核）**
-    （数量锁定照常）→ 商务接手审核（改价确认/驳回）后生效；原「仅生态人员进 pending」的角色分叉已废除。
+    （数量锁定照常）→ 商务接手审核（改价确认/驳回）后生效。
     ADR-022（REQUIRED-20261024）：逐行必填校验（客户/销售金额>0整数元/普通行服务期限起止），
-    缺项 400 一次报全（文案含行标识）；「留空=挂牌价」兜底与 viewer 金额免填口径已作废。"""
+    缺项 400 一次报全（文案含行标识）；「留空=挂牌价」兜底与 viewer 金额免填口径已作废。
+
+    BUG-10 / ADR-033 §1：可选 `requestId` 幂等——响应 = `ProjectOut` 全部字段 + `idempotent`
+    （首次 false；同一 `(userId, requestId)` 24h 内重复请求返回首次项目、`idempotent: true`，
+    不重复建单/锁量/清购物车）。故此处不用 response_model（需附加非 ORM 字段）。
+    """
     is_viewer = user.role == "viewer"
-    project = services.checkout(db, data, user_id=str(user.id), operator=user.username,
-                                viewer=is_viewer)
-    security.record_audit(db, user, "sale",
-                          "购物车下单（待商务审核）" if is_viewer else "购物车结算",
-                          "project", project.name, project.code)
-    return project
+    project, idempotent = services.checkout(db, data, user_id=str(user.id),
+                                            operator=user.username, viewer=is_viewer)
+    if not idempotent:
+        security.record_audit(db, user, "sale",
+                              "购物车下单（待商务审核）" if is_viewer else "购物车结算",
+                              "project", project.name, project.code)
+    body = schemas.ProjectOut.model_validate(project).model_dump()
+    body["idempotent"] = idempotent
+    return body
 
 
-@router.post("/sales/order", response_model=schemas.ProjectOut)
-def create_sale_order(data: schemas.SaleOrderInput, db: Session = Depends(get_db),
-                      user: models.User = Depends(security.require_order)):
-    """产品直接下单（任意角色）。⚠️ deprecated（ADR-020，PRICING-20261020）：
-    前端已移除「登记销售」入口，购物车为唯一下单链路；本端点保留兼容潜在直调方，
-    折扣金额同样过参考区间校验（防绕过）。
-    【核心业务规则 ADR-012 修订 2026-10-19】统一建 **pending（待审核）**（锁定照常），
-    商务接手审核（改价确认/驳回）后生效 active——与手动建单/购物车结算同口径。"""
-    project = services.create_sale_order(db, data, operator=user.username)
-    security.record_audit(db, user, "sale", "下单", "project", project.name, project.code)
-    return project
+@router.post("/sales/order")
+def create_sale_order():
+    """⚠️ **已下线（BUG-08/ADR-029 §3，FIX-20261022）**：一律 410 Gone。
+
+    原因：该入口曾对 viewer 开放且只做「部分」校验（参考区间/服务期限缺失），
+    与购物车链路形成第二套口径（同一业务不变量被复制到 4 处且无权威出口）。
+    购物车结算 `POST /cart/checkout` 为唯一下单链路，新增入口自动继承全部校验。
+    前端已无封装/入口；外部脚本直调需改造。
+    """
+    raise HTTPException(410, "该接口已下线，请使用购物车结算")
 
 
 # ============================================================
@@ -642,38 +740,53 @@ def delete_base(kind: str, rec_id: int, db: Session = Depends(get_db),
 
 
 # ============================================================
-# 交付物模板（type 为中文产品类型，走 query 避免 path 编码问题）
+# 资产主体（ADR-035，ENTITIES-20261022）：主体清单单一事实来源
+# 读登录即可（viewer 建产品页下拉也需读取）；写 admin+editor
 # ============================================================
-@router.post("/deliverable-templates")
-def add_template_item(atype: str = Query(..., alias="type"),
-                      data: schemas.DeliverableTemplateInput = ..., db: Session = Depends(get_db),
-                      user: models.User = Depends(security.require_editor)):
-    services.add_template_item(db, atype, data)
-    security.record_audit(db, user, "setting", "新增交付物模板", "template", data.name, f"type={atype}")
-    return {"ok": True}
+_ENTITY_LABEL = "资产主体"
 
 
-@router.put("/deliverable-templates/{item_id}")
-def update_template_item(item_id: int, atype: str = Query(..., alias="type"),
-                         data: schemas.DeliverableTemplateInput = ..., db: Session = Depends(get_db),
-                         user: models.User = Depends(security.require_editor)):
-    services.update_template_item(db, atype, item_id, data)
-    security.record_audit(db, user, "setting", "编辑交付物模板", "template", data.name, f"type={atype}")
-    return {"ok": True}
+@router.get("/entities", response_model=list[schemas.EntityOut])
+def list_entities(db: Session = Depends(get_db),
+                  _: models.User = Depends(security.get_current_user)):
+    """全量返回，按 createdAt 正序、id 正序（存量展示顺序稳定）。"""
+    return services.list_entities(db)
 
 
-@router.delete("/deliverable-templates/{item_id}")
-def delete_template_item(item_id: int, atype: str = Query(..., alias="type"), db: Session = Depends(get_db),
-                         user: models.User = Depends(security.require_editor)):
-    t = db.get(models.DeliverableTemplate, item_id)
-    name = t.name if t else str(item_id)
-    services.delete_template_item(db, atype, item_id)
-    security.record_audit(db, user, "setting", "删除交付物模板", "template", name, f"type={atype}")
+@router.post("/entities", response_model=schemas.EntityOut)
+def add_entity(data: schemas.EntityInput, db: Session = Depends(get_db),
+               user: models.User = Depends(security.require_editor)):
+    e = services.add_entity(db, data, operator=user.username)
+    security.record_audit(db, user, "setting", f"新增{_ENTITY_LABEL}", "entity",
+                          e.name, f"short={e.short}")
+    return e
+
+
+@router.put("/entities/{entity_id}", response_model=schemas.EntityOut)
+def update_entity(entity_id: int, data: schemas.EntityInput, db: Session = Depends(get_db),
+                  user: models.User = Depends(security.require_editor)):
+    old = db.get(models.Entity, entity_id)
+    e = services.update_entity(db, entity_id, data, operator=user.username)
+    detail = f"short={e.short}"
+    if old and old.name != e.name:
+        detail = f"名称 {old.name} → {e.name}；short={e.short}"
+    security.record_audit(db, user, "setting", f"编辑{_ENTITY_LABEL}", "entity",
+                          e.name, detail)
+    return e
+
+
+@router.delete("/entities/{entity_id}")
+def delete_entity(entity_id: int, db: Session = Depends(get_db),
+                  user: models.User = Depends(security.require_editor)):
+    e = db.get(models.Entity, entity_id)
+    name = e.name if e else str(entity_id)
+    services.delete_entity(db, entity_id, operator=user.username)
+    security.record_audit(db, user, "setting", f"删除{_ENTITY_LABEL}", "entity", name)
     return {"ok": True}
 
 
 # ============================================================
-# 产品交付物
+# 产品交付物（ADR-024：模板端点已下线，实例完全手动维护）
 # ============================================================
 @router.post("/assets/{asset_id}/deliverables")
 def add_asset_deliverable(asset_id: int, data: schemas.AssetDeliverableInput, db: Session = Depends(get_db),
@@ -684,9 +797,13 @@ def add_asset_deliverable(asset_id: int, data: schemas.AssetDeliverableInput, db
 
 
 @router.put("/assets/{asset_id}/deliverables/{item_id}")
-def update_asset_deliverable(asset_id: int, item_id: int, request: dict, db: Session = Depends(get_db),
+def update_asset_deliverable(asset_id: int, item_id: int,
+                             data: schemas.AssetDeliverableUpdate,
+                             db: Session = Depends(get_db),
                              user: models.User = Depends(security.require_editor)):
-    services.update_asset_deliverable(db, asset_id, item_id, request)
+    """更新交付物（BUG-20：裸 dict → Pydantic 部分更新，字段未传 = 保持原值，非法入参 422）。"""
+    services.update_asset_deliverable(db, asset_id, item_id,
+                                      data.model_dump(exclude_unset=True))
     d = db.get(models.AssetDeliverable, item_id)
     security.record_audit(db, user, "setting", "编辑交付物", "deliverable",
                           d.name if d else str(item_id), f"assetId={asset_id}")
@@ -709,21 +826,43 @@ def remove_asset_deliverable(asset_id: int, item_id: int, db: Session = Depends(
 @router.post("/upload")
 async def upload_file(file: UploadFile = File(...), db: Session = Depends(get_db),
                       user: models.User = Depends(security.require_editor)):
+    """上传附件（BUG-31 / api-contracts §7）：`.doc` 已从白名单移除；**流式写入**，
+    累计超过 20MB 立即中断并删除半成品（不再先整体读入内存，避免 20MB×N 并发内存峰值）。"""
     orig = file.filename or ""
     ext = orig.rsplit(".", 1)[-1].lower() if "." in orig else ""
     if ext not in ALLOWED_EXT:
-        raise HTTPException(400, f"不支持的文件格式：.{ext or '?'}（支持 pdf/doc/docx/图片/xlsx）")
-    content = await file.read()
-    if not content:
-        raise HTTPException(400, "文件内容为空")
-    if len(content) > MAX_SIZE:
-        raise HTTPException(400, "文件过大（上限 20MB）")
+        raise HTTPException(
+            400,
+            f"不支持的文件格式：.{ext or '?'}（支持 pdf/docx/xlsx/图片；.doc 请先另存为 .docx）",
+        )
     fname = f"{uuid.uuid4().hex}.{ext}"
-    with open(os.path.join(UPLOAD_DIR, fname), "wb") as f:
-        f.write(content)
+    dest = os.path.join(UPLOAD_DIR, fname)
+    size = 0
+    try:
+        with open(dest, "wb") as out:
+            while True:
+                chunk = await file.read(_CHUNK)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > MAX_SIZE:
+                    raise HTTPException(400, "文件过大（上限 20MB）")
+                out.write(chunk)
+    except HTTPException:
+        try:
+            os.remove(dest)
+        except OSError:
+            pass
+        raise
+    if not size:
+        try:
+            os.remove(dest)
+        except OSError:
+            pass
+        raise HTTPException(400, "文件内容为空")
     # 落盘成功后写原名映射（上传不是产品操作，不写 OpLog）
-    services.add_file_meta(db, fname, orig, len(content), user.username)
-    return {"filename": fname, "name": orig, "size": len(content), "storedName": fname}
+    services.add_file_meta(db, fname, orig, size, user.username)
+    return {"filename": fname, "name": orig, "size": size, "storedName": fname}
 
 
 def _resolve_upload(name: str) -> str:
@@ -742,26 +881,29 @@ async def get_file_user(
     db: Session = Depends(get_db),
 ) -> models.User:
     """文件端点双通道认证：优先 Authorization: Bearer 头；无头时接受 ?token=<jwt>。
-    复用 security.jwt_decode 校验（不改动其签名），失败一律 401。"""
+    复用 `security.user_from_token`（含 tokenVersion 比对），失败一律 401。"""
     raw = (credentials.credentials if credentials is not None else "") or (token or "")
     if not raw:
         raise HTTPException(401, "未登录或登录已过期")
-    payload = security.jwt_decode(raw)
-    try:
-        user_id = int(payload.get("sub") or 0)
-    except (TypeError, ValueError):
-        raise HTTPException(401, "未登录或登录已过期")
-    user = db.get(models.User, user_id)
-    if user is None or not user.enabled:
-        raise HTTPException(401, "未登录或登录已过期")
-    return user
+    return security.user_from_token(db, raw)
 
 
 @router.get("/files/{filename}")
 def get_file(filename: str, inline: bool = Query(False, description="true 时内联预览（Content-Disposition: inline），缺省下载"),
              db: Session = Depends(get_db),
              user: models.User = Depends(get_file_user)):
+    """下载/预览上传文件。
+
+    BUG-02 / ADR-030 §3（FIX-20261022）：**对象级 ACL**——
+    文件被任一产品引用（`assets.contractFile` / `featureDoc` / `asset_deliverables.file`）→ 所有
+    登录用户可见；未被引用的孤儿文件 → 仅 `uploadedBy == 当前用户` 或 admin 可见。
+    不可见返回 **404**（不返回 403，避免探测文件名是否存在）。
+    响应头追加 `X-Content-Type-Options: nosniff`（禁止浏览器 MIME 嗅探）。
+    """
     path = _resolve_upload(filename)
+    visible = services.build_visibility(db, user).file_visible(os.path.basename(filename or ""))
+    if not visible:
+        raise HTTPException(404, "文件不存在或已被删除")
     mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
     # 还原原始文件名：查 file_meta，无记录用散列名兜底；MIME 仍按扩展名
     m = db.get(models.FileMeta, filename)
@@ -770,7 +912,10 @@ def get_file(filename: str, inline: bool = Query(False, description="true 时内
     disposition = "inline" if inline else "attachment"
     return FileResponse(
         path, media_type=mime,
-        headers={"Content-Disposition": f"{disposition}; filename*=UTF-8''{quoted}"},
+        headers={
+            "Content-Disposition": f"{disposition}; filename*=UTF-8''{quoted}",
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 
@@ -783,6 +928,12 @@ def delete_file(filename: str, db: Session = Depends(get_db),
     ).first()
     if ref is not None:
         raise HTTPException(400, f"该文件仍被产品「{ref.name}」引用（产品清单/功能清单），请先修改产品附件后再删除")
+    # ADR-024：仍被交付物附件（asset_deliverables.file）引用的文件禁止删除
+    dref = db.query(models.AssetDeliverable).filter(models.AssetDeliverable.file == filename).first()
+    if dref is not None:
+        a = db.get(models.Asset, dref.asset_id)
+        aname = a.name if a else str(dref.asset_id)
+        raise HTTPException(400, f"该文件仍被产品「{aname}」的交付物「{dref.name}」引用（交付物附件），请先移除交付物附件后再删除")
     path = _resolve_upload(filename)
     os.remove(path)
     # 同步清理 file_meta 原名映射（无行则忽略，幂等）

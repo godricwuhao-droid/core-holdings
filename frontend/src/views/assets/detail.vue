@@ -23,6 +23,7 @@ import {
   Operation,
   Plus,
   Tickets,
+  Upload,
 } from '@element-plus/icons-vue'
 import {
   ASSET_STOCK_STATE,
@@ -32,14 +33,17 @@ import {
   assetStockState,
   availableQty,
   boardLabel,
+  displayUnitPrice,
   entityShort,
   expiryText,
   formatAssetQty,
   formatMoney,
+  isAmountMode,
   noSellableStock,
   priceRangeText,
   tagInfo,
   rsItemName,
+  type AssetDeliverable,
   type AssetFlow,
   type DeliverableCategory,
   type FlowType,
@@ -54,6 +58,8 @@ import {
   addRsItem,
   deleteAsset,
   deleteRsItem,
+  deleteUploadFile,
+  fileDisplayName,
   getAsset,
   getAssetDeliverables,
   allUserOptions,
@@ -66,12 +72,14 @@ import {
   translateFileNames,
   updateAssetDeliverable,
   updateRsItem,
+  uploadFile,
   db,
   type RsItemInput,
   type UserOption,
 } from '@/api'
 import { PROVINCES } from '@/constants'
 import { canWrite, NO_PERM_TIP } from '@/auth'
+import FilePreview from '@/components/FilePreview.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -311,24 +319,119 @@ async function confirmDel() {
     ElMessage.warning('请输入交付物名称')
     return
   }
-  await addAssetDeliverable(asset.value.id, { ...delCreate.form })
-  ElMessage.success('新增成功')
-  delCreate.visible = false
+  // FIX-20261022 / BUG-09：写操作补 catch（后端 400/422 此前完全静默）
+  try {
+    await addAssetDeliverable(asset.value.id, { ...delCreate.form })
+    ElMessage.success('新增成功')
+    delCreate.visible = false
+  } catch (e) {
+    showError(e, '新增失败')
+  }
 }
 
-/** 查看（行点击），引用保持响应式 */
-const viewing = ref<import('@/types').AssetDeliverable | null>(null)
+/**
+ * 交付物详情弹窗：只持有 id，数据按 id 从**刷新后的镜像**取值（FIX-20261022 / BUG-36）。
+ * 原实现持有打开瞬间的对象引用 → 标记就绪/上传附件等写操作刷新 bootstrap 后，
+ * 弹窗仍显示旧状态（与列表不一致）；改为 computed 后弹窗内容随 `db.assetDeliverables` 自动同步。
+ */
+const viewingId = ref<number | null>(null)
 const viewDialog = ref(false)
+const viewing = computed<AssetDeliverable | null>(() =>
+  viewingId.value == null ? null : deliverables.value.find((d) => d.id === viewingId.value) ?? null,
+)
 
 function openView(id: number) {
-  viewing.value = deliverables.value.find((d) => d.id === id) ?? null
+  viewingId.value = id
   viewDialog.value = true
 }
 
 async function setDelStatus(status: 'ready' | 'todo') {
-  if (!asset.value || !viewing.value) return
-  await updateAssetDeliverable(asset.value.id, viewing.value.id, { status })
-  ElMessage.success(status === 'ready' ? '已置为「已就绪」' : '已置为「待完善」')
+  const d = viewing.value
+  if (!asset.value || !d) return
+  // FIX-20261022 / BUG-09：补 catch（含与列表同步：失败不提示成功）
+  try {
+    await updateAssetDeliverable(asset.value.id, d.id, { status })
+    ElMessage.success(status === 'ready' ? '已置为「已就绪」' : '已置为「待完善」')
+  } catch (e) {
+    showError(e, '状态更新失败')
+  }
+}
+
+// ============================================================
+// 交付物附件（ADR-024：每项单文件；交互对齐 create.vue「产品清单」(contractFile)）
+// 上传/替换/删除仅 canWrite（editor/admin）；预览所有角色（含 viewer）可用
+// ============================================================
+const DEL_FILE_EXTS = ['pdf', 'docx', 'png', 'jpg', 'jpeg', 'gif', 'webp']
+const delFileInputRef = ref<HTMLInputElement>()
+const delFileTarget = ref<AssetDeliverable | null>(null)
+const delUploading = ref(false)
+
+function pickDelFile(d: AssetDeliverable) {
+  delFileTarget.value = d
+  const input = delFileInputRef.value
+  if (!input) return
+  input.value = ''
+  input.click()
+}
+
+function onDelFilePicked(e: Event) {
+  const input = e.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  const d = delFileTarget.value
+  const a = asset.value
+  if (!file || !d || !a) return
+  const ext = (file.name.split('.').pop() || '').toLowerCase()
+  if (!DEL_FILE_EXTS.includes(ext)) {
+    ElMessage.warning('文件格式不支持：仅允许 PDF、Word（.docx）、图片（不支持 .doc / .xlsx）')
+    return
+  }
+  delUploading.value = true
+  uploadFile(file)
+    .then(async (res) => {
+      await updateAssetDeliverable(a.id, d.id, { file: res.filename })
+      ElMessage.success('附件上传成功')
+    })
+    .catch((err) => showError(err, '附件上传失败'))
+    .finally(() => {
+      delUploading.value = false
+    })
+}
+
+async function removeDelFile(d: AssetDeliverable) {
+  const a = asset.value
+  if (!a) return
+  try {
+    await ElMessageBox.confirm('移除附件后文件将被一并删除，不可恢复。', '移除附件', { type: 'warning' })
+  } catch {
+    return
+  }
+  const stored = d.file
+  delUploading.value = true
+  try {
+    await updateAssetDeliverable(a.id, d.id, { file: '' })
+  } catch (err) {
+    showError(err, '移除附件失败')
+  } finally {
+    delUploading.value = false
+  }
+  if (stored) {
+    try {
+      await deleteUploadFile(stored)
+      ElMessage.success('附件已移除')
+    } catch (err) {
+      // 后端 400：文件仍被其他记录引用（如产品清单）——字段已清空，物理文件保留
+      ElMessage.warning(err instanceof Error ? err.message : '该文件仍被其他记录引用，已清空附件字段，文件未删除')
+    }
+  }
+}
+
+// ADR-024：附件预览（全屏复用 FilePreview，弹窗内自带下载入口；viewer 亦可）
+const delPreviewVisible = ref(false)
+const delPreviewFile = ref('')
+function openDelPreview(filename: string) {
+  delPreviewFile.value = filename
+  delPreviewVisible.value = true
 }
 
 // ============================================================
@@ -399,6 +502,23 @@ watch(assetId, () => {
   opLog.items = []
   opLog.total = 0
 })
+
+/**
+ * FIX-20261022 / BUG-40：页签分页数据「写后失效」修复。
+ * PAGE-20261021 把 `loaded` 做成一次性标记（首次进入才拉取，避免重复请求）——但本页的写操作
+ * （交付物新增/状态/附件、可售明细 CRUD）都会走 afterWrite 刷新 bootstrap，`db.logs` / `db.flows`
+ * 长度随之变化，而页签数据仍是旧快照且 `loaded` 已为 true → 再进页签也不重拉。
+ * 现按镜像长度变化重置 loaded：当前正停在该页签则立刻重载，否则下次进入时由 ensureTabLoaded 重拉。
+ */
+function invalidatePager(state: { loaded: boolean }, load: () => void, tab: string) {
+  state.loaded = false
+  if (activeTab.value === tab) load()
+}
+watch(() => db.logs.length, () => invalidatePager(opLog, loadOpLogs, 'logs'))
+watch(() => db.flows.length, () => invalidatePager(flow, loadFlows, 'flows'))
+// 可售明细同理（本页 CRUD 后已有显式 loadRsItems 重载）：这里只重置 loaded，
+// 不立即重拉，避免与 saveRsItem/removeRsItem 的重载叠加成两次请求
+watch(() => db.rsItems.length, () => { rs.loaded = false })
 
 /** 精度选项（米） */
 const RS_RESOLUTIONS = [0.5, 1, 1.5, 2]
@@ -657,10 +777,11 @@ function operatorText(f: AssetFlow): string {
                   </div>
                   <div class="info-item">
                     <span class="il">销售单价</span>
-                    <!-- ADR-017（2026-10-20）：包量定价产品单价与普通产品一致（元/份），删除「元/万Token」特判 -->
+                    <!-- ADR-025（2026-10-21）：包量定价（amount 模式）统一走百万Token 口径（与列表列同口径） -->
                     <!-- ADR-018（PRICING-20261020）：有参考区间时追加区间提示（与列表列同口径） -->
                     <span class="iv">
-                      {{ asset.salePrice ? formatMoney(asset.salePrice) : '-' }}<template v-if="asset.repeatSale"> / {{ asset.unit }}</template>
+                      <template v-if="isAmountMode(asset)">{{ asset.salePrice ? displayUnitPrice(asset) : '-' }}</template>
+                      <template v-else>{{ asset.salePrice ? formatMoney(asset.salePrice) : '-' }}<template v-if="asset.repeatSale"> / {{ asset.unit }}</template></template>
                       <template v-if="priceRangeText(asset)">（参考区间 {{ priceRangeText(asset) }}）</template>
                     </span>
                   </div>
@@ -770,6 +891,14 @@ function operatorText(f: AssetFlow): string {
 
           <!-- 2 交付物 -->
           <el-tab-pane :label="`交付物（${deliverables.length}）`" name="deliverables">
+            <!-- ADR-024：交付物附件上传（隐藏 input，accept 仅 .pdf/.docx/图片，禁 .doc/.xlsx；行上操作，新增对话框不带附件） -->
+            <input
+              ref="delFileInputRef"
+              type="file"
+              accept=".pdf,.docx,.png,.jpg,.jpeg,.gif,.webp"
+              style="display: none"
+              @change="onDelFilePicked"
+            />
             <div class="stat-cards del-stats">
               <div class="stat-card">
                 <div>
@@ -850,6 +979,42 @@ function operatorText(f: AssetFlow): string {
                       </div>
                     </div>
                     <div class="dl-right">
+                      <template v-if="!d.file">
+                        <!-- ADR-024：单文件附件——无附件显示「上传」（仅 canWrite）；有附件显示原名 + 预览 + 删除（canWrite） -->
+                        <template v-if="canWrite">
+                          <el-tooltip :content="NO_PERM_TIP" :disabled="canWrite" placement="top">
+                            <el-button
+                              link
+                              type="primary"
+                              size="small"
+                              :icon="Upload"
+                              :loading="delUploading"
+                              @click.stop="pickDelFile(d)"
+                            >
+                              上传
+                            </el-button>
+                          </el-tooltip>
+                        </template>
+                        <span v-else class="dl-file-none muted">无附件</span>
+                      </template>
+                      <template v-else>
+                        <a class="dl-file-name" :title="fileDisplayName(d.file)" @click.stop="openDelPreview(d.file as string)">
+                          {{ fileDisplayName(d.file) }}
+                        </a>
+                        <el-button link type="primary" size="small" @click.stop="openDelPreview(d.file as string)">
+                          预览
+                        </el-button>
+                        <el-button
+                          v-if="canWrite"
+                          link
+                          type="danger"
+                          size="small"
+                          :loading="delUploading"
+                          @click.stop="removeDelFile(d)"
+                        >
+                          删除
+                        </el-button>
+                      </template>
                       <span class="dl-pill" :class="d.status === 'ready' ? 'ok' : 'wip'">
                         {{ d.status === 'ready' ? '已就绪' : '待完善' }}
                       </span>
@@ -973,13 +1138,15 @@ function operatorText(f: AssetFlow): string {
                 </div>
               </div>
               <el-empty v-if="!flow.loading && !filteredFlows.length" description="暂无流水" :image-size="70" />
-              <!-- PAGE-20261021：服务端分页（el-pagination 照 settings/users.vue 先例） -->
+              <!-- PAGE-20261021：服务端分页（el-pagination 照 settings/users.vue 先例）
+                   FIX-20261022 / BUG-40：类型筛选仅作用于当前页 → 筛选态隐藏全量 total
+                   （避免「筛选 0 条却显示共 37 条」；口径说明见卡头 desc） -->
               <div v-if="flow.total > 0" class="pagination">
                 <el-pagination
                   v-model:current-page="flow.page"
                   :page-size="flow.pageSize"
                   :total="flow.total"
-                  layout="total, prev, pager, next"
+                  :layout="flowFilter === 'all' ? 'total, prev, pager, next' : 'prev, pager, next'"
                   @current-change="onFlowPageChange"
                 />
               </div>
@@ -1119,6 +1286,11 @@ function operatorText(f: AssetFlow): string {
           </el-tooltip>
           <el-button @click="viewDialog = false">关闭</el-button>
         </template>
+      </el-dialog>
+
+      <!-- ADR-024：交付物附件预览（全屏复用 FilePreview，弹窗内自带下载入口） -->
+      <el-dialog v-model="delPreviewVisible" title="交付物附件预览" fullscreen append-to-body destroy-on-close>
+        <FilePreview v-if="delPreviewVisible && delPreviewFile" :filename="delPreviewFile" />
       </el-dialog>
 
       <!-- ADR-011：新增 / 编辑可售明细 -->
@@ -1483,6 +1655,21 @@ function operatorText(f: AssetFlow): string {
 .dl-pill.wip {
   color: #a86514;
   background: #fff5e7;
+}
+/* ADR-024：交付物附件（文字链接/文字按钮，复用平台 token，无新颜色与圆角） */
+.dl-file-name {
+  font-size: 13px;
+  color: var(--primary-color);
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dl-file-name:hover {
+  text-decoration: underline;
+}
+.dl-file-none {
+  font-size: 12px;
 }
 
 /* 分类图标 */

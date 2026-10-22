@@ -34,19 +34,23 @@ ASSETS = [
 
     # ================= 卫星 Token =================
     # ADR-008：卫星 Token 为包量计价（pricingMode='amount'，合同金额整数元权威；salePrice 仅参考值）
+    # BUG-34（FIX-20261022）：单位统一为「个」（ADR-025；当前库 `unit like '%颗%'` 已为 0 条，
+    # 此处修正只影响**空库重建**，不迁移存量库）。
+    # 数量口径自洽：非 repeatSale 且 soldCount=1 ⇒ 必须有对应已交付口径（shippedQty=1，
+    # 数量售罄时 status=all_sold）；repeatSale 不加 shippedQty（只计次不扣量）。
     {"code": "CH-SAT-001", "name": "宏大卫星（26年10月发射）", "board": "satellite", "type": "卫星Token",
-     "subject": "四川蜂云星座人工智能科技有限公司", "unit": "颗", "quantity": 2, "lockedQty": 0, "shippedQty": 0, "repeatSale": False,
+     "subject": "四川蜂云星座人工智能科技有限公司", "unit": "个", "quantity": 2, "lockedQty": 0, "shippedQty": 0, "repeatSale": False,
      "salePrice": 0, "soldAmount": 0, "soldCount": 0, "status": "in_stock", "pricingMode": "amount",
      "inboundDate": "2026-06-01", "expiryDate": "2028-10-31", "perpetual": False,
      "spec": "2 颗自持卫星 Token 服务", "remark": "26 年 10 月发射", "updatedAt": "2026-09-01"},
     {"code": "CH-SAT-002", "name": "46号卫星（Token服务）", "board": "satellite", "type": "卫星Token",
-     "subject": "蜂云时代科技有限公司", "unit": "颗", "quantity": 1, "lockedQty": 0, "shippedQty": 0, "repeatSale": False,
-     "salePrice": 10000000, "soldAmount": 10000000, "soldCount": 1, "status": "in_stock", "pricingMode": "amount",
+     "subject": "蜂云时代科技有限公司", "unit": "个", "quantity": 1, "lockedQty": 0, "shippedQty": 1, "repeatSale": False,
+     "salePrice": 10000000, "soldAmount": 10000000, "soldCount": 1, "status": "all_sold", "pricingMode": "amount",
      "inboundDate": "2026-01-10", "expiryDate": "2026-12-01", "perpetual": False,
      "spec": "3 亿 Token，1000 万/3 亿 Token", "remark": "26 年已售 1000 万；服务期至 26 年 12 月", "updatedAt": "2026-09-01"},
     {"code": "CH-SAT-003", "name": "38号卫星（Token服务）", "board": "satellite", "type": "卫星Token",
-     "subject": "四川蜂云星座人工智能科技有限公司", "unit": "颗", "quantity": 1, "lockedQty": 0, "shippedQty": 0, "repeatSale": False,
-     "salePrice": 20000000, "soldAmount": 20000000, "soldCount": 1, "status": "in_stock", "pricingMode": "amount",
+     "subject": "四川蜂云星座人工智能科技有限公司", "unit": "个", "quantity": 1, "lockedQty": 0, "shippedQty": 1, "repeatSale": False,
+     "salePrice": 20000000, "soldAmount": 20000000, "soldCount": 1, "status": "all_sold", "pricingMode": "amount",
      "inboundDate": "2026-01-10", "expiryDate": "2029-06-30", "perpetual": False,
      "spec": "3 亿 Token，1000 万/3 亿 Token", "remark": "26 年已售 2000 万", "updatedAt": "2026-09-01"},
 
@@ -152,6 +156,32 @@ ASSETS = [
      "spec": "AI 算力集群（整机柜交付）", "remark": "集群可售", "updatedAt": "2026-09-01"},
 ]
 
+def _apply_quantity_invariants(rows: list[dict]) -> None:
+    """种子数量口径自洽（BUG-34，FIX-20261022；**只影响空库重建**，不迁移存量库）。
+
+    平台数量不变量（`services.auto_status` / 交付链路）：
+    - 交付一次 ⇒ `soldCount += 1`；非 repeatSale 同时 `shippedQty += qty`；
+    - repeatSale 只计次不扣量 ⇒ `shippedQty` 必须保持 0；
+    - `shippedQty` 累加后不可超过 `quantity`；售罄（可售=0 且非 repeatSale）⇒ `all_sold`。
+    历史汇总金额（`soldAmount`）> 0 但 `soldCount` = 0 的行属自相矛盾（有成交却无售卖次数），
+    按「至少成交 1 次」归一，避免抽屉「已售次数 0 / 累计金额非 0」的错位展示。
+    """
+    for a in rows:
+        if not a.get("soldAmount"):
+            continue
+        if not a.get("soldCount"):
+            a["soldCount"] = 1
+        if a.get("repeatSale"):
+            a["shippedQty"] = 0
+            continue
+        a["shippedQty"] = max(int(a.get("shippedQty") or 0), 1)
+        if a["quantity"] - (a.get("lockedQty") or 0) - a["shippedQty"] <= 0:
+            a["status"] = "all_sold"
+
+
+_apply_quantity_invariants(ASSETS)
+
+
 SUPPLIERS = [
     {"name": "智元", "contact": "", "phone": "", "remark": "机器人本体"},
     {"name": "松延", "contact": "", "phone": "", "remark": "人形机器人（二期）"},
@@ -167,69 +197,11 @@ CATEGORY_UNITS = [
     {"board": "embodied", "type": "机器人", "unit": "套 / 台", "note": "整机交付，可选序列号交付"},
     {"board": "embodied", "type": "数采设备", "unit": "套", "note": "数采软件及设备接入"},
     {"board": "embodied", "type": "平台软件", "unit": "套", "note": "管理平台类"},
-    {"board": "satellite", "type": "卫星Token", "unit": "颗（Token 额度）", "note": "按 Token 额度与有效期售卖（包量计价，合同金额整数元权威，ADR-008）"},
+    {"board": "satellite", "type": "卫星Token", "unit": "个", "note": "按 Token 额度与有效期售卖（包量计价，合同金额整数元权威，ADR-008）"},
     {"board": "satellite", "type": "卫星数据", "unit": "轨 / 期 / 条", "note": "默认可重复售卖，不扣减数量"},
     {"board": "satellite", "type": "遥感数据", "unit": "份（区域·精度·日期）", "note": "按 省/精度/日期 三维唯一售卖（ADR-010）"},
     {"board": "software", "type": "软件", "unit": "套", "note": "永久 / 年限 / 并发 / 账号授权"},
     {"board": "hardware", "type": "硬件集群", "unit": "集群 / 台", "note": "整机柜或单台交付"},
     {"board": "compute", "type": "算力服务器", "unit": "台（服务期）", "note": "按服务期售卖，建设中"},
 ]
-
-
-def _t(name: str, category: str, required: bool, note: str) -> dict:
-    return {"name": name, "category": category, "required": required, "note": note}
-
-
-DELIVERABLE_TEMPLATES: dict[str, list[dict]] = {
-    "机器人": [
-        _t("硬件整机安装包", "install", True, "含本体与标准附件"),
-        _t("安装与调试手册", "install", True, "含调试、点检与初始上电流程"),
-        _t("产品授权证书", "license", True, "序列号证书，交付后签发"),
-        _t("用户培训资料", "feature", False, "操作培训与交接资料"),
-        _t("验收检验报告模板", "accept", False, "验收前由项目经理补充"),
-    ],
-    "数采设备": [
-        _t("数采设备安装包", "install", True, "含设备接入配置文件"),
-        _t("数采软件授权", "license", True, "按账号授权"),
-        _t("数据处理指南", "feature", False, "数据采集与标注规范"),
-        _t("验收检验报告模板", "accept", False, "验收前由项目经理补充"),
-    ],
-    "平台软件": [
-        _t("软件安装包（离线部署版）", "install", True, "V1.0 · 2.1 GB"),
-        _t("软件授权许可证模板", "license", True, "交付时生成"),
-        _t("软件产品功能清单", "feature", True, "包含模块、能力与技术价值"),
-        _t("产品介绍与演示材料", "feature", False, "PPTX · 用于售前沟通和客户演示"),
-        _t("验收测试报告模板", "accept", False, "交付前由项目经理补充"),
-    ],
-    "卫星Token": [
-        _t("Token 授权开通凭证", "license", True, "按额度与有效期签发"),
-        _t("接口接入文档", "feature", True, "调用接口与参数说明"),
-        _t("数据产品介绍材料", "feature", False, "用于售前沟通和客户演示"),
-        _t("服务级别协议（SLA）", "accept", False, "SLA 与结算口径"),
-    ],
-    "卫星数据": [
-        _t("数据授权凭证", "license", True, "交付时生成，记录授权范围"),
-        _t("数据说明与元数据说明", "feature", True, "含数据范围、分辨率与期次"),
-        _t("数据样例集", "feature", False, "供客户验证使用"),
-        _t("验收确认单模板", "accept", False, "交付前由项目经理补充"),
-    ],
-    "软件": [
-        _t("软件安装包（离线部署版）", "install", True, "V1.0 · 3.6 GB · 更新于 2026-09-28"),
-        _t("软件授权许可证模板", "license", True, "永久 / 年限 / 并发授权 · 交付时生成"),
-        _t("部署与运维手册", "install", True, "V1.2 · PDF · 更新于 2026-10-09"),
-        _t("软件产品功能清单", "feature", True, "V1.0 · 包含模块、能力与技术价值"),
-        _t("产品介绍与演示材料", "feature", False, "PPTX · 用于售前沟通和客户演示"),
-        _t("验收测试报告模板", "accept", False, "DOCX · 交付前由项目经理补充"),
-    ],
-    "硬件集群": [
-        _t("硬件配置清单", "install", True, "含机柜、服务器与网络设备"),
-        _t("机柜部署与调试手册", "install", True, "含现场部署流程"),
-        _t("集群验收报告模板", "accept", True, "整机柜交付时完成"),
-        _t("运维交接资料", "feature", False, "移交客户运维团队"),
-    ],
-    "算力服务器": [
-        _t("服务开通凭证", "license", True, "按服务期签发"),
-        _t("资源池配置说明", "feature", True, "算力规格与额度说明"),
-        _t("服务协议与 SLA", "accept", False, "服务期与结算口径"),
-    ],
-}
+# ADR-024：交付物模板种子数据已删除（模板体系下线，实例完全手动维护）

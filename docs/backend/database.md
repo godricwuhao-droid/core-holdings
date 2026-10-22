@@ -2,6 +2,176 @@
 
 > SQLite（`backend/core_holdings.db`），ORM：SQLAlchemy 2.x 声明式。字段 camelCase，与前端 `types.ts` 对齐。
 > 变更方式：`main.py::_ensure_migration()` 轻量迁移（`ALTER TABLE ... ADD COLUMN`，幂等判断），`Base.metadata.create_all` 不会改已存在的表。
+> **FIX-20261022 起（ADR-031）**：新增 `schema_migrations(name PK, appliedAt, note)` 标记表——启动期**只做结构迁移**，所有数据类一次性动作必须经 `_run_once(标记名, fn)`「查标记 → 执行一次 → 写标记」；**禁止**在启动期对业务表执行无标记的 `DELETE/UPDATE`。
+
+---
+
+## 2026-10-22 变更（ENTITIES-20261022 / ADR-035：资产主体表 `entities` + 存量回填）
+
+### 1. 新增表
+
+| 表 | 主键 | 字段 | 说明 |
+|---|---|---|---|
+| `entities` | `id` 自增 | `name` VARCHAR(128) **UNIQUE**（公司全称，与 `assets.subject` 存储口径一致）、`short` VARCHAR(64)（展示简称，默认=name）、`createdAt` VARCHAR(32)、`updatedAt` VARCHAR(32) | 资产主体清单（ADR-035），单一事实来源。不建外键（H7 策略）：引用完整性（删除前 `assets.subject` 计数校验）由服务层保证 |
+
+### 2. 迁移语句（`main.py`，幂等；不引入 Alembic）
+
+```sql
+-- 结构：建表（create_all 直接建出 entities，name UNIQUE 随约束生成）
+
+-- 数据类一次性动作（_run_once，标记 ADR035_entities_backfill 写入 schema_migrations）：
+INSERT OR IGNORE INTO entities (name, short, createdAt, updatedAt)
+SELECT DISTINCT subject, subject, :now, :now FROM assets WHERE subject <> '';
+```
+
+| 标记名 | 动作 | 存量库行为 |
+|---|---|---|
+| `ADR035_entities_backfill` | 存量 `assets.subject` 去重回填 `entities`（short 默认取 name，由管理员在设置页修正） | 首启回填 4 条（现库 subject 恰好 4 家）；第二次启动零写入（行数稳定 4、标记 1 行）；空库回填 0 条 |
+
+### 3. 实测
+
+副本库（`/tmp`）重复启动 2 次：`entities` 行数稳定（4）、`schema_migrations` 标记不重复（1 行）；空库启动：回填 0 条、0 行、标记 1 行。纯增量——只 INSERT `entities`，不动 `assets` 及其他业务表。
+
+---
+
+## 2026-10-22 变更（FIX-20261022 / ADR-031 ~ ADR-034：迁移治理 + 2 列 + 1 张表 + 2 个唯一索引）
+
+### 1. 新增表
+
+| 表 | 主键 | 字段 | 说明 |
+|---|---|---|---|
+| `schema_migrations` | `name` | `name` VARCHAR(64) PK、`appliedAt` VARCHAR(32)、`note` VARCHAR(255) | 迁移执行标记（ADR-031）。启动期结构迁移不写标记（靠 inspector 判列幂等）；**数据类一次性动作**必须写标记，执行前查标记 |
+| `idempotency` | `id` 自增 | `userId` VARCHAR(64)、`scope` VARCHAR(32)（当前仅 `checkout`）、`requestId` VARCHAR(64)、`projectId` INTEGER NULL、`createdAt` VARCHAR(32)、**UNIQUE(`userId`,`scope`,`requestId`)** | 请求幂等键（BUG-10 / ADR-033 §1）。`POST /cart/checkout` 首次成功后写 `projectId`；同一键 24h 内重复请求直接返回首次项目。保留期 24h，过期记录在复用同键时被覆盖（不做自动清理任务） |
+
+### 2. 新增列
+
+| 表.列 | 类型 | 可空 | 默认 | 说明 |
+|---|---|---|---|---|
+| `users.tokenVersion` | INTEGER | 是 | 0 | 凭据版本（BUG-11 / ADR-034 §2）：写入 JWT payload `ver`，`get_current_user` 每请求比对，不一致 401。改密 / 禁用 / 改角色时 +1。存量账号补列置 0（旧 token 无 `ver` 按 0 处理，仍然有效直至自然过期） |
+| `logs.projectId` | INTEGER | 是 | NULL | 项目级操作日志的结构化归属外键（BUG-13 / ADR-030 §4）：viewer 日志可见性只看外键（`projectId`/`contractId`），不再用 detail 文本里的 `SP-` 正则。新建日志由 `add_log(..., project_id=...)` 写入；**存量 project 日志保持 NULL → 对 viewer 一律过滤**（宁可保守） |
+
+### 3. 新增唯一索引
+
+| 索引 | 定义 | 说明 |
+|---|---|---|
+| `uq_project_items_key` | `UNIQUE(contractId, assetId, COALESCE(itemId, 0))` WHERE 两列非空 | BUG-19：同一销售记录内不可重复同一产品/明细行。建前先跑查重 SQL，**存在重复行则跳过并打印告警**（不启动失败、不删数据）。实测存量库无重复 → 已建立 |
+| ~~`uq_contracts_project_customer`~~ | ~~`UNIQUE(projectId, customer)`~~ | ⚠️ **未创建**（BUG-19 原文要求，技术冲突）：ADR-016 销售记录粒度 = 一产品（×客户）一条 ⇒ 同一项目同一客户**必然**多条（现库 `projectId=2` 即有 3 条 `customer='云从'`）。建该索引会阻断购物车「多产品同客户」结算（IntegrityError → 500）。**替代方案**：① 迁移期查重并打印警告（`main._ensure_unique_indexes`）；② 服务层禁止「同项目 + 同客户 + 同明细集合」重复（400「客户「X」下相同的销售明细不可重复建记录」）与同一记录内重复产品行（400）；③ `uq_project_items_key` 阻断记录内重复行 |
+
+### 4. 迁移语句（`main.py`，幂等；不引入 Alembic）
+
+```sql
+-- 结构：建表（create_all 直接建出 schema_migrations / idempotency）
+-- 结构：补列（inspector 判定，列已存在则 no-op）
+ALTER TABLE users ADD COLUMN tokenVersion INTEGER DEFAULT 0;
+ALTER TABLE logs  ADD COLUMN projectId INTEGER;
+
+-- 结构：唯一索引（先查重，有重复则跳过 + 告警，不阻断启动）
+CREATE UNIQUE INDEX IF NOT EXISTS uq_project_items_key
+  ON project_items (contractId, assetId, COALESCE(itemId, 0));
+```
+
+数据类一次性动作（`_run_once`，标记写入 `schema_migrations`；第二次启动**零写入**）：
+
+| 标记名 | 动作 | 存量库行为 |
+|---|---|---|
+| `ADR024_cleanup_done` | **仅写标记**（原「每次启动全表 DELETE `asset_deliverables`」已删除，BUG-01/ADR-031） | 0 行 DELETE；实测预置 1 条交付物后启动/重启仍为 1 条 |
+| `ADR027_cartrefilled_backfill` | 历史已撤销终止项目 `cartRefilled=1` | 首启命中 1 条（已存在标记的库不再执行） |
+| `ADR011_demo_asset_cleanup` | 删除 ADR-010 演示遥感数据产品及其从属行（交付物用 Core Delete 按 `asset_id` 精确限定） | 命中 0 条 |
+| `ADR008_pricingmode_backfill` | 卫星Token 产品 `pricingMode='amount'` | 命中 0 条 |
+| `ADR009_cart_userid_backfill` | `cart_items.userId='admin'` → admin 的 `users.id` | 命中 0 条 |
+| `LEGACY_project_status_3state` | 旧 8 态项目状态归一为 3 态 | 命中 0 条 |
+| `assets_status_backfill` | 按 `services.auto_status` 回填 `assets.status` | 命中 0 条（此后不再每次启动扫描全表） |
+| `file_meta_backfill_done` | 存量 `uploads/` 文件回填 `file_meta` | `file_meta` 非空 → 跳过并写标记（空库重建时回填 65 条） |
+
+### 5. 存量库实测（28 产品 / 3 项目 / 7 合同 / 49 文件）
+
+启动（含 `--reload` 热重载）后逐表计数与迁移前**完全一致**：`assets 28 / projects 3 / contracts 7 / project_items 7 / file_meta 49 / cart_items 11 / outbounds 1 / flows 194 / logs 571 / users 8 / asset_deliverables 0 / rs_items 97`；无 DELETE、无行数变化；`asset_deliverables` 保持 0 行（**历史交付物不恢复**，附件仍在 `uploads/`，可人工按审计日志重建）。
+
+---
+
+## 2026-10-21 变更（ADR-027 明细回填购物车幂等标记 `projects.cartRefilled`）
+
+### 新增列
+
+| 表.列 | 类型 | 可空 | 默认 | 说明 |
+|-------|------|------|------|------|
+| `projects.cartRefilled` | BOOLEAN | 否 | 0 | 该项目明细**是否已回填购物车**（ADR-027 幂等标记）。`withdraw_project`（撤销）回填成功后置 1；`POST /projects/{id}/refill-cart`（重新提交）见 1 直接返回 `alreadyRefilled=true` 不重复回填，首次回填成功后置 1 |
+
+`ProjectOut` 同步输出 `cartRefilled`（bootstrap `projects[]` / 结算响应）。
+
+### 迁移语句（幂等，`main.py::_ensure_migration` 第 18 项）
+
+```sql
+-- 1) 补列（幂等：projects 无该列才执行；SQLite 加列不能带 NOT NULL，故用 DEFAULT 0）
+ALTER TABLE projects ADD COLUMN cartRefilled BOOLEAN DEFAULT 0;
+
+-- 2) 一次性数据迁移：历史「已撤销」的终止项目置 1
+--    判据：其名下任一合同 remark 含「撤销」（与 ADR-026 withdraw 写入格式「撤销：{reason}」一致）；
+--    「驳回」项目的 remark 为「驳回：{reason}」，不含「撤销」→ 保持 0（首次点重新提交才回填）。
+--    幂等：只更新 COALESCE(cartRefilled,0)=0 的行，已是 1 直接跳过（复跑命中 0 条）。
+UPDATE projects SET cartRefilled = 1
+WHERE COALESCE(cartRefilled, 0) = 0
+  AND status = 'terminated'
+  AND EXISTS (
+    SELECT 1 FROM contracts
+    WHERE contracts.projectId = projects.id AND contracts.remark LIKE '%撤销%'
+  );
+```
+
+### 迁移说明
+
+- 真实库首启命中 1 条（`SP-2026102110215709 云从项目`，3 个合同 remark 均为「撤销：213」→ `cartRefilled=1`），`projects/subjects` 其余行不变；重复启动（`touch main.py` 触发 reload 复跑）命中 0 条、值不再变化。
+- 无索引变更；无表删除；`cartRefilled` 为纯增量列，回退只需忽略该列（代码不读即兼容）。
+
+---
+
+## 2026-10-21 变更（ADR-026 撤销待审核订单）
+
+**无表结构变更（仅写既有字段）。**
+
+| 操作 | 表/列 | 说明 |
+|---|---|---|
+| 更新 | `contracts.status` / `contracts.remark` / `contracts.updatedAt` | `pending → terminated`；`remark` 追加「撤销：{reason}」（追加不覆盖，已含同文案不重复追加） |
+| 更新 | `projects.status` / `projects.businessOwner` / `projects.updatedAt` | 置 `terminated`；`businessOwner` 置空（原值写入 OpLog 详情） |
+| 更新 | `projects.customer` / `subject` / `expectedAmount` / `contractAmount` | 由 `_recompute_project` 按合同派生重算（口径不变） |
+| 更新 | `project_items.status` | `locked/confirmed → released` |
+| 更新 | `assets.lockedQty` / `assets.status` / `assets.updatedAt` | 逐明细释放真实锁定（仅 `locked=true` 的行），由 `apply_item_lock(..., add=False)` + `refresh_status` 维护 |
+| 新增行 | `flows` | `type='cancel_release'`（每行一条，repeatSale/明细 repeatSale 行不产生） |
+| 新增行 | `cart_items` | 按 `(userId, assetId, itemId, customer)` 判重回填下单人购物车（命中即合并 qty / 覆盖 amount） |
+| 新增行 | `logs`（OpLog）/ `audit_logs` | `撤销订单` 各 1 条（另有既有合同级「销售记录状态变更」日志） |
+
+无新增表/列/索引，`_ensure_migration()` 无需改动。
+
+---
+
+## 2026-10-21 变更（ADR-024：交付物模板下线 + 交付物附件，⚠️ 破坏性）
+
+### 删除表
+
+| 表 | 说明 |
+|---|---|
+| `deliverable_templates`（已删除） | 交付物模板体系下线（ADR-024）：模型/端点/种子数据全删；启动迁移 `DROP TABLE IF EXISTS deliverable_templates` 幂等清理旧库物理表。交付物实例改为产品详情页完全手动维护 |
+
+### 新增列
+
+| 表.列 | 类型 | 可空 | 说明 |
+|-------|------|------|------|
+| `asset_deliverables.file` | VARCHAR(255) | 是 | 交付物单文件附件（存 `/api/upload` 返回的散列文件名；NULL/空=无附件）。`PUT /assets/{id}/deliverables/{item_id}` patch 白名单追加（`""`/null → 落库 NULL）；bootstrap `assetDeliverables` 行携带 `file`；`DELETE /upload/{filename}` 引用检查追加本列 |
+
+### 存量数据一次性清空（幂等）
+
+- `asset_deliverables` 表存在且**非空**时 `DELETE FROM asset_deliverables`（空表跳过，幂等）。模板体系下线后各产品交付物从零手动添加（用户已确认，ADR-024 §2）。
+- 无其他表引用 `asset_deliverables`，直接清；`product 删除`（`delete_asset`）的级联清理逻辑不受影响。
+
+### 迁移语句（`main.py::_ensure_migration`）
+
+```sql
+DROP TABLE IF EXISTS deliverable_templates;      -- 旧库物理表清理（表存在才执行）
+ALTER TABLE asset_deliverables ADD COLUMN file VARCHAR(255);
+DELETE FROM asset_deliverables;                   -- 一次性清空（仅表非空时执行）
+```
+
+> 注：沿用 inspector + ALTER TABLE / 条件 DDL 幂等模式，可重复启动；`asset_deliverables` 其余列（id/asset_id/name/category/required/note/version/meta/status/updatedAt）不变。
 
 ---
 
@@ -406,6 +576,7 @@ ALTER TABLE logs   ADD COLUMN changes    VARCHAR(512) DEFAULT '';
 | expectedAmount/quoteAmount/contractAmount/paidAmount | FLOAT | 各口径金额（expectedAmount/contractAmount 为合同派生，2026-10-15 起） |
 | rep | VARCHAR(64) | 生态人员（销售对接人姓名，展示字段） |
 | creator | VARCHAR(64) INDEX | 实际登录下单的 username（2026-10-16 新增，幂等补列）；三个建单入口自动写入，存量项目为空。生态人员「仅可见自己下单项目」的判定依据（`services.user_sees_project`：creator==自己，存量回退 rep==自己姓名） |
+| cartRefilled | BOOLEAN 默认 0 | 明细是否已回填购物车（ADR-027，2026-10-21 幂等补列）。撤销（`withdraw`）回填成功后置 1；`POST /projects/{id}/refill-cart`（重新提交）见 1 直接返回 `alreadyRefilled=true` 不重复回填，首次回填成功后置 1。历史已撤销项目在启动迁移中按「合同 remark 含撤销」置 1 |
 | items | 关系 | `ProjectItem`，cascade delete-orphan |
 | contracts | 关系 | `Contract`，cascade delete-orphan（2026-10-15 新增） |
 
@@ -464,7 +635,7 @@ ALTER TABLE logs   ADD COLUMN changes    VARCHAR(512) DEFAULT '';
 
 ### 其它表
 
-`flows`（产品流水）、`logs`（操作日志，见上）、`base_records`、`deliverable_templates`、`category_units`、`asset_deliverables`、`cart_items`、`file_meta`（上传文件原名映射，见上）。
+`flows`（产品流水）、`logs`（操作日志，见上）、`base_records`、~~`deliverable_templates`~~（已删除，ADR-024）、`category_units`、`asset_deliverables`（2026-10-21 起含 `file` 附件列，ADR-024）、`cart_items`、`file_meta`（上传文件原名映射，见上）。
 
 ---
 

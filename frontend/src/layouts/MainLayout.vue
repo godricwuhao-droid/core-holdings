@@ -103,14 +103,16 @@
             </el-menu-item>
           </el-sub-menu>
 
-          <el-sub-menu v-if="isAdmin" index="settings">
-            <template #title>
-              <el-icon><Setting /></el-icon>
-              <span>基础设置</span>
-            </template>
-            <el-menu-item index="/settings/deliverables">交付物设置</el-menu-item>
-            <el-menu-item index="/settings/users">账号与审计</el-menu-item>
-          </el-sub-menu>
+          <el-menu-item v-if="isAdmin" index="/settings/users">
+            <el-icon><Setting /></el-icon>
+            <template #title>账号与审计</template>
+          </el-menu-item>
+          <!-- ENTITIES-20261022 / ADR-035；FORMS-20261022（ADR-036）：菜单改名「资产主体」→「公司主体」（路由路径不变）——
+               v-if 与「账号与审计」同口径（isAdmin）；editor 可直达路由访问 -->
+          <el-menu-item v-if="isAdmin" index="/settings/entities">
+            <el-icon><OfficeBuilding /></el-icon>
+            <template #title>公司主体</template>
+          </el-menu-item>
         </el-menu>
       </el-aside>
 
@@ -131,6 +133,7 @@ import {
   Box,
   TrendCharts,
   Setting,
+  OfficeBuilding,
   Coin,
   CircleCheckFilled,
   Fold,

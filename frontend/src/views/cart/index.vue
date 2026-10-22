@@ -12,8 +12,9 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Delete, InfoFilled, ShoppingCart } from '@element-plus/icons-vue'
-import { availableQty, entityShort, formatMoney, formatTokens, isAmountMode, priceRangeText, rsItemName, type Asset, type CartItem, type RsItem } from '@/types'
+import { availableQty, displayUnitPrice, entityShort, formatMoney, formatTokens, isAmountMode, priceRangeText, rsItemName, type Asset, type CartItem, type RsItem } from '@/types'
 import { checkoutCart, clearCart, db, getAsset, patchCartItem, refresh, removeCartItem, rsItemById, setCartAmount, setCartQty, setCartService, showError, type OrderFields } from '@/api'
+import { isViewer } from '@/auth'
 import SalesOrderDialog from '@/components/SalesOrderDialog.vue'
 import type { OrderItem } from '@/components/SalesOrderDialog.vue'
 
@@ -30,10 +31,13 @@ interface CartRow {
    *  显式 `RsItem | undefined`（而非可选属性）：computed map 恒返回该键，
    *  可选属性会使 filter 类型谓词 `r is CartRow` 不满足可赋值性（TS2677） */
   rsItem: RsItem | undefined
+  /** 本行可用数量上限（FIX-20261022 / BUG-22）：可重复售卖 null（不限），否则为
+   *  「可售数量 − 同产品其他行已占数量」 */
+  avail: number | null
 }
 
-const cartRows = computed<CartRow[]>(() =>
-  db.cart
+const cartRows = computed<CartRow[]>(() => {
+  const rows = db.cart
     .map((c) => {
       const asset = getAsset(c.assetId)
       const rsItem = c.itemId != null ? rsItemById(c.itemId) : undefined
@@ -44,10 +48,29 @@ const cartRows = computed<CartRow[]>(() =>
       //（与后端 checkout 回退口径一致，ADR-012）、unit 行 = 单价×数量
       const amountFallback = Math.round((asset?.salePrice ?? 0) * c.qty)
       const subtotal = c.amount ?? (rsItem ? rsItem.price : isAmount ? amountFallback : (asset?.salePrice ?? 0) * c.qty)
-      return { cart: c, asset, price: rsItem ? rsItem.price : asset?.salePrice ?? 0, subtotal, isAmount, rsItem }
+      return {
+        cart: c,
+        asset,
+        price: rsItem ? rsItem.price : asset?.salePrice ?? 0,
+        subtotal,
+        isAmount,
+        rsItem,
+        // 下面统一按「同产品其他行已占数量」回填（declared 为可空，避免字面量 null 收窄类型）
+        avail: null as number | null,
+      }
     })
-    .filter((r): r is CartRow => !!r.asset),
-)
+    .filter((r): r is CartRow => !!r.asset)
+  // FIX-20261022 / BUG-22：数量上限改「同产品合计」口径（后端 PUT /cart/{id} 与 checkout 均按
+  // 该产品在购物车全部行合计校验）——本行上限 = 可售 − 同 assetId 其他行 qty 合计，避免越界只能靠后端 400 回滚
+  const qtyByAsset = new Map<number, number>()
+  for (const r of rows) qtyByAsset.set(r.cart.assetId, (qtyByAsset.get(r.cart.assetId) ?? 0) + r.cart.qty)
+  for (const r of rows) {
+    if (r.asset.repeatSale) continue // 可重复售卖不限数量
+    const others = (qtyByAsset.get(r.cart.assetId) ?? 0) - r.cart.qty
+    r.avail = Math.max(0, (availableQty(r.asset) ?? 0) - others)
+  }
+  return rows
+})
 
 const totalQty = computed(() => db.cart.reduce((s, c) => s + c.qty, 0))
 const totalAmount = computed(() => cartRows.value.reduce((s, r) => s + r.subtotal, 0))
@@ -105,17 +128,20 @@ function amountValue(row: CartRow): number | undefined {
   return t === '' ? undefined : Number(t)
 }
 
+/** 手改金额标记（FIX-20261022 / BUG-25）：「手改金额 → 折扣作废」的清空动作合并到失焦提交，
+ *  逐字输入阶段不再写 db.cart 镜像（原实现在 onAmountInput 里直接置 discountRate=null，
+ *  敲第一个字就触发一次全表重渲染，与「逐字输入只写草稿」的既有约定相悖） */
+const amountManualDrafts = reactive<Record<number, boolean>>({})
+
 /** 金额输入：仅保留整数位（元口径，禁止小数）——CART-PERF-20261021：只写草稿，不再碰 row.cart.amount */
 function onAmountInput(row: CartRow, v: string) {
   const digits = (v ?? '').replace(/[^\d]/g, '')
   amountDrafts[row.cart.id] = digits
-  // DISCOUNT-20261021（ADR-023）一致性规则：手动编辑销售金额 → 清空该行折扣草稿（显示）
-  // 并置 discountRate 为 null（失焦提交 null）——金额是权威值，防止「显示 9 折但金额已被手改」。
-  // CART-PERF2-20261021（2026-10-21）：仅当 discountRate 非 null 时才置 null——
-  // 已为 null 时不再触碰镜像（避免敲金额首字时多余的镜像写触发一次全表重渲染）
+  // DISCOUNT-20261021（ADR-023）一致性规则：手动编辑销售金额 → 该行折扣作废（显示层先清空折扣草稿）；
+  // 镜像 discountRate 的清空合并到失焦提交（onAmountChange），见 amountManualDrafts 注释
   // 清折扣草稿用 delete（而非置 ''）：rate 置 null 后显示回退本就为 ''，delete 语义更准（无草稿）
   delete discountDrafts[row.cart.id]
-  if (row.cart.discountRate != null) row.cart.discountRate = null
+  amountManualDrafts[row.cart.id] = true
 }
 
 /** 2026-10-24（ADR-022）：金额缺项（空 / 0 / 非整数）→ 标红，与客户列同一「必填缺项」样式
@@ -153,15 +179,27 @@ function rowRangeText(row: CartRow): string {
 async function onAmountChange(row: CartRow) {
   const n = amountValue(row)
   if (n === undefined || !Number.isInteger(n) || n <= 0) return // 缺项不提交（标红由值驱动，草稿保留）
+  // FIX-20261022 / BUG-25：消费「手改金额」标记（敲字阶段只置标记，不写镜像）
+  const manualEdit = amountManualDrafts[row.cart.id] === true
+  delete amountManualDrafts[row.cart.id]
   row.cart.amount = n
   // CART-PERF2-20261021（2026-10-21）：清草稿用 delete（而非置 ''）——'' 是合法草稿值（用户清空未失焦），
   // delete 后显示回退已提交值（镜像已写入 n）
   delete amountDrafts[row.cart.id]
+  // FIX-20261022 / BUG-06：包量定价行折扣恒不参与（金额为权威输入，salePrice 仅参考）——
+  // 存量脏值一并在本次提交清空；FIX-20261022 / BUG-25：手改金额 → 折扣作废（镜像清空合并到本提交）
+  // ADR-037（FORMS-20261022）：viewer 历史 discountRate「不展示、不清空」（后端忽略该值，金额仍权威）——
+  // viewer 手改金额时不清镜像 rate（前端已无折扣入口，清了也没有再录入/清除的 UI）
+  let rate: number | null = null
+  if (row.isAmount || manualEdit) {
+    if (!isViewer.value && row.cart.discountRate != null) row.cart.discountRate = null
+  } else {
+    rate = row.cart.discountRate ?? null
+  }
   try {
     // 回传该行当前 qty：后端 PUT 对 qty<=0 直接 400，且区间校验按新 qty 重算
-    // DISCOUNT-20261021（ADR-023，2026-10-21）：amount + discountRate（0-1 小数）一次性提交；
-    // 手改金额路径已在 onAmountInput 清空该行折扣率，此处提交 null（后端只存不算）
-    await setCartAmount(row.cart.id, row.cart.qty, n, row.cart.discountRate ?? null)
+    // DISCOUNT-20261021（ADR-023，2026-10-21）：amount + discountRate（0-1 小数）一次性提交（后端只存不算）
+    await setCartAmount(row.cart.id, row.cart.qty, n, rate)
   } catch (e) {
     showError(e, '销售金额更新失败')
     await refresh(true)
@@ -210,6 +248,8 @@ function discountInvalid(row: CartRow): boolean {
  *  草稿非法（0/超10/非数字）返回 null（不显示预览，标红提示用户）。
  *  供摘要实时显示与金额 placeholder 预览共用——敲折扣数字过程中即可见摘要，不等失焦 */
 function discountPreviewRate(row: CartRow): number | null {
+  // FIX-20261022 / BUG-06：包量定价行不参与折扣（折扣输入/摘要/placeholder 由此统一失效）
+  if (row.isAmount) return null
   const t = discountDraft(row)
   if (t !== '') {
     const n = Number(t)
@@ -259,6 +299,9 @@ function onDiscountInput(row: CartRow, v: string) {
  *  非法（0/超10/非数字）→ 输入框标红（值驱动）不回填，金额不受影响；
  *  清空折扣输入 → 折扣率提交 null（金额保持当前值） */
 async function onDiscountChange(row: CartRow) {
+  // FIX-20261022 / BUG-06（双保险）：包量定价行折扣快捷入口一律不生效——
+  // 金额为人工权威输入，禁止用「salePrice × qty × 折扣」伪造合同金额
+  if (row.isAmount) return
   const t = discountDraft(row)
   const n = Number(t)
   if (t !== '' && (!/^\d+(\.\d)?$/.test(t) || !(n > 0 && n <= 10))) return
@@ -354,14 +397,15 @@ onMounted(async () => {
   await refresh()
 })
 
-/** 可用数量上限：可重复售卖返回 null（无上限）；否则为可售数量 */
-function availOf(a: Asset): number | null {
-  return a.repeatSale ? null : (availableQty(a) ?? 0)
+/** 本行可用数量上限（FIX-20261022 / BUG-22）：可重复售卖 null（不限）；
+ *  否则 = 可售数量 − 同产品其他行已占数量（口径见 cartRows 内注释） */
+function availOf(row: CartRow): number | null {
+  return row.avail
 }
 
-/** 数量输入上限：可重复不限；否则取可售数量（至少 1，避免 min/max 冲突） */
+/** 数量输入上限：可重复不限；否则取本行可用上限（至少 1，避免 min/max 冲突） */
 function qtyMax(row: CartRow): number | undefined {
-  return row.asset.repeatSale ? undefined : Math.max(availOf(row.asset) ?? 0, 1)
+  return row.asset.repeatSale ? undefined : Math.max(availOf(row) ?? 0, 1)
 }
 
 function goAssetDetail(assetId: number) {
@@ -395,7 +439,7 @@ function typeIcon(type: string): string {
 async function onQtyChange(row: CartRow): Promise<boolean> {
   // ADR-011：遥感明细行数量恒 1（输入禁用，双保险拦截）
   if (row.rsItem) return false
-  const avail = availOf(row.asset)
+  const avail = availOf(row)
   if (avail !== null && row.cart.qty > avail) {
     ElMessage.error(`「${row.asset.name}」可用数量仅 ${avail}${row.asset.unit}，已为你回退`)
     row.cart.qty = avail
@@ -412,28 +456,50 @@ async function onQtyChange(row: CartRow): Promise<boolean> {
   }
 }
 
+/** 步进器行级 in-flight 互斥（FIX-20261022 / BUG-25）：同行请求在飞期间禁用 ± 按钮，
+ *  避免连点产生并发 PUT、响应乱序把镜像写回旧数量/旧金额 */
+const qtyBusy = reactive<Record<number, boolean>>({})
+
 /** 步进器 ±1（2026-10-22 视觉优化：替代 el-input-number）：
  *  改数量后复用现有 onQtyChange 的 PUT 提交链路（含上限拦截 / 400 回滚），业务逻辑零变更 */
 async function stepQty(row: CartRow, delta: number) {
   if (row.rsItem) return // ADR-011：遥感明细行数量恒 1
+  if (qtyBusy[row.cart.id]) return // 本行上一次请求未回：忽略连点（按钮同时置灰）
   const next = row.cart.qty + delta
   if (next < 1) return
   const max = qtyMax(row)
   if (max != null && next > max) return // 已达可用上限，+ 号本就禁用（双保险）
-  row.cart.qty = next
-  const ok = await onQtyChange(row)
-  // DISCOUNT-20261021（ADR-023，2026-10-21）：数量变更后若该行有折扣率 →
-  // 按新数量重新回填 amount = round(原价单价 × 新数量 × rate) 并提交（保持折扣语义跟随数量）
-  if (ok && row.cart.discountRate != null) {
-    const amount = Math.round(row.price * row.cart.qty * row.cart.discountRate)
-    row.cart.amount = amount
-    delete amountDrafts[row.cart.id] // CART-PERF2-20261021（2026-10-21）：重算覆盖金额 → 删金额草稿（显示回退镜像，delete 而非置 ''）
-    try {
-      await setCartAmount(row.cart.id, row.cart.qty, amount, row.cart.discountRate)
-    } catch (e) {
-      showError(e, '销售金额更新失败')
-      await refresh(true)
+  const prevAmount = row.cart.amount
+  qtyBusy[row.cart.id] = true
+  try {
+    row.cart.qty = next
+    const ok = await onQtyChange(row)
+    if (!ok) return
+    // FIX-20261022 / BUG-27：后端改数量时对「无折扣率行」会静默清空已填金额（旧总额对新数量已失真）。
+    // 前端必须显式提示重填；该行标红由 amountInvalid 值驱动（镜像 amount 已为 null → 输入框立即标红）
+    const fresh = db.cart.find((c) => c.id === row.cart.id)
+    if (prevAmount != null && fresh && fresh.amount == null) {
+      delete amountDrafts[row.cart.id]
+      ElMessage.warning(`「${row.asset.name}」数量已变更，请重新填写销售金额`)
+      return
     }
+    // DISCOUNT-20261021（ADR-023，2026-10-21）：数量变更后若该行有折扣率 →
+    // 按新数量重新回填 amount = round(原价单价 × 新数量 × rate) 并提交（保持折扣语义跟随数量）
+    // ADR-037（FORMS-20261022）：viewer 的历史 discountRate 被后端忽略（金额权威）——
+    // 不参与数量变更回填，避免用旧折扣率覆盖用户手填金额
+    if (row.cart.discountRate != null && !isViewer.value) {
+      const amount = Math.round(row.price * row.cart.qty * row.cart.discountRate)
+      row.cart.amount = amount
+      delete amountDrafts[row.cart.id] // CART-PERF2-20261021（2026-10-21）：重算覆盖金额 → 删金额草稿（显示回退镜像，delete 而非置 ''）
+      try {
+        await setCartAmount(row.cart.id, row.cart.qty, amount, row.cart.discountRate)
+      } catch (e) {
+        showError(e, '销售金额更新失败')
+        await refresh(true)
+      }
+    }
+  } finally {
+    delete qtyBusy[row.cart.id] // 只清自己的行锁（行 id 唯一，天然不误清新行）
   }
 }
 
@@ -514,16 +580,28 @@ function openOrder() {
   orderVisible.value = true
 }
 
+/**
+ * 结算幂等键（FIX-20261022 / BUG-10，ADR-033）：点击开始时生成，**同一次提交的重试沿用**，
+ * 成功后清空（下次结算重新生成）。后端按 (userId, requestId) 24h 内幂等返回首次创建的项目，
+ * 双击/失败重试不会重复建单与重复锁量。
+ */
+const checkoutRequestId = ref('')
+
 async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: number; qty: number; amount?: number }[] }) {
+  if (orderLoading.value) return // 请求在飞：忽略重复提交（按钮同时 loading 禁用）
   orderLoading.value = true
+  if (!checkoutRequestId.value) checkoutRequestId.value = crypto.randomUUID()
   try {
     // ADR-008：包量定价行合同金额已由行内失焦 PUT /cart/{id} 持久化，结算只传订单字段（后端 CheckoutInput 无 items）
-    const p = await checkoutCart({ ...payload.fields })
+    const p = await checkoutCart({ ...payload.fields, requestId: checkoutRequestId.value })
+    checkoutRequestId.value = '' // 成功后丢弃幂等键
     orderVisible.value = false
     const cc = p.contractCount ?? previewGroups.value.length
     // ADR-012 修订（2026-10-19）：所有角色下单统一进「待审核」（数量已锁定），商务接手审核（可改价）后生效
     ElMessage.success(
-      `下单成功，销售项目 ${p.code} 待审核（数量已锁定 · ${cc} 份销售记录），商务接手确认后生效`,
+      p.idempotent
+        ? `该次结算已提交过，销售项目 ${p.code} 已存在（本次未重复建单）`
+        : `下单成功，销售项目 ${p.code} 待审核（数量已锁定 · ${cc} 份销售记录），商务接手确认后生效`,
     )
     await refresh(true)
     router.push(`/sales/projects/${p.id}/detail`)
@@ -537,7 +615,7 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
 </script>
 
 <template>
-  <!-- 2026-10-22 修复④：加 cart-page 类——底部留白需让开 sticky 深色结算栏（见 scoped 样式） -->
+  <!-- 2026-10-22 修复④：加 cart-page 类——底部留白需让开 sticky 吸附结算条（见 scoped 样式） -->
   <div class="page-container cart-page">
     <!-- 页面头部 -->
     <div class="page-head">
@@ -563,7 +641,8 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
           <b>下单前请完善关键信息</b>
           <!-- 2026-10-24（ADR-022）：必填口径——客户/销售金额/服务期限三必填（遥感明细行期限豁免），
                原「生态可留空回退 / 其余选填」表述废弃 -->
-          <span>每件产品必填客户、销售金额（整数元 &gt; 0）与服务期限（开始/结束日期，遥感明细行豁免期限）；设参考区间时金额须落在区间内；数量受产品可用数量约束（可重复售卖不受限）。下单后按「产品 + 客户」分组各生成一条销售记录，销售项目进入「待审核」并锁定数量，商务确认（可改价）后生效，再执行「交付」生成交付记录。</span>
+          <!-- ADR-037（FORMS-20261022）：区间校验分角色——viewer 仅下限（上限放开，加价成交允许），editor/admin 双向 -->
+          <span>每件产品必填客户、销售金额（整数元 &gt; 0）与服务期限（开始/结束日期，遥感明细行豁免期限）；设参考区间时金额须{{ isViewer ? '不低于区间下限（上限不限）' : '落在区间内' }}；数量受产品可用数量约束（可重复售卖不受限）。下单后按「产品 + 客户」分组各生成一条销售记录，销售项目进入「待审核」并锁定数量，商务确认（可改价）后生效，再执行「交付」生成交付记录。</span>
         </div>
       </div>
 
@@ -646,17 +725,20 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
               <!-- 2026-10-23 修复①：统一单元格结构——价格进主内容区，单位 + 可售/上限副文案进 18px 副提示区一行内 -->
               <div class="cart-cell">
                 <div class="cell-main cart-price">
-                  <!-- ADR-017（2026-10-20）：包量定价行单价与普通产品一致（元/份，参考口径），删除「元/万Token」特判
+                  <!-- ADR-025（2026-10-21）：包量定价（amount 模式）行单价统一走百万Token 口径（displayUnitPrice，仅展示，
+                       权威口径仍为行内销售金额）；unit/遥感行维持 formatMoney 原展示
                        2026-10-23 修复②：去掉模板里多余的「¥ 」前缀——formatMoney 返回值已含 ¥，原写法渲染成「¥ ¥5,100,000.00」 -->
-                  <span class="cart-price-value" :class="{ muted: row.isAmount }">{{ formatMoney(row.price) }}</span>
+                  <span class="cart-price-value" :class="{ muted: row.isAmount }">{{ row.isAmount ? displayUnitPrice(row.asset) : formatMoney(row.price) }}</span>
                 </div>
                 <div class="cell-hint cart-price-sub">
-                  <span>{{ row.rsItem ? '元/份' : `元/${row.asset.unit || '单位'}` }}</span>
+                  <!-- ADR-025：amount 行单价已含「/百万Token」后缀，不再重复展示「元/{unit}」副文案 -->
+                  <span v-if="!row.isAmount">{{ row.rsItem ? '元/份' : `元/${row.asset.unit || '单位'}` }}</span>
+                  <!-- FIX-20261022 / BUG-22：上限口径改「本行可加到的上限」= 可售 − 同产品其他行 qty 合计 -->
                   <span
                     v-if="!row.rsItem && !row.asset.repeatSale"
-                    :class="row.cart.qty >= (availOf(row.asset) ?? 0) ? 'cart-sellable-max' : ''"
+                    :class="row.cart.qty >= (availOf(row) ?? 0) ? 'cart-sellable-max' : ''"
                   >
-                    {{ row.cart.qty >= (availOf(row.asset) ?? 0) ? `已达上限 ${availOf(row.asset)}` : `可售 ${availOf(row.asset)}` }}
+                    {{ row.cart.qty >= (availOf(row) ?? 0) ? `已达上限 ${availOf(row)}` : `可售 ${availOf(row)}` }}
                   </span>
                 </div>
               </div>
@@ -671,10 +753,12 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
               <div class="cart-cell">
                 <div class="cell-main cell-main-center">
                   <div class="cart-stepper">
+                    <!-- FIX-20261022 / BUG-25：本行请求在飞期间（qtyBusy）两个按钮一并禁用，
+                         避免连点造成并发 PUT / 响应乱序 -->
                     <button
                       type="button"
                       class="step-btn"
-                      :disabled="!!row.rsItem || row.cart.qty <= 1"
+                      :disabled="!!row.rsItem || row.cart.qty <= 1 || !!qtyBusy[row.cart.id]"
                       :aria-label="`减少${row.asset.name}数量`"
                       @click="stepQty(row, -1)"
                     >
@@ -684,7 +768,7 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
                     <button
                       type="button"
                       class="step-btn"
-                      :disabled="!!row.rsItem || (qtyMax(row) != null && row.cart.qty >= qtyMax(row)!)"
+                      :disabled="!!row.rsItem || !!qtyBusy[row.cart.id] || (qtyMax(row) != null && row.cart.qty >= qtyMax(row)!)"
                       :aria-label="`增加${row.asset.name}数量`"
                       @click="stepQty(row, 1)"
                     >
@@ -722,10 +806,12 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
                          :model-value 草稿优先（无草稿读已提交值），敲字只写草稿不碰 db.cart 镜像；
                          placeholder 实时回填折扣预计金额（纯展示，无重复提交风险，见 amountPlaceholder 注释） -->
                     <!-- 2026-10-25：用户反馈输入框 hover 提示「太碍事」，删除金额输入框 tooltip
-                         （必填/整数元口径见列头红星 + 顶部提示条，参考区间见下方提示行） -->
+                         （必填/整数元口径见列头红星 + 顶部提示条，参考区间见下方提示行）
+                         ADR-037（FORMS-20261022）：viewer 无折扣入口 → 金额 placeholder 不走折扣预计金额预览
+                         （历史 discountRate 不展示；函数不改，渲染层直接给固定文案） -->
                     <el-input
                       :model-value="amountDraft(row)"
-                      :placeholder="amountPlaceholder(row)"
+                      :placeholder="isViewer ? '必填，整数元' : amountPlaceholder(row)"
                       size="small"
                       class="cart-amount-input"
                       :class="{ 'cart-customer-error': amountInvalid(row) }"
@@ -734,8 +820,13 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
                     />
                     <!-- 折扣输入（选填，0-10 一位小数）：合法→回填金额走 onAmountChange 提交链路；
                          非法（0/超10/非数字）→ 值驱动标红不回填；手改金额自动清空（onAmountInput）
-                         2026-10-25：删除折扣输入框 tooltip（回填规则见顶部提示条 + 折扣摘要提示行） -->
+                         2026-10-25：删除折扣输入框 tooltip（回填规则见顶部提示条 + 折扣摘要提示行）
+                         FIX-20261022 / BUG-06：包量定价行（isAmount）不渲染折扣入口——
+                         该行合同金额为人工权威输入，禁止用 salePrice×qty×折扣 伪造金额（ADR-008）
+                         ADR-037（FORMS-20261022）：viewer（生态人员）折扣入口下线——不渲染（editor/admin 不变）；
+                         历史 discountRate 不展示、不清空（后端忽略，金额仍权威） -->
                     <el-input
+                      v-if="!row.isAmount && !isViewer"
                       :model-value="discountDraft(row)"
                       placeholder="折扣"
                       size="small"
@@ -753,8 +844,10 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
                        2026-10-25：金额输入框 hover tooltip 删除后，填了折扣的行参考区间不再于提示行展示
                        （超区间由后端 400 文案兜底，无信息死角，按用户要求不补新展示） -->
                   <!-- CART-PERF-20261021（2026-10-21）：渲染条件改「草稿合法或已提交值非空」（discountPreviewRate）——
-                       折扣输入过程中摘要实时出现，不等失焦落值；截断时 el-tooltip 全文可触发（见 .cart-amount-range 样式） -->
-                  <el-tooltip v-if="discountPreviewRate(row) != null" :content="discountSummary(row)" placement="top">
+                     折扣输入过程中摘要实时出现，不等失焦落值；截断时 el-tooltip 全文可触发（见 .cart-amount-range 样式）
+                     ADR-037（FORMS-20261022）：viewer 不渲染折扣摘要（含历史 discountRate 行——不展示、不清空；
+                     函数本身不改，仅渲染条件加角色判断） -->
+                  <el-tooltip v-if="discountPreviewRate(row) != null && !isViewer" :content="discountSummary(row)" placement="top">
                     <span class="cart-amount-range">{{ discountSummary(row) }}</span>
                   </el-tooltip>
                   <!-- ADR-018：产品设了参考区间时展示区间提示（超区间提交由后端 400，文案走 showError）
@@ -846,18 +939,28 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
         </el-table>
       </el-card>
 
-      <!-- 底部深色结算栏（2026-10-22 视觉优化：借鉴 cart-ui-demo.html checkout 栏——
-           sticky 固定内容区底部、深蓝底白字、主蓝按钮；「将生成 N 份销售记录」结算预览保留在结算弹窗内） -->
+      <!-- 底部白卡吸附工具条（2026-10-21 视觉对齐平台：白卡 + 描边 + 轻投影，主蓝只用于合计金额与结算按钮；
+           sticky 固定内容区底部；「将生成 N 份销售记录」结算预览保留在结算弹窗内）
+           2026-10-21（TASK-FE-036）：左侧重排为「一条信息」——件数 → 竖细线分隔 → 应付合计 → 金额，
+           两个灰字统一 13px，金额与标签 flex 中线对齐（原 baseline 让小字「掉底」）；分隔线纯装饰 aria-hidden -->
       <div class="cart-checkout">
         <div class="co-left">
-          <span class="co-selected">已选 {{ totalQty }} 件产品</span>
+          <span class="co-selected">已选 <b>{{ totalQty }}</b> 件产品</span>
+          <span class="co-divider" aria-hidden="true"></span>
           <div class="co-total">
             <!-- 2026-10-23 修复②：去掉多余「¥ 」前缀——formatMoney 返回值已含 ¥（同单价列） -->
             <small>应付合计</small>{{ formatMoney(totalAmount) }}
           </div>
         </div>
-        <!-- 结算下单对三角色均可用（含生态人员）；前置校验（2026-10-24 ADR-022：客户/金额/服务期限三必填）仍走 openOrder -->
-        <el-button class="co-btn" type="primary" :disabled="!db.cart.length" @click="openOrder">
+        <!-- 结算下单对三角色均可用（含生态人员）；前置校验（2026-10-24 ADR-022：客户/金额/服务期限三必填）仍走 openOrder
+             FIX-20261022 / BUG-10：请求期间 loading + 禁用（防重复提交，配合结算弹窗的 requestId 幂等） -->
+        <el-button
+          class="co-btn"
+          type="primary"
+          :loading="orderLoading"
+          :disabled="!db.cart.length || orderLoading"
+          @click="openOrder"
+        >
           结算下单 →
         </el-button>
       </div>
@@ -1084,14 +1187,18 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
   background: var(--el-color-danger-light-8);
 }
 
-/* 2026-10-22 修复④：页面底部留白——结算栏 sticky 悬浮（bottom:16px，实际高度约 72px），
-   原 .page-container 底部仅 24px，滚动到底时末行金额/小计被结算栏压住；
-   130px = 结算栏高度 + bottom 偏移 16px + 约 40px 间距，保证任意滚动位置末行不被遮挡 */
+/* 2026-10-22 修复④：页面底部留白——结算条 sticky 悬浮（bottom:16px）。
+   2026-10-21 复测（白卡工具条）：实测条高 62px（padding 14×2 + 按钮 32 + 1px 描边×2），
+   130px = 62 + bottom 偏移 16 + 约 50px 间距；1440/1280/1024 三档视口滚到底
+   末行（金额/小计/删除）距条顶仍余 35px，未被遮挡，故维持 130px 不再下调
+   TASK-FE-036（2026-10-21）复测：文字排版调整未改变条高（仍 62px，22px 数字行盒 = 按钮 32px 未撑高），
+   1440×900 / 1280×800 / 1024×768 滚到底末行距条顶仍均为 35px → padding-bottom 维持 130px */
 .cart-page {
   padding-bottom: 130px;
 }
 
-/* 底部深色结算栏：sticky 固定内容区底部（滚动容器为 el-main），深蓝底白字 + 主蓝按钮 */
+/* 白卡吸附工具条（2026-10-21 视觉对齐平台：白卡 + 描边 + 轻投影，主蓝只用于合计金额与结算按钮）
+   sticky 固定内容区底部（滚动容器为 el-main），与上方「待售产品」el-card 同一套白卡语言 */
 .cart-checkout {
   position: sticky;
   bottom: 16px;
@@ -1100,42 +1207,63 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
   justify-content: space-between;
   align-items: center;
   gap: 16px;
-  background: #112d54;
-  color: #fff;
-  border-radius: 14px;
-  padding: 15px 20px;
-  box-shadow: 0 14px 35px rgba(16, 35, 63, 0.24);
+  background: var(--card-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  padding: 14px 20px;
+  box-shadow: 0 6px 20px rgba(26, 46, 78, 0.08);
 }
 .co-left {
   display: flex;
   align-items: center;
-  gap: 22px;
+  /* 2026-10-21（TASK-FE-036）：22px → 13px，分隔线两侧间距由 gap 统一控制，两段信息连成一体 */
+  gap: 13px;
   flex-wrap: wrap;
 }
 .co-selected {
-  color: rgba(255, 255, 255, 0.72);
+  color: var(--text-secondary);
   font-size: 13px;
+  /* 2026-10-21（TASK-FE-036）：与 .co-total small 同为 13px / line-height 1.2——
+     两者行盒等高，align-items:center 后墨迹重心才对得齐（行高不同会差 2px） */
+  line-height: 1.2;
+}
+/* 2026-10-21（TASK-FE-036）：件数数字轻微跳出灰字（600 主文字色），避免整句糊成一片 */
+.co-selected b {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+/* 2026-10-21（TASK-FE-036）：件数 / 应付合计之间的竖细线（纯装饰，不参与语义朗读） */
+.co-divider {
+  width: 1px;
+  height: 16px;
+  background: var(--divider-color);
+  flex: 0 0 auto;
+  align-self: center;
 }
 .co-total {
   display: flex;
-  align-items: baseline;
-  gap: 8px;
+  /* 2026-10-21（TASK-FE-036）：baseline → center——原小字被对齐到 22px 数字基线（视觉掉底、重心左低右高） */
+  align-items: center;
+  /* 2026-10-21（TASK-FE-036）：8px → 6px，标签与金额贴合为一段 */
+  gap: 6px;
   font-size: 22px;
   font-weight: 700;
-  color: #fff;
+  color: var(--primary-color);
   font-variant-numeric: tabular-nums;
 }
 .co-total small {
-  font-size: 12px;
+  /* 2026-10-21（TASK-FE-036）：字号 12 → 13，与 .co-selected 统一（同行同级信息不再发虚） */
+  font-size: 13px;
   font-weight: 400;
-  color: rgba(255, 255, 255, 0.72);
+  color: var(--text-secondary);
+  line-height: 1.2;
 }
+/* 结算按钮：沿用 type="primary" 实心主蓝（底色/圆角/极轻投影均由 global.css 主按钮统一规则提供，此处不重复声明投影） */
 .co-btn {
-  background: var(--primary-color);
-  border-color: var(--primary-color);
-  padding: 11px 22px;
+  /* 2026-10-21（TASK-FE-036）：显式靠右（原靠父级 space-between），与左侧信息区保留 .cart-checkout 的 16px 最小间距 */
+  margin-left: auto;
+  padding: 10px 22px;
   font-weight: 600;
-  box-shadow: 0 5px 13px rgba(23, 105, 212, 0.35);
 }
 .co-btn:hover,
 .co-btn:focus {
@@ -1209,7 +1337,7 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
   align-items: center;
   gap: 12px;
 }
-/* 2026-10-22 视觉优化：原浅蓝 .cart-settle 结算条已由 .cart-checkout 深色结算栏取代，旧样式删除 */
+/* 2026-10-22 视觉优化：原浅蓝 .cart-settle 结算条已由 .cart-checkout 白卡吸附工具条取代，旧样式删除 */
 .cart-order-summary {
   padding: 10px 14px;
   margin-bottom: 16px;

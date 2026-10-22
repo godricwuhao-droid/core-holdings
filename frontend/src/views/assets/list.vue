@@ -13,14 +13,15 @@ import {
   ASSET_STOCK_STATE,
   DELIVERABLE_CATEGORIES,
   DELIVERABLE_STATUS,
-  FLOW_TYPES,
   assetStockState,
   availableQty,
   boardLabel,
+  displayUnitPrice,
   entityShort,
   expiryText,
   formatAssetQty,
   formatMoney,
+  isAmountMode,
   noSellableStock,
   priceRangeText,
   rsItemName,
@@ -36,10 +37,7 @@ import {
   fileDisplayName,
   fileUrl,
   getAssetDeliverables,
-  listAssetFlows,
-  listAssetLogs,
   listAssetRsItems,
-  projectItemsOfAsset,
   refresh,
   showError,
 } from '@/api'
@@ -73,9 +71,9 @@ watch(board, () => {
   searchText.value = ''
 })
 
-const subjects = computed(() =>
-  Array.from(new Set(db.assets.filter((a) => a.board === board.value).map((a) => a.subject))).filter(Boolean),
-)
+// ENTITIES-20261022 / ADR-035：主体筛选选项改读 bootstrap 镜像 db.entities（全量主体 + clearable「全部主体」；
+// label 走 entityShort（内部已切 db.entities），value 仍为全称（存储口径不变）；db.entities 为空时下拉为空选项）
+const subjects = computed(() => db.entities.map((e) => e.name))
 
 const list = computed(() => {
   return db.assets.filter((a) => {
@@ -234,6 +232,14 @@ const previewVisible = ref(false)
 function openPreview() {
   if (drawerAsset.value?.contractFile) previewVisible.value = true
 }
+
+// ADR-024：交付物附件预览（所有角色含 viewer 可预览；上传/删除入口仅在详情页，受 canWrite 约束）
+const delPreviewVisible = ref(false)
+const delPreviewFile = ref('')
+function openDelPreview(filename: string) {
+  delPreviewFile.value = filename
+  delPreviewVisible.value = true
+}
 function contractKindLabel(a: Asset): string {
   if (!a.contractFile) return ''
   const e = a.contractFile.split('.').pop()?.toLowerCase() || ''
@@ -246,17 +252,17 @@ function contractKindLabel(a: Asset): string {
 const dDeliverables = computed(() =>
   drawerAsset.value ? getAssetDeliverables(drawerAsset.value.id) : [],
 )
-const dProjects = computed(() =>
-  drawerAsset.value ? projectItemsOfAsset(drawerAsset.value.id) : [],
-)
 
 /** 列表「销售单价」列（口径与抽屉「销售单价」一致）：
- *  遥感容器按明细定价显示「-」；包量定价（amount 模式）单价与普通产品一致（元/份，ADR-017，2026-10-20）；
- *  金额直显（repeatSale 带 /unit）。定宽 120 + 居中 + 溢出省略 hover 显示全文。
+ *  遥感容器按明细定价显示「-」；
+ *  ADR-025（2026-10-21）：包量定价（amount 模式，卫星 Token）统一走百万Token 口径（displayUnitPrice）；
+ *  unit 模式金额直显（repeatSale 带 /unit）。定宽 120 + 居中 + 溢出省略 hover 显示全文。
  *  ADR-018（PRICING-20261020）：有参考区间时追加「（参考区间 {min}~{max}）」，无区间维持原展示 */
 function salePriceText(a: Asset): string {
   if (a.type === '遥感数据' || !a.salePrice) return '-'
-  const base = a.repeatSale ? `${formatMoney(a.salePrice)}/${a.unit || '份'}` : formatMoney(a.salePrice)
+  const base = isAmountMode(a)
+    ? displayUnitPrice(a)
+    : a.repeatSale ? `${formatMoney(a.salePrice)}/${a.unit || '份'}` : formatMoney(a.salePrice)
   const range = priceRangeText(a)
   return range ? `${base}（参考区间 ${range}）` : base
 }
@@ -294,69 +300,32 @@ function onDrawerRsPageChange(page: number) {
   loadDrawerRs()
 }
 
-/** 遥感容器「已售次数」总数（PAGE-20261021）：后端仅按行返回 soldCount（当前页），
- * 抽屉头部总数仍由 bootstrap 镜像派生（db.rsItems 取该产品的明细 id + db.contracts 按 itemId 计数，口径与原先一致） */
+/**
+ * 遥感容器「已售次数」总数（FIX-20261022 / BUG-46）：
+ * 原实现遍历 `db.contracts` 按 itemId 计数——viewer 的 bootstrap.contracts 已被后端按
+ * 「自己下单」过滤，生态人员看到的次数会比行内 soldCount（后端按全部 delivered 合同派生）偏小，口径不一致。
+ * 现改为读**后端派生值**：
+ *  1) 优先汇总 `db.rsItems` 行级 `soldCount`（FIX-20261022-FOLLOWUP：后端已把该字段补进 bootstrap.rsItems）；
+ *  2) 降级：任一行缺该字段（旧后端 / 旧快照）即视为整批不可信 → 回退产品级 `asset.soldCount`
+ *     （同一后端口径：每次明细交付 `asset.soldCount += 1`，与行级合计等价），不再遍历 contracts。
+ */
 const dRsSoldTotal = computed(() => {
   const a = drawerAsset.value
   if (!a) return 0
-  const ids = new Set(db.rsItems.filter((r) => r.assetId === a.id).map((r) => r.id))
-  let n = 0
-  for (const c of db.contracts) {
-    if (c.status !== 'delivered') continue
-    for (const it of c.items) {
-      if (it.itemId != null && ids.has(it.itemId)) n++
-    }
+  const rows = db.rsItems.filter((r) => r.assetId === a.id)
+  // 只有「有行 且 全部行都带 soldCount」才采信行级汇总，避免半新半旧时算出偏小的部分和
+  if (rows.length && rows.every((r) => typeof r.soldCount === 'number')) {
+    return rows.reduce((s, r) => s + (r.soldCount ?? 0), 0)
   }
-  return n
+  return a.soldCount ?? 0
 })
 
-/** 最近动态（PAGE-20261021，契约 §4.3）：并行取 flows 第 1 页(10) + logs 第 1 页(10)，
- * 前端合并倒序取前 10 条（保持「最近 10 条」语义；不新增合并端点，动态条数多时可能有 1-2 条口径误差，契约已接受） */
-interface DrawerActivity {
-  key: string
-  time: string
-  title: string
-  operator?: string
-  kind: 'flow' | 'log'
-}
-const dActivities = ref<DrawerActivity[]>([])
-
-async function loadDrawerActivities() {
-  const a = drawerAsset.value
-  if (!a) return
-  try {
-    const [flowsRes, logsRes] = await Promise.all([
-      listAssetFlows(a.id, 1, 10),
-      listAssetLogs(a.id, 1, 10),
-    ])
-    const flows: DrawerActivity[] = flowsRes.items.map((f) => ({
-      key: `flow-${f.id}`,
-      time: f.date.slice(0, 10),
-      title: [FLOW_TYPES[f.type].label, f.ref, f.note].filter(Boolean).join(' · '),
-      operator: f.operator ? (f.operator === 'system' ? '系统' : f.operator) : undefined,
-      kind: 'flow' as const,
-    }))
-    const logs: DrawerActivity[] = logsRes.items.map((l) => ({
-      key: `log-${l.id}`,
-      time: l.time.slice(0, 16),
-      title: [l.action, l.detail].filter(Boolean).join(' · '),
-      operator: l.operator || undefined,
-      kind: 'log' as const,
-    }))
-    dActivities.value = [...flows, ...logs].sort((x, y) => y.time.localeCompare(x.time)).slice(0, 10)
-  } catch (e) {
-    dActivities.value = []
-    showError(e, '加载最近动态失败')
-  }
-}
-
-// PAGE-20261021：抽屉打开时重置并加载可售明细（仅遥感）与最近动态
+// PAGE-20261021：抽屉打开时重置并加载可售明细（仅遥感）
+// ADR-024（2026-10-21）：「最近动态」区块已删除（dActivities/loadDrawerActivities 一并移除）
 watch(drawerVisible, (v) => {
   if (!v || !drawerAsset.value) return
   dRs.page = 1
-  dActivities.value = []
   loadDrawerRs()
-  loadDrawerActivities()
 })
 
 /** 数量进度分段（不可重复售卖时展示） */
@@ -644,10 +613,11 @@ const boardMeta = computed(() => {
               <span class="il">销售单价</span>
               <!-- 遥感容器：按明细定价（明细单价为权威口径） -->
               <span v-if="isRemote" class="iv iv-weak">按明细定价</span>
-              <!-- ADR-017（2026-10-20）：包量定价产品单价与普通产品一致（元/份），删除「元/万Token」特判 -->
+              <!-- ADR-025（2026-10-21）：包量定价（amount 模式）统一走百万Token 口径（与列表列同口径） -->
               <!-- ADR-018（PRICING-20261020）：有参考区间时追加区间提示（与列表列同口径） -->
               <span v-else class="iv">
-                {{ drawerAsset.salePrice ? formatMoney(drawerAsset.salePrice) : '-' }}<template v-if="drawerAsset.repeatSale"> / {{ drawerAsset.unit }}</template>
+                <template v-if="isAmountMode(drawerAsset)">{{ drawerAsset.salePrice ? displayUnitPrice(drawerAsset) : '-' }}</template>
+                <template v-else>{{ drawerAsset.salePrice ? formatMoney(drawerAsset.salePrice) : '-' }}<template v-if="drawerAsset.repeatSale"> / {{ drawerAsset.unit }}</template></template>
                 <template v-if="priceRangeText(drawerAsset)">（参考区间 {{ priceRangeText(drawerAsset) }}）</template>
               </span>
             </div>
@@ -749,26 +719,14 @@ const boardMeta = computed(() => {
                 <template v-if="d.version"> · {{ d.version }}</template>
                 <template v-if="d.updatedAt"> · 更新于 {{ d.updatedAt.slice(0, 10) }}</template>
               </div>
-            </div>
-            <el-empty v-if="!dDeliverables.length" description="该类型暂无交付物配置" :image-size="56" />
-          </div>
-        </div>
-
-        <!-- 最近动态（全类型统一：操作日志 + 数量流水合并，细线时间线） -->
-        <div class="dr-section">
-          <div class="sec-title">最近动态</div>
-          <div class="sec-desc muted">操作日志与数量流水合并，倒序前 10 条 · 关联销售 {{ dProjects.length }} 项</div>
-          <div v-if="dActivities.length" class="rs-tl">
-            <div v-for="act in dActivities" :key="act.key" class="rs-tl-item">
-              <span class="rs-tl-dot" :class="act.kind" aria-hidden="true"></span>
-              <div class="rs-tl-title">
-                <span class="rs-tl-time muted">{{ act.time }}</span>
-                <span class="rs-tl-text">{{ act.title }}</span>
+              <!-- ADR-024：交付物附件（点击文件名 → 全屏预览，所有角色含 viewer 可预览） -->
+              <div v-if="d.file" class="del-file">
+                <el-icon class="del-file-ic"><Document /></el-icon>
+                <a class="del-file-name" @click="openDelPreview(d.file as string)">{{ fileDisplayName(d.file) }}</a>
               </div>
-              <div v-if="act.operator" class="rs-tl-op muted">操作人：{{ act.operator }}</div>
             </div>
+            <el-empty v-if="!dDeliverables.length" description="暂无交付物，请在产品详情维护" :image-size="56" />
           </div>
-          <div v-else class="muted" style="font-size: 13px;">暂无动态记录</div>
         </div>
       </template>
 
@@ -790,6 +748,11 @@ const boardMeta = computed(() => {
         v-if="previewVisible && drawerAsset?.contractFile"
         :filename="drawerAsset.contractFile"
       />
+    </el-dialog>
+
+    <!-- ADR-024：交付物附件预览（全屏复用 FilePreview，弹窗内自带下载入口） -->
+    <el-dialog v-model="delPreviewVisible" title="交付物附件预览" fullscreen append-to-body destroy-on-close>
+      <FilePreview v-if="delPreviewVisible && delPreviewFile" :filename="delPreviewFile" />
     </el-dialog>
 
     <!-- ADR-011：遥感数据明细选择弹窗（加购用途；ADR-020：登记销售入口已移除） -->
@@ -1134,61 +1097,25 @@ const boardMeta = computed(() => {
   background: #f8fbff;
 }
 
-/* 最近动态细线时间线（参考平台细线风格，勿用 EP 默认时间线配色） */
-.asset-drawer .rs-tl {
-  padding-left: 14px;
-}
-.asset-drawer .rs-tl-item {
-  position: relative;
-  padding-bottom: 12px;
-}
-.asset-drawer .rs-tl-item:last-child {
-  padding-bottom: 0;
-}
-.asset-drawer .rs-tl-item::before {
-  content: '';
-  position: absolute;
-  left: -14px;
-  top: 6px;
-  bottom: 0;
-  width: 1px;
-  background: var(--divider-color);
-}
-.asset-drawer .rs-tl-item:last-child::before {
-  display: none;
-}
-.asset-drawer .rs-tl-dot {
-  position: absolute;
-  left: -17px;
-  top: 4px;
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: #9aa9bf;
-}
-.asset-drawer .rs-tl-dot.flow {
-  background: var(--primary-color);
-}
-.asset-drawer .rs-tl-title {
+/* ADR-024：交付物附件行（文件名可点击 → 全屏预览；仅复用平台 token，无新颜色/圆角） */
+.asset-drawer .del-file {
   display: flex;
-  align-items: baseline;
-  gap: 8px;
-  font-size: 13px;
-}
-.asset-drawer .rs-tl-time {
-  flex-shrink: 0;
+  align-items: center;
+  gap: 4px;
+  margin-top: 6px;
   font-size: 12px;
-  width: 84px;
 }
-.asset-drawer .rs-tl-text {
-  color: var(--text-primary);
-  min-width: 0;
+.asset-drawer .del-file-ic {
+  color: var(--text-secondary);
+}
+.asset-drawer .del-file-name {
+  color: var(--primary-color);
+  max-width: 260px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.asset-drawer .rs-tl-op {
-  margin-top: 2px;
-  font-size: 12px;
+.asset-drawer .del-file-name:hover {
+  text-decoration: underline;
 }
 </style>

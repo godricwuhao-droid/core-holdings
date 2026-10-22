@@ -371,57 +371,75 @@ const pageReady = computed(() => proj.value != null)
                 <span class="rv-ct-total">销售金额合计（实时）：{{ formatMoney(contractTotal(c.id)) }}</span>
               </div>
               <div v-for="l in reviewLines.filter((x) => x.contractId === c.id)" :key="l.id" class="rv-line">
-                <div class="rv-line-main">
-                  <el-tooltip :content="l.name" placement="top">
-                    <span class="rv-line-name">{{ l.name }}</span>
-                  </el-tooltip>
-                  <span class="rv-line-qty muted">× {{ l.qty }}{{ l.unit }}</span>
+                <!-- 第 1 层：产品名 + 数量 + 折扣 + 原价 + 可编辑价 + 金额（固定列网格，单行不换行，仅产品名可省略） -->
+                <div class="rv-line-main-row">
+                  <div class="rv-c-name">
+                    <el-tooltip :content="l.name" placement="top">
+                      <span class="rv-line-name">{{ l.name }}</span>
+                    </el-tooltip>
+                  </div>
+                  <span class="rv-c-qty muted">× {{ l.qty }}{{ l.unit }}</span>
+                  <!-- DISCOUNT-20261021（ADR-023，2026-10-21）：折扣率只读展示（下单时生态人员填写的快照，不可改；
+                       null 显示 -）；与已有原单价/原金额 + 可编辑终审价并列，商务可见「原价、折扣率、折扣价」三要素 -->
+                  <div class="rv-c-disc">
+                    <span class="rv-lbl rv-discount-lbl">
+                      <el-tooltip content="下单时生态人员填写的折扣率（快照，不可改）" placement="top">
+                        <span>折扣</span>
+                      </el-tooltip>
+                    </span>
+                    <span class="rv-orig">{{ l.discountRate != null ? discountRateText(l.discountRate) : '-' }}</span>
+                  </div>
+                  <!-- ADR-018 §2（PRICING-20261020）：原价列只读——展示下单时挂牌价快照；
+                       存量订单 orig 为空时数据层已按当前 price/amount 兜底（见 reviewLines 展开逻辑），
+                       故此处恒展示，无需再判空 -->
+                  <template v-if="l.mode === 'unit'">
+                    <div class="rv-c-orig">
+                      <span class="rv-lbl">原单价（元）</span>
+                      <span class="rv-orig muted">{{ formatMoney(l.origPrice) }}</span>
+                    </div>
+                    <div class="rv-c-edit">
+                      <span class="rv-lbl">实际单价（元）</span>
+                      <el-input-number v-model="l.price" :min="0" :precision="2" :controls="false" class="rv-input" />
+                    </div>
+                    <span class="rv-c-amt">金额 {{ formatMoney(lineAmount(l)) }}</span>
+                  </template>
+                  <template v-else-if="l.mode === 'amount'">
+                    <div class="rv-c-orig">
+                      <span class="rv-lbl">原金额（元）</span>
+                      <span class="rv-orig muted">{{ formatMoney(l.origAmount) }}</span>
+                    </div>
+                    <div class="rv-c-edit">
+                      <span class="rv-lbl">销售金额（整数元）</span>
+                      <el-input-number v-model="l.amount" :min="0" :precision="0" :step="1000" :controls="false" class="rv-input" />
+                    </div>
+                    <span v-if="l.qty > 0" class="rv-c-amt rv-derived muted">参考单价 ≈ {{ (lineAmount(l) / l.qty).toFixed(2) }} 元/{{ l.unit || '个' }}</span>
+                  </template>
+                  <template v-else>
+                    <!-- 2026-10-20：遥感明细行金额放开可改（仅本单生效，不回写产品明细单价） -->
+                    <div class="rv-c-orig">
+                      <span class="rv-lbl">原金额（元）</span>
+                      <span class="rv-orig muted">{{ formatMoney(l.origAmount) }}</span>
+                    </div>
+                    <div class="rv-c-edit">
+                      <span class="rv-lbl">销售金额（整数元）</span>
+                      <el-input-number v-model="l.amount" :min="0" :precision="0" :step="1000" :controls="false" class="rv-input" />
+                    </div>
+                    <span v-if="l.qty > 0" class="rv-c-amt rv-derived muted">参考单价 ≈ {{ (lineAmount(l) / l.qty).toFixed(2) }} 元/{{ l.unit || '份' }}（明细单价不回写）</span>
+                  </template>
                 </div>
-                <!-- DISCOUNT-20261021（ADR-023，2026-10-21）：折扣率只读展示（下单时生态人员填写的快照，不可改；
-                     null 显示 -）；与已有原单价/原金额 + 可编辑终审价并列，商务可见「原价、折扣率、折扣价」三要素 -->
-                <span class="rv-lbl rv-discount-lbl">
-                  <el-tooltip content="下单时生态人员填写的折扣率（快照，不可改）" placement="top">
-                    <span>折扣</span>
-                  </el-tooltip>
-                </span>
-                <span class="rv-orig">{{ l.discountRate != null ? discountRateText(l.discountRate) : '-' }}</span>
-                <!-- ADR-018 §2（PRICING-20261020）：原价列只读——展示下单时挂牌价快照；
-                     存量订单 orig 为空时数据层已按当前 price/amount 兜底（见 reviewLines 展开逻辑），
-                     故此处恒展示，无需再判空 -->
-                <template v-if="l.mode === 'unit'">
-                  <span class="rv-lbl">原单价（元）</span>
-                  <span class="rv-orig muted">{{ formatMoney(l.origPrice) }}</span>
-                  <span class="rv-lbl">实际单价（元）</span>
-                  <el-input-number v-model="l.price" :min="0" :precision="2" :controls="false" class="rv-input" />
-                  <span class="rv-amt">金额 {{ formatMoney(lineAmount(l)) }}</span>
-                </template>
-                <template v-else-if="l.mode === 'amount'">
-                  <span class="rv-lbl">原金额（元）</span>
-                  <span class="rv-orig muted">{{ formatMoney(l.origAmount) }}</span>
-                  <span class="rv-lbl">销售金额（整数元）</span>
-                  <el-input-number v-model="l.amount" :min="0" :precision="0" :step="1000" :controls="false" class="rv-input" />
-                  <span v-if="l.qty > 0" class="rv-derived muted">参考单价 ≈ {{ (lineAmount(l) / l.qty).toFixed(2) }} 元/{{ l.unit || '个' }}</span>
-                </template>
-                <template v-else>
-                  <!-- 2026-10-20：遥感明细行金额放开可改（仅本单生效，不回写产品明细单价） -->
-                  <span class="rv-lbl">原金额（元）</span>
-                  <span class="rv-orig muted">{{ formatMoney(l.origAmount) }}</span>
-                  <span class="rv-lbl">销售金额（整数元）</span>
-                  <el-input-number v-model="l.amount" :min="0" :precision="0" :step="1000" :controls="false" class="rv-input" />
-                  <span v-if="l.qty > 0" class="rv-derived muted">参考单价 ≈ {{ (lineAmount(l) / l.qty).toFixed(2) }} 元/{{ l.unit || '份' }}（明细单价不回写）</span>
-                </template>
-                <!-- ADR-020（PRICING-20261020）：服务期限可改（普通行；遥感明细行按期数售卖不展示） -->
-                <template v-if="l.mode !== 'rs'">
-                  <span class="rv-lbl">服务期限</span>
-                  <el-date-picker v-model="l.serviceStart" type="date" value-format="YYYY-MM-DD" size="small" placeholder="开始" class="rv-date" />
-                  <span class="muted">~</span>
-                  <el-date-picker v-model="l.serviceEnd" type="date" value-format="YYYY-MM-DD" size="small" placeholder="结束" class="rv-date" />
-                </template>
+                <!-- 第 2 层：服务期限（同一行不换行）——ADR-020（PRICING-20261020）：普通行可改；遥感明细行按期数售卖不展示 -->
+                <div v-if="l.mode !== 'rs'" class="rv-line-svc-row">
+                  <span class="rv-lbl rv-svc-lbl">服务期限</span>
+                  <el-date-picker v-model="l.serviceStart" type="date" value-format="YYYY-MM-DD" placeholder="开始" class="rv-date" />
+                  <span class="rv-svc-sep muted">~</span>
+                  <el-date-picker v-model="l.serviceEnd" type="date" value-format="YYYY-MM-DD" placeholder="结束" class="rv-date" />
+                </div>
               </div>
             </div>
           </div>
           <div class="rv-foot">
-            <span>项目总金额（实时）：<b>{{ formatMoney(projectTotal) }}</b></span>
+            <span>项目总金额（实时）：</span>
+            <b>{{ formatMoney(projectTotal) }}</b>
           </div>
         </div>
 
@@ -497,64 +515,97 @@ const pageReady = computed(() => proj.value != null)
   font-size: 13px;
 }
 
-/* 订单审核行（自编辑页迁移，scoped 样式随迁） */
+/* E. 页头说明：限制行长，避免超长单行（文案不变） */
+.page-head .desc {
+  max-width: 920px;
+  line-height: 1.7;
+}
+
+/* ==================== 订单审核行（自编辑页迁移，scoped 样式随迁） ====================
+   TASK-FE-027（2026-10-21）：纯布局优化——卡片头单行、明细行两层结构、金额右对齐、总金额条对齐 */
+/* C. 卡片与卡片容器：间距 14px，内边距 14px 16px，细边框 + 8px 圆角 */
 .rv-contracts {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 14px;
 }
 .rv-ct {
   border: 1px solid var(--border-color);
   border-radius: 8px;
-  padding: 12px 14px;
+  padding: 14px 16px;
 }
+/* A. 卡片头：单行不换行（客户名 → 主体标签 → 合计金额右对齐），22px 基线 + 底部 12px */
 .rv-ct-head {
   display: flex;
+  flex-wrap: nowrap;
   align-items: center;
   gap: 8px;
-  margin-bottom: 10px;
+  min-height: 22px;
+  line-height: 22px;
+  margin-bottom: 12px;
 }
 .rv-ct-customer {
+  flex-shrink: 0;
+  white-space: nowrap;
   font-size: 14px;
   font-weight: 600;
   color: var(--text-primary);
 }
+/* 主体标签紧随客户名，不参与压缩 */
+.rv-ct-head .el-tag {
+  flex-shrink: 0;
+}
 .rv-ct-total {
   margin-left: auto;
+  white-space: nowrap;
   font-size: 13px;
   font-weight: 600;
   color: var(--el-color-primary, var(--primary-color));
   font-variant-numeric: tabular-nums;
 }
+/* B. 明细行：行与行之间单条 1px 细线（去掉 dashed，避免双线） */
 .rv-line {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 8px 0;
-  border-top: 1px dashed var(--border-color);
-  flex-wrap: wrap;
-}
-.rv-line-main {
-  display: flex;
-  align-items: center;
-  gap: 8px;
   min-width: 0;
-  flex: 1 1 240px;
+}
+.rv-line + .rv-line {
+  border-top: 1px solid var(--divider-color);
+}
+/* B-1 层：产品名 + 数量 + 折扣 + 原价 + 可编辑价 + 金额
+   TASK-FE-028（2026-10-21）：flex → 固定列 CSS Grid。「标签+值」成对包成分组，
+   每个标签/输入框落在固定列上，三种明细行（unit/amount/rs）的输入框左边缘吸附同一列，
+   标签不再被 overflow 裁切（只剩产品名省略）。 */
+.rv-line-main-row {
+  display: grid;
+  /* 产品名 | 数量 | 折扣 | 原价 | 可编辑价 | 金额 */
+  grid-template-columns: minmax(150px, 1fr) 78px 92px 176px 280px minmax(132px, auto);
+  align-items: center;
+  column-gap: 10px;
+  padding: 9px 0;
+  min-width: 0;
+  /* 极端窄屏裁剪而不是换行（单行底线） */
+  overflow: hidden;
+}
+/* 第 1 列：产品名（唯一允许省略的列） */
+.rv-c-name {
+  min-width: 0;
 }
 .rv-line-name {
+  display: block;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  max-width: 320px;
   font-size: 13px;
   color: var(--text-primary);
 }
-.rv-line-qty {
-  flex-shrink: 0;
+/* 第 2 列：× 数量单位 */
+.rv-c-qty {
+  white-space: nowrap;
   font-size: 12px;
 }
+/* 行内标签统一 12px 次要色 */
 .rv-lbl {
   flex-shrink: 0;
+  white-space: nowrap;
   font-size: 12px;
   color: var(--text-secondary);
 }
@@ -562,40 +613,99 @@ const pageReady = computed(() => proj.value != null)
 .rv-discount-lbl {
   cursor: help;
 }
+/* TASK-FE-028（2026-10-21）：成对分组容器——标签 + 值/输入框同组，组内 label 定宽 → 列内对齐 */
+.rv-c-disc,   /* 第 3 列：折扣（标签 + 折扣率） */
+.rv-c-orig,   /* 第 4 列：原单价/原金额（标签 + 值，标签文案随分支原样） */
+.rv-c-edit {  /* 第 5 列：实际单价/销售金额（定宽标签 + 输入框） */
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+/* 第 4 列的值不换行、数字等宽 */
+.rv-c-orig .rv-orig {
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+/* 可编辑列标签定宽（容纳最长的「销售金额（整数元）」，不截断）→ 三种分支的输入框左边缘完全一致 */
+.rv-c-edit .rv-lbl {
+  width: 112px;
+  flex: 0 0 auto;
+  text-align: right;
+  white-space: nowrap;
+}
+/* 单价/金额输入框宽度统一（158px） */
 .rv-input {
-  width: 160px;
+  width: 158px;
   flex-shrink: 0;
 }
 .rv-input :deep(.el-input__inner) {
   font-weight: 600;
   font-variant-numeric: tabular-nums;
 }
-.rv-amt {
-  flex-shrink: 0;
+/* 第 6 列：金额 / 参考单价（末列右边缘 = 行右边缘 → 各行右对齐） */
+.rv-c-amt {
+  justify-self: end;
+  text-align: right;
+  white-space: nowrap;
   font-size: 13px;
   font-weight: 600;
+  color: var(--text-primary);
   font-variant-numeric: tabular-nums;
 }
-/* ADR-018 §2（PRICING-20261020）：原价只读列（弱于可编辑列） */
+/* ADR-018 §2（PRICING-20261020）：原价只读列（弱于可编辑列，.muted 保持灰色） */
 .rv-orig {
   flex-shrink: 0;
+  white-space: nowrap;
   font-size: 13px;
   font-variant-numeric: tabular-nums;
 }
-/* ADR-020（PRICING-20261020）：服务期限日期输入 */
-.rv-date {
-  width: 140px;
-  flex-shrink: 0;
+.rv-orig:not(.muted) {
+  color: var(--text-primary);
 }
+/* 派生提示（参考单价 ≈ …）：与金额列同一右基准，字号/灰度沿用原样式 */
 .rv-derived {
   font-size: 12px;
+  font-weight: 400;
+  color: var(--text-secondary);
+}
+/* ADR-020（PRICING-20261020）：服务期限日期输入（TASK-FE-028：默认尺寸 + 170px）
+   el-date-picker 根节点不带 scope 属性 → 用父层 :deep 命中，并压过 EP 默认 --el-date-editor-width(220px) */
+.rv-line-svc-row :deep(.rv-date) {
+  width: 170px;
+  flex-shrink: 0;
+}
+.rv-line-svc-row :deep(.rv-date .el-input__inner) {
+  font-size: 13px;
 }
 .rv-rs-tip {
   font-size: 12px;
 }
+/* B-2 层：服务期限（标签 + 开始 ~ 结束，同一行不换行，与左侧标签对齐；层间单条细线） */
+.rv-line-svc-row {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 0 10px 2px;
+  border-top: 1px solid var(--divider-color);
+  min-width: 0;
+}
+/* 第 2 层标签略大（13px），颜色沿用 .rv-lbl 次要色 */
+.rv-svc-lbl {
+  font-size: 13px;
+}
+/* `~` 分隔符前后各留 2px */
+.rv-svc-sep {
+  margin: 0 2px;
+}
+/* D. 项目总金额条：与卡片同内边距，左标签右数值 */
 .rv-foot {
-  margin-top: 12px;
-  padding: 10px 14px;
+  margin-top: 14px;
+  padding: 10px 16px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
   border-radius: 8px;
   background: #f8fafc;
   border: 1px solid var(--border-color);
@@ -605,6 +715,18 @@ const pageReady = computed(() => proj.value != null)
 .rv-foot b {
   color: var(--text-primary);
   font-size: 15px;
+  font-weight: 600;
   font-variant-numeric: tabular-nums;
+}
+/* F. 响应式底线（TASK-FE-028）：视口 ≤1360px 时列宽整体收缩——先压产品名列（省略号），
+   标签定宽保持 112px（不换行、不截断），输入框 150px；第 1 层仍为单行网格，不换行 */
+@media (max-width: 1360px) {
+  .rv-line-main-row {
+    grid-template-columns: minmax(0, 1fr) 72px 88px 170px 268px minmax(132px, auto);
+    column-gap: 8px;
+  }
+  .rv-input {
+    width: 150px;
+  }
 }
 </style>

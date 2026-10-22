@@ -2,6 +2,9 @@
  * 全局领域类型与状态定义
  */
 import type { IWorkbookData } from '@univerjs/presets'
+// ENTITIES-20261022 / ADR-035：主体清单由硬编码常量改为 bootstrap 镜像（db.entities）；
+// 仅 entityShort 在调用时读取 db，模块求值期不触碰，与 api/index.ts 的循环导入安全
+import { db } from '@/api'
 
 // ============================================================
 // 板块
@@ -43,21 +46,18 @@ export const TYPE_TAG_CLASS: Record<string, string> = {
 // ============================================================
 // 公司所属主体（均为我司主体）
 // ============================================================
+/** 公司主体（FORMS-20261022 / ADR-036 起由「资产主体」改名；ENTITIES-20261022 / ADR-035：entities 表，bootstrap 全量下发；原硬编码 ENTITIES 常量已删除） */
 export interface Entity {
-  name: string // 公司全称（存储值）
-  short: string // 列表页展示简称
+  id: number
+  name: string // 公司全称（存储值，assets.subject 存此值）
+  short: string // 展示简称
+  createdAt: string
+  updatedAt: string
 }
 
-export const ENTITIES: Entity[] = [
-  { name: '蜂云时代科技有限公司', short: '蜂云时代' },
-  { name: '四川蜂云星座人工智能科技有限公司', short: '蜂云星座' },
-  { name: '蜂云纪元科技(贺州)有限公司', short: '蜂云纪元(贺州)' },
-  { name: '安徽天枢智算人工智能科技有限公司', short: '安徽天枢' },
-]
-
-/** 全称 → 简称（列表列展示用，未收录的按原值显示） */
+/** 全称 → 简称（列表列展示用；读 db.entities，查不到回退原值——兼容未刷新快照/存量游离值） */
 export function entityShort(name: string): string {
-  return ENTITIES.find((e) => e.name === name)?.short ?? name
+  return db.entities.find((e) => e.name === name)?.short ?? name
 }
 
 // ============================================================
@@ -87,8 +87,8 @@ export interface Asset {
   soldCount: number // 授权/销售次数（可重复售卖）
   status: AssetStatus // 可售 / 全部出售
   inboundDate: string // 登记时间
-  expiryDate: string // 到期时间（长期买断时为空）
-  perpetual: boolean // 长期买断（无到期时间）
+  expiryDate: string // 到期时间（产品有效期勾选时为空）
+  perpetual: boolean // 产品有效期（FORMS-20261022 / ADR-036 起由「长期买断」改名；无到期时间）
   spec: string // 规格/说明
   saleDetail?: IWorkbookData // 售卖内容明细（Excel 快照，登记时录入；结构自由、可含行列合并）
   contractFile?: string // 产品清单（uploads 目录散列文件名，抽屉内可在线预览；展示原始名走 fileDisplayName）
@@ -112,6 +112,9 @@ export interface RsItem {
   repeatSale: boolean // 可重复售卖（默认 true，只计次不扣量）
   createdAt: string
   updatedAt: string
+  // 已售次数（FIX-20261022-FOLLOWUP）：后端派生值（该明细被 delivered 合同明细计数）。
+  // 可选——bootstrap.rsItems 同批补齐该字段，旧后端/旧快照不返回时为 undefined（消费方需降级）
+  soldCount?: number
 }
 
 /** 明细展示名：省 + 市 + 精度m + 月份（如「河北省石家庄市 1.5m 2026-09」） */
@@ -205,13 +208,13 @@ export function noSellableStock(a: Asset): boolean {
   return !a.repeatSale && (availableQty(a) ?? 0) <= 0
 }
 
-/** 到期时间展示：长期买断 → 长期；有到期时间 → 日期；否则 长期 */
+/** 到期时间展示：产品有效期（原「长期买断」）→ 长期；有到期时间 → 日期；否则 长期 */
 export function expiryText(a: Asset): string {
   if (a.perpetual || !a.expiryDate) return '长期'
   return a.expiryDate
 }
 
-/** 是否在 days 天内到期（非长期买断且已设到期时间且未过期） */
+/** 是否在 days 天内到期（非产品有效期（原「长期买断」）且已设到期时间且未过期） */
 export function expiringSoon(a: Asset, days: number, now = Date.now()): boolean {
   if (a.perpetual || !a.expiryDate) return false
   const d = new Date(a.expiryDate).getTime()
@@ -303,6 +306,10 @@ export interface Project {
   remark: string
   items: ProjectItem[]
   contractCount?: number // 合同数量（ADR-007，派生；存量项目可能缺失）
+  // ADR-028 §5（2026-10-21）：明细是否已回填/已产生撤销留痕（后端 projects.cartRefilled，bootstrap 同步）。
+  // `status === 'terminated' && cartRefilled` = 撤销导致的终止 → 详情页展示「已撤销，历史记录已保留」提示条，
+  // 同时后端 DELETE /projects 对该组合 403（留痕不可删）。被驳回未回填的终态项目为 false
+  cartRefilled?: boolean
   createdAt: string
   updatedAt: string
 }
@@ -467,16 +474,7 @@ export const DELIVERABLE_CATEGORIES: Record<
   accept: { label: '验收材料', icon: 'neutral' },
 }
 
-/** 交付物模板项（基础设置中按产品类型配置） */
-export interface DeliverableTemplateItem {
-  id: number
-  name: string
-  category: DeliverableCategory
-  required: boolean // 默认必选交付
-  note: string // 适用说明
-}
-
-/** 交付物实例项（产品详情中，由模板初始化 + 可维护状态/版本） */
+/** 交付物实例项（产品详情中手动维护；ADR-024：模板已下线，每项可挂单文件附件） */
 export interface AssetDeliverable {
   id: number
   name: string
@@ -487,6 +485,7 @@ export interface AssetDeliverable {
   meta: string // 次要信息：格式/大小/授权范围等
   status: 'ready' | 'todo' // 已就绪 / 待完善
   updatedAt: string
+  file?: string | null // 附件（upload 返回的散列文件名；空/NULL = 无附件，ADR-024）
 }
 
 export const DELIVERABLE_STATUS: Record<
@@ -573,6 +572,17 @@ export function formatMoney(v: number | null | undefined): string {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   }).format(v)
+}
+
+/**
+ * 销售单价展示口径（ADR-025，2026-10-21，仅展示层，不影响任何输入/校验/提交）：
+ * amount 模式（卫星 Token）统一换算到百万Token 口径——salePrice（元/个）× 1e6，
+ * formatMoney 两位小数 + 千分位，如 `¥33,333.33/百万Token`；
+ * unit 模式维持 formatMoney 原展示（调用方原有的 salePrice 判空/`/unit` 后缀逻辑不变）。
+ */
+export function displayUnitPrice(a: Pick<Asset, 'pricingMode' | 'salePrice'>): string {
+  if (isAmountMode(a)) return `${formatMoney(a.salePrice * 1_000_000)}/百万Token`
+  return formatMoney(a.salePrice)
 }
 
 /** 元单位金额的输入框展示（千分位 + 两位小数，不含 ¥ 前缀，空/非法回退 0.00），与 formatMoney 同为元口径 */

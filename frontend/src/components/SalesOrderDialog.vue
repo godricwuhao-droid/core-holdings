@@ -197,9 +197,11 @@ function close() {
       </el-form-item>
     </el-form>
 
+    <!-- FIX-20261022 / BUG-10（ADR-033）：请求期间两个按钮一并 loading 禁用（防重复提交；
+         requestId 幂等在父组件 cart/index.vue 内维护） -->
     <template #footer>
-      <el-button @click="close">取消</el-button>
-      <el-button type="primary" :loading="loading" @click="onSubmit">确认下单</el-button>
+      <el-button :disabled="loading" @click="close">取消</el-button>
+      <el-button type="primary" :loading="loading" :disabled="loading" @click="onSubmit">确认下单</el-button>
     </template>
   </el-dialog>
 </template>

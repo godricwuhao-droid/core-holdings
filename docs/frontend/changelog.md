@@ -2,6 +2,229 @@
 
 > 记录 core-holdings 前端（Vue3 + TS + Element Plus + Vite）的页面/组件/接口封装变更。
 
+## 2026-10-22 ｜ 修复：HOTFIX-20261022（购物车模板语法错误 + dev server 域名代理拦截）
+
+> 来源：FORMS-20261022 批次引入的两处阻塞问题（① `cart/index.vue` 编译失败 → 整页白屏；② 域名反代访问 dev server 被 Vite 拦）。
+> 范围：仅 `frontend/src/views/cart/index.vue` + `frontend/vite.config.ts` + 本日志；未改后端、未执行 `npm run build`、未重启 dev server（Vite HMR 自动重载）、未 commit。纯语法/配置修复，业务逻辑、样式、文案零改动。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-22 | 修复 | **购物车模板语法错误（`Element is missing end tag`）**：FORMS-20261022 把 ADR-037 的一条 HTML 注释插进了 `<el-input>` 的**属性区内部**（原 812–813 行），导致编译器认为开标签未闭合、整页编译失败。修法：把该注释上移，与上方 808–809 那段注释合并为一段（808–811，注释内容原样保留），`<el-input>`（812 行）属性区只留属性 | src/views/cart/index.vue（808-811 注释合并，原 812-813 已移除；`<el-input>` 起 812 行） | HOTFIX-20261022 | **规则沉淀（防复发）**：HTML/Vue 模板**注释不得置于开标签内部**（`<el-input` 与 `>` 之间）——注释只能出现在元素之间或元素内容区；多行属性中要写说明，请放到开标签之前或元素内部。全仓 22 个 `.vue` 已用 `@vue/compiler-sfc` 做 `parse` + `compileTemplate` 全量校验：0 错误（含历史遗留零命中） |
+| 2026-10-22 | 修复 | **域名代理被 Vite 拦截（`Blocked request. This host ("store.qxkg.cn") is not allowed.`）**：`vite.config.ts` 的 `server` 补 `allowedHosts`，默认 `['store.qxkg.cn', '.qxkg.cn', 'localhost']`（`.qxkg.cn` 放行该域下所有子域，后续换子域无需改配置）；支持环境变量覆盖 `VITE_ALLOWED_HOSTS="a.com,b.com"`（读 `process.env`，非 `import.meta.env`）；**未**使用 `allowedHosts: true`（等于关闭 DNS rebinding 防护） | frontend/vite.config.ts（新增 `allowedHosts` 常量 + `server.allowedHosts`，proxy 未动） | HOTFIX-20261022 | **配置变更需重启前端 dev server 才生效**（Vite 不热重载自身配置文件）。若安全口径要求更严，可删掉 `'.qxkg.cn'` 只留 `store.qxkg.cn`，后续按子域逐个追加或用 `VITE_ALLOWED_HOSTS` 临时覆盖 |
+
+**自查**：`@vue/compiler-sfc` 全量扫描 `frontend/src/**/*.vue`（22 文件）→ `parse` + `compileTemplate` **0 错误**；并用「注释插在开标签内」的临时 fixture 反向自测，脚本能准确复现 `Element is missing end tag`（证明校验非空跑）；`npx vue-tsc --noEmit` → **0 错误**（无新增，既有历史告警亦无）；IDE 诊断 2 个改动文件 0 条；临时脚本置于 `/tmp` 并已删除。
+
+**部署注意**：`vite.config.ts` 属 Vite 启动配置，改后**必须重启前端 dev server**（`Ctrl+C` 后重新 `pnpm dev` / `npm run dev`），HMR 不会重载配置。
+
+---
+
+## 2026-10-22 ｜ 新增/修改/重构：FORMS-20261022 前端（ADR-036 登记规则 + 表单重构 / ADR-037 viewer 购物车口径）
+
+> 来源：`docs/adr/ADR-036.md` / `docs/adr/ADR-037.md` + `docs/api-contracts.md`「FORMS-20261022 批次」。后端并行开发同一契约，联调在后端完成后进行。
+> 范围：仅 `frontend/src`（7 文件）+ 本日志；未改后端 / `docs/architecture.md` / `docs/business-logic-bugs-20261022.md`，未执行 build、未起 dev server、未 commit。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-22 | 修改 ⚠️ | **菜单与文案「资产主体」→「公司主体」**：① `MainLayout.vue` 侧边栏菜单项；② `router/index.ts` viewer 直达提示改「仅商务人员/管理员可访问『公司主体』」（路由路径 `/settings/entities` 与后端 API 不变，无 meta.title 字段，路由注释同步）；③ `entities.vue` 面包屑 + 页头标题；④ `types.ts` / `api/index.ts` 代码注释同步（纯注释） | src/layouts/MainLayout.vue（110-115）、src/router/index.ts（98、170-175）、src/views/settings/entities.vue（3、120-121）、src/types.ts（49）、src/api/index.ts（155、783） | FORMS-20261022 / ADR-036 | **用户可见**：侧边栏菜单与设置页标题改「公司主体」；viewer 直达该路由的提示文案同步 |
+| 2026-10-22 | 修改 | **登记时间（ADR-036 §1）**：① 新建移除「登记时间」输入项与 `rules.inboundDate` 必填规则，提交 `inboundDate: ''`（后端自动取当天 `YYYY-MM-DD`）；② 编辑模式改只读文本行（`.readonly-text`，`v-if="isEdit"`，前端约束、后端不锁）；③ `form.inboundDate` 初始值 `today()` 保留（仅作编辑回显兜底） | src/views/assets/create.vue（rules、handleSubmit payload 244-245、卡片③ 415-419、样式 554） | FORMS-20261022 / ADR-036 | **用户可见**：登记页不再要求选登记时间（自动当天）；编辑页只读展示一行文本 |
+| 2026-10-22 | 修改 | **术语「长期买断」→「产品有效期」（ADR-036 §2）**：checkbox 标签改「产品有效期」，到期时间占位「长期有效，无需设置」；字段名 `perpetual` / 提交键不变；`types.ts` 注释同步 | src/views/assets/create.vue（卡片③ 401-414）、src/types.ts（91、211、217） | FORMS-20261022 / ADR-036 | **用户可见**：仅文案变化，语义与提交结构零变化 |
+| 2026-10-22 | 新增 | **参考区间自动同步（ADR-036 §3）**：`watch(salePrice)`——仅新建且非遥感容器，`salePrice > 0` 且对应边界未手改 → `priceMin = salePrice`、`priceMax = round(salePrice × 1.02, 2)`；区间输入 `@change` 置 `touchedMin/touchedMax`（程序化写入不触发 change，不置位），手改后不再自动覆盖；编辑模式不自动同步（只回显存量值） | src/views/assets/create.vue（120-131 touched 标记 + watch、373/375 区间输入 @change） | FORMS-20261022 / ADR-036 | **用户可见**：填销售单价后参考区间自动带出（下限=单价、上限=+2%）；手动改过区间后以手改为准，单价再变不再覆盖 |
+| 2026-10-22 | 修改 | **重复售卖规则（ADR-036 §4）**：① 删除「卫星数据自动勾选」`watch`（原 create.vue:100-102），新建默认一律 `false`（存量产品不回刷）；② 遥感容器：「基本信息」卡内禁用态「可重复售卖」开关（恒关 `:model-value="false" disabled`）+ 说明「容器按可售明细售卖，剩余数量 = 未售明细数」；③ 非容器开关保留（可开可关，提示文案不动）；④ `loadAsset` 对容器归零 `repeatSale`（171 行，后端传 true 会 400，防存量脏值卡保存）；「数量与价格」卡对容器整卡隐藏的现状保持 | src/views/assets/create.vue（106 注释、卡片① 323-327、loadAsset 171） | FORMS-20261022 / ADR-036 | **用户可见**：卫星数据不再自动勾选；容器表单首次出现重复售卖入口（禁用态 + 语义说明） |
+| 2026-10-22 | 重构 | **登记页表单分块（ADR-036 §5，不增不减字段）**：4 卡 = ①基本信息（板块/类型/名称/规格/主体 + 遥感 info-bar + 容器禁用开关）②数量与价格（仅非容器：计量单位/产品总数/销售单价（元）/参考价格区间（元）/可重复售卖 + Token info-bar + repeat-sale-hint）③有效期与附件（产品有效期/到期时间/登记时间（仅编辑只读）/产品清单）④状态与备注（产品状态 + 备注）。全部沿用 `.form-card`/`.form-grid`/`.block-head`/`.info-bar` 与既有 token，单列 form-grid 节奏不变；原校验规则（name/board/type/subject/unit/quantity 必填）全部保留，仅移除 inboundDate | src/views/assets/create.vue（模板 292-470 重组） | FORMS-20261022 / ADR-036 | **用户可见**：表单由 3 卡平铺改 4 卡分块；「数量单价」卡改名「数量与价格」；产品清单移入「有效期与附件」；登记时间/有效期字段换卡 |
+| 2026-10-22 | 修改 | **购物车 viewer 折扣口径（ADR-037）**：① 折扣输入 `v-if="!row.isAmount && !isViewer"`（editor/admin 完整保留；amount 行仍不渲染折扣，两条件叠加）；② 折扣摘要行、金额 placeholder 折扣预览对 viewer 同不渲染（`discountSummary/discountPreviewRate/amountPlaceholder` 函数未改，仅渲染层加角色条件）；③ viewer 历史 `discountRate` 不展示、不清空：`onAmountChange` viewer 手改金额不清镜像 rate（195）、`stepQty` 不用旧 rate 回填金额（490，防覆盖用户手填金额）；④ 超上限拦截：grep 确认现有前端**无**金额上下限拦截（仅数量上限 + 后端 400 文案），无需改动；顶部提示条区间文案改角色条件（viewer「须不低于区间下限（上限不限）」，其余「须落在区间内」） | src/views/cart/index.vue（17 import、195、490、645、814、829、850） | FORMS-20261022 / ADR-037 | **用户可见**：生态人员购物车少一个折扣输入（及折扣摘要/预计金额预览）；金额超参考上限不再 400（后端放宽，前端无拦截可改）。结算流程、requestId 幂等（ADR-033）、qtyBusy（BUG-25）零改动 |
+
+**自查**：`npx vue-tsc --noEmit` → 0 错误；`grep "资产主体\|长期买断\|卫星数据自动勾选" frontend/src` → 用户可见文案 0 命中（残留均为注释中的改名引述，任务允许保留）；IDE 诊断 7 个改动文件 0 条；§6 自查：登记页仅用既有 token 与共享类（`.form-card`/`.form-grid`/`.block-head`/`.info-bar`/`.muted`），无新增颜色/圆角/间距/组件类型，单列栅格节奏不变；购物车仅改渲染条件与两处提交守卫，行结构/列宽/结算条零改动；其它页面未触碰。
+
+**联调注意**：① `POST /assets` 传 `inboundDate: ''`（空串）→ 后端自动取当天；`PUT /assets/{id}` 回传存量值（后端不锁，API 仍可改）；② 遥感容器 `repeatSale=true` → 400「遥感数据容器按明细售卖，不支持重复售卖」（前端恒 false，400 为直调 API/并发的兜底）；③ viewer `PUT /cart/{id}` 与 checkout：仅校验下限（`amount < priceMin` → 400），上限放开，历史 `discountRate` 被忽略（不 400、不参与计算）；④ editor/admin 双向区间校验与折扣行为不变（ADR-023）；⑤ 区间自动同步为纯前端行为，后端对 `priceMin/priceMax` 无新增校验（min>max 400 保留）。
+
+---
+
+## 2026-10-22 ｜ 新增：资产主体设置页 + 主体清单动态化（ENTITIES-20261022 / ADR-035）
+
+> 来源：`docs/adr/ADR-035.md` + `docs/api-contracts.md`「ENTITIES-20261022 批次」。后端并行开发同一契约，联调在后端完成后进行。
+> 范围：仅 `frontend/src`（7 文件，其中 1 个新建）+ 本日志；未改后端 / `docs/architecture.md` / `docs/business-logic-bugs-20261022.md`，未执行 build、未起 dev server、未 commit。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-22 | 删除 ⚠️ | **`ENTITIES` 硬编码常量移除**：`types.ts` 删除 4 家主体常量与旧 `interface Entity`，替换为新类型 `Entity { id, name, short, createdAt, updatedAt }`；`entityShort(name)` 改读 `db.entities`（查不到回退原值，兼容未刷新快照/存量游离值）。`types.ts` 新增 `import { db } from '@/api'`（仅 `entityShort` 调用时读取，模块求值期不触碰，与 api 循环导入安全） | src/types.ts（5-6、49-60） | ENTITIES-20261022 / ADR-035 | **用户可感知**：主体简称映射不再写死在前端，改简称/新增主体无需发版；首次 bootstrap 前简称展示回退全称（无功能影响） |
+| 2026-10-22 | 新增 | **API 层**：① `db` 镜像新增 `entities: [] as Entity[]`；`fetchBootstrap` 填充 `db.entities = data.entities ?? []`，字段缺失（旧后端并行期）仅弹一次 `ElMessage.warning('主体清单未加载，请刷新页面')`（模块级 `entityListWarned` 标记，不重复弹）；② 端点封装 `listEntities()` / `createEntity(name, short)` / `updateEntity(id, name, short)` / `deleteEntity(id)`（写操作走既有 `afterWrite()`） | src/api/index.ts（155、161-162、191-196、782-811） | ENTITIES-20261022 / ADR-035 | 读以 bootstrap 镜像为主（全量、无角色过滤），`listEntities` 供需要最新清单时调用；400「主体已存在」/「该主体下存在 N 个产品，不可删除」等文案由后端 detail 给出，经拦截器 + `showError` 展示 |
+| 2026-10-22 | 新增 | **新页面 `/settings/entities`（资产主体）**：表格（主体全称 / 简称 / 创建时间 / 操作：编辑、删除）+ 新增按钮 + 弹窗 `.dlg-form`（公司全称 2–64 字必填、简称 1–32 字必填，placeholder 示例，`maxlength` + 字数统计）；删除走 `ElMessageBox.confirm`，被产品引用 400 由 `showError` 展示；**改名（全称变化）二次确认**「修改主体全称后，存量产品仍挂旧名称，需到产品页逐个改选。确定修改？」（ADR-035 Decision 5），只改简称不弹；数据源 `db.entities`（写后 `afterWrite` 自动同步，无需手动 reload）；空态 `el-empty`「暂无主体，请添加」 | src/views/settings/entities.vue（新建，204 行） | ENTITIES-20261022 / ADR-035 | **用户可感知**：admin/editor 可自助增删改主体（秒级生效，无需发版）。UI 对齐 `settings/users.vue` 骨架（`.page-head` / `.info-bar` / `el-card` + `el-table border stripe` / `.op-actions` / `.dlg-form` label-width 96px），无 token 外颜色/圆角/间距 |
+| 2026-10-22 | 新增 | **路由与菜单**：① `router/index.ts` 新增 `/settings/entities`（懒加载）；viewer 直达 → `ElMessage.warning('仅商务人员/管理员可访问「资产主体」')` 并回 `/assets/embodied`（置于 viewer 静默收窄之前，避免被无提示重定向抢先）；② `MainLayout.vue` 菜单「账号与审计」下方新增「资产主体」（`OfficeBuilding` 图标），`v-if="isAdmin"` 与同组「账号与审计」同口径（editor 不显示菜单项，可直达路由访问） | src/router/index.ts（98-103、153、170-175）、src/layouts/MainLayout.vue（110-114、131） | ENTITIES-20261022 / ADR-035 | **用户可感知**：admin 侧边栏多一个「资产主体」入口；viewer 直达该路由有明确提示（不再静默跳走） |
+| 2026-10-22 | 修改 | **消费点切换 `db.entities`**：① 建产品页「所在主体」下拉 `ENTITIES` → `db.entities`（`label = e.short \|\| e.name`，`value = e.name` 存储口径不变，保持 `filterable`）；② 产品列表主体筛选 `subjects` computed 由「本板块产品去重 subject」改为 `db.entities.map(e => e.name)`（全量主体 + 既有 clearable「全部主体」；label 仍走 `entityShort`，内部已切新数据源，模板零改动）；③ `SalesOrderDialog.vue` / `assets/detail.vue` / 购物车 / 销售项目页等只调 `entityShort` 的页面**未改**（函数内部数据源已切） | src/views/assets/create.vue（33-38、307-311）、src/views/assets/list.vue（74-76） | ENTITIES-20261022 / ADR-035 | **用户可感知**：建产品下拉选项显示「简称（或全称）」而非仅全称；列表主体筛选覆盖全部主体（含本板块暂无产品的主体）；`db.entities` 为空时两处下拉为空选项（不加特殊兜底文案） |
+
+**自查**：`npx vue-tsc --noEmit` → 0 错误；`grep -rn "ENTITIES" frontend/src` 排除任务号 `ENTITIES-20261022` 注释后 0 命中（常量删净，仅任务号出现在注释/changelog）；IDE 诊断 7 个改动文件 0 条；§6 自查：新页面仅用既有 token 与共享类（`.page-head` / `.info-bar` / `.table-head` / `.op-actions` / `.dlg-form`），弹窗 640px `.dlg-form` + label 96px，主蓝按钮 / 表格样式与 `settings/users.vue` 一致，无新增颜色/圆角/间距。
+
+**联调注意**：① 后端 `bootstrap` 未带 `entities` 前，前端降级 = 空下拉 + 设置页空表 + 一次性 warning（不白屏）；② 联调时核对 `entities[]` 元素字段名（`id/name/short/createdAt/updatedAt`，camelCase）与 `GET /entities` 排序（createdAt 正序）；③ 改名不回写 `assets.subject` 为既定行为（ADR-035 Decision 5），联调勿当 bug 提。
+
+---
+
+## 2026-10-22 ｜ 修复：FIX-20261022-FOLLOWUP 收尾（BUG-31 前端 accept + BUG-46 行级 soldCount）
+
+> 范围：仅 `frontend/src`（3 文件）+ 本日志；未改 `docs/architecture.md` / `docs/business-logic-bugs-20261022.md`，未执行 build、未起 dev server、未 commit。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-22 | 修复 | **BUG-31（前端部分）产品清单 accept 与后端白名单对齐**：① `accept=".pdf,.doc,.docx,…,.xlsx"` → 去掉 `.doc`（后端 `POST /api/upload` 已移出白名单，见 `docs/backend/api.md:96`），保留 docx/图片/xlsx；② 上传前提示文案「支持 PDF、Word（.doc/.docx）、图片，≤20MB」→「支持 PDF、Word（.docx）、图片、Excel（.xlsx），≤20MB」；③ 复核本页**无**其它硬编码类型校验（`onContractPicked` 直接调 `uploadFile`，非法格式由后端 400 兜底并 toast）；`contractTypeLabel()` 的 `.doc → Word` 分支**保留**（存量产品仍可能指向旧 .doc 文件，纯展示兜底）；④ `assets/detail.vue` 交付物附件 accept（ADR-024 的 7 种）**未动** | src/views/assets/create.vue（408 accept、419-421 提示文案） | FIX-20261022-FOLLOWUP / BUG-31 | **用户可见**：文件选择框不再列出 `.doc`（选它会被后端 400）；提示文案与实际可上传格式一致（补上了原本漏写的 xlsx）。UI 结构/颜色/间距/组件尺寸零改动 |
+| 2026-10-22 | 修复 | **BUG-46 收尾：优先读行级 `soldCount`**：① `RsItem` 新增可选 `soldCount?: number`（后端同批补进 `bootstrap.rsItems`，字段名 `soldCount: number`；可选以兼容旧后端/旧快照）；② `dRsSoldTotal` 改为「有行且全部行都带 soldCount → 汇总行级值」，否则回退产品级 `asset.soldCount`（原实现按「部分行有值就只加那几行」，会算出偏小的部分和，本次一并收紧）；移除两处 `as RsItemWithSold` 断言（类型已就位） | src/types.ts（RsItem，100-118）、src/views/assets/list.vue（303-322） | FIX-20261022-FOLLOWUP / BUG-46 | **用户可见**：后端 bootstrap 带上行级 soldCount 后，抽屉「已售次数」自动切到行级合计（与明细行内「已售次数」逐行相加一致）；旧后端下行为不变（仍回退产品级，非 0 差异）。`RsItemWithSold`（分页接口行类型，soldCount 必填）保持不动，`detail.vue` 分页表格不受影响 |
+
+**自查**：`npx vue-tsc -p tsconfig.app.json --noEmit` → 0 新增错误，仅余**改动前既存** 5 条（`SalesOrderDialog.vue` 未用 `ref`/`rsItemName`、`assets/detail.vue`+`assets/list.vue` 未用 `refresh`、`review.vue` 的 `ContractItem.discountRate` 缺类型）；IDE 诊断 3 个改动文件均 0 条。
+
+---
+
+## 2026-10-22 ｜ 修复：FIX-20261022 批次前端缺陷（BUG-06/07/09/10/21/22/24/25/26/27/32/35/36/37/38/39/40/44/46）
+
+> 来源：`docs/business-logic-bugs-20261022.md` + `docs/adr/ADR-030.md`（可见性）/`ADR-032.md`（状态机）/`ADR-033.md`（并发幂等）+ `docs/api-contracts.md`「FIX-20261022 批次」。
+> 范围：仅 `frontend/src`，未改后端/架构文档/缺陷报告；未执行 build、未起 dev server、未 commit。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-22 | 修复 | **BUG-06 包量定价行折扣入口下线**（金额降级防护）：① 折扣输入框 `v-if="!row.isAmount"`（amount 模式行不再渲染）；② `discountPreviewRate()` 对 amount 行直接返回 null → 折扣摘要与金额 placeholder 的「预计折后金额」同时失效（placeholder 回归「必填，整数元」）；③ `onDiscountChange()` 对 amount 行提前 return（双保险）；④ `onAmountChange()` 对 amount 行恒提交 `discountRate: null`（存量脏值一并在本次提交清空） | src/views/cart/index.vue（`discountPreviewRate` 247、`onDiscountChange` 298、`onAmountChange` 178、模板金额列 819） | FIX-20261022 / BUG-06 | **用户可见**：卫星 Token 行金额框右侧的「折扣」输入框消失、金额框占满单元格，折扣摘要不再出现；unit 行（含遥感明细行）折扣行为完全不变。依据 ADR-008「合同金额为人工权威输入，salePrice 仅参考」，阻止 `salePrice×qty×折扣` 被当成合同金额写库 |
+| 2026-10-22 | 修复 | **BUG-07 建单页切换产品重置单价/金额**：`onItemAssetChange()` 改为「先无条件重置、再按新产品预填」——amount 模式 `amount=0`（人工重录）、`price=0`；unit 模式 `price=新产品 salePrice` 且 `amount=qty×price` 重算。遥感容器拦截与 `itemId` 解绑逻辑原样保留 | src/views/sales/projects/create.vue:191-213 | FIX-20261022 / BUG-07 | **用户可见**：换产品后单价/金额立即变成新产品挂牌价（Token 产品金额清空待重填），不再沿用上一产品数值。重置即视为「未手改过」：旧产品下手改过的价格随切换丢弃（安全侧，避免错误单价落库） |
+| 2026-10-22 | 修复 | **BUG-09 写操作统一补 `catch`**（按 `await (create\|update\|delete\|patch\|set\|add\|remove\|revert\|claim\|change\|refill\|withdraw)` 逐处 grep 复核，非仅报告列出的位置）：create 页 `saveDraft`/`handleSubmit`；assets/create 页 `handleSubmit`（并把手写 `catch(err:any)` 改为复用 `showError`）；assets/detail 页 `confirmDel`/`setDelStatus`；outbound 页 `handleRevert` | src/views/sales/projects/create.vue（601、624）、src/views/assets/create.vue（211）、src/views/assets/detail.vue（316、348）、src/views/sales/outbound/index.vue（207-214） | FIX-20261022 / BUG-09 | **用户可见**：后端 400/422（数量不足、参考区间越界、服务期限非法、文件格式等）现在弹出可读中文 toast，不再「按钮转一圈什么都没发生」。403 仍由响应拦截器统一 toast（`showError` 跳过，避免重复）；其余页面（cart、projects/index、projects/detail、review、settings/users、TransferDialog、WithdrawProjectDialog、assets/list）经复核原本已有 catch，未改动 |
+| 2026-10-22 | 修复 | **BUG-10（前端部分）结算幂等键 + 按钮 loading 禁用**：① `CheckoutInput` 新增可选 `requestId`、`ProjectOut` 新增可选 `idempotent`；② 购物车结算点击时 `crypto.randomUUID()` 生成 `requestId`（同一次提交失败重试沿用，成功后清空）；③ 结算条「结算下单」、结算弹窗「确认下单/取消」、项目详情合同级「交付/终止」、列表抽屉「交付/终止」、编辑页「终止项目」请求期间 loading + 禁用，并补 `if (busy) return` 双保险 | src/api/index.ts（`CheckoutInput` 929、`ProjectOut.idempotent` 939）、src/views/cart/index.vue（583-600、结算按钮）、src/components/SalesOrderDialog.vue（footer）、src/views/sales/projects/detail.vue（237、517-533、564-579）、src/views/sales/projects/index.vue（抽屉 footer）、src/views/sales/projects/create.vue（终止项目按钮） | FIX-20261022 / BUG-10 / ADR-033 | **用户可见**：重复/连点结算不会再建出两张待审核单（命中幂等时提示「该次结算已提交过，销售项目 SP-xxxx 已存在」）；请求进行中相关按钮转圈且不可再点。后端幂等表未上线时 `requestId` 为可选字段，退化为旧行为不报错 |
+| 2026-10-22 | 修复 | **BUG-21 `delivering`（交付中）纳入批量口径**：① 列表抽屉 `dActiveCount` 改为 `status === 'active' \|\| status === 'delivering'`；② 详情页头部「编辑」按钮放开 delivering（仅「已完成」保留禁用态「编辑」）；③ 建单/编辑页「终止项目」确认文案的进行中记录数同步计入 delivering | src/views/sales/projects/index.vue（267）、src/views/sales/projects/detail.vue（354、371-374）、src/views/sales/projects/create.vue（390） | FIX-20261022 / BUG-21 / ADR-032 | **用户可见**：全部合同都已录签订时间（交付中）的项目，抽屉「交付/终止」不再灰掉不可用；详情页「编辑」按钮在交付中状态出现（与列表页、后端 PUT 口径一致）；终止确认文案里的「N 份进行中销售记录」不再少算 |
+| 2026-10-22 | 修复 | **BUG-22 数量上限改「同产品合计」口径**：① 购物车 `cartRows` 内单次遍历汇总同 `assetId` 全部行 qty，按行回填 `avail = 可售 − 同产品其他行 qty`，`availOf(row)`/`qtyMax(row)` 改读该值（单价列副文案「可售 X / 已达上限 X」同源）；② 建单页 `validateContracts()` 先按 `assetId` 汇总 demand 再与 `availableQty` 比较，越界提示「本单数量合计 X 超出可售上限（可售 Y）」；遥感明细行仍恒 1 | src/views/cart/index.vue（cartRows ~38-80、`availOf` 399、`qtyMax` 404）、src/views/sales/projects/create.vue（428-480） | FIX-20261022 / BUG-22 | **用户可见**：同一产品拆成多行时，「+」按钮按剩余可加数量提前置灰，不再点了才被后端 400 回滚；建单页多行/多销售记录合计越界会被前端先拦住 |
+| 2026-10-22 | 修复 | **BUG-24 `refresh` 并发语义修复**：拆出 `fetchBootstrap()`，以 `refreshSeq` 请求序号只接受最新一次响应（旧快照直接丢弃，不写镜像）；`finally` 仅在 `refreshing === 本次 promise` 时释放锁（`force` 不再无条件绕过，也不再误清并发请求的锁） | src/api/index.ts:156-196 | FIX-20261022 / BUG-24 | **用户可见**：连续写操作后列表/抽屉不再偶发「刚改完数据又变回旧值」（旧快照覆盖新快照）。非 force 调用仍复用同一在飞请求，请求数不变 |
+| 2026-10-22 | 修复 | **BUG-25 折扣/步进器镜像写入收敛**：① `onAmountInput` 不再写 `row.cart.discountRate`，改为标记 `amountManualDrafts[rowId]=true`，「手改金额 → 折扣作废」的清空动作在 `onAmountChange`（失焦提交）同步段一次性完成（同时提交 `discountRate: null`）；② 步进器新增行级 in-flight 互斥 `qtyBusy[rowId]`，请求期间「−/＋」双按钮禁用、`stepQty` 早退，避免响应乱序回写 | src/views/cart/index.vue（133、136、178-205、458-499、模板步进器按钮） | FIX-20261022 / BUG-25 | **用户可见**：敲金额首字不再触发整表重渲染（输入跟手感与原 CART-PERF 目标一致）；快速连点「+/-」时按钮短暂置灰，数量与金额不会出现「跳回上一个值」 |
+| 2026-10-22 | 修复 | **BUG-26 保存草稿复用合同校验**：`saveDraft()` 新增 `if (!isEdit && !validateContracts()) return`——不再产出 0 明细 0 元的 pending 空单 | src/views/sales/projects/create.vue:601-620 | FIX-20261022 / BUG-26 | **用户可见**：未选产品/未填客户/数量或金额不合法时点「保存草稿」会被拦下并提示具体缺项（原来能存出一个既不能审核也不能编辑的空单） |
+| 2026-10-22 | 修复 | **BUG-27 改数量后金额被后端清空的提示**：`stepQty` 提交前记录 `prevAmount`，请求返回后比对镜像 `db.cart` 的 `amount == null` → 清该行金额草稿并提示「「产品名」数量已变更，请重新填写销售金额」；该行标红由既有 `amountInvalid` 值驱动自动生效 | src/views/cart/index.vue:469-482 | FIX-20261022 / BUG-27 | **用户可见**：无折扣行改数量后，金额框清空 + 变红 + 顶部 toast 提示重填，不再「改个数量金额莫名消失」 |
+| 2026-10-22 | 修复 | **BUG-32（前端部分）`/users/options` 对 viewer 不再调用**：列表页 `ownerFilterOptions` 仅在 `!isViewer` 时请求；「全部商务负责人」筛选下拉对 viewer 整块不渲染 | src/views/sales/projects/index.vue（46-49、381-386） | FIX-20261022 / BUG-32 / ADR-030 §5 | **用户可见**：生态人员进入销售项目列表不再有「商务负责人」筛选（该信息对其无意义），也不会因接口提权为 `require_editor` 而弹 403 |
+| 2026-10-22 | 修复 | **BUG-35 文案常量与后端口径对齐**（只改文案，不动 UI 结构）：软件 note「账号许可」→「账号授权」；卫星Token note 补「（包量计价，合同金额整数元权威）」；遥感数据 note 明确「省/精度/月份 维护可售明细，每份单独定价」，单位仍为「份（可售明细）」，彻底去除 ADR-010「日期」语义 | src/constants.ts:11-33 | FIX-20261022 / BUG-35 | 用户可见变化仅在消费 `CATEGORY_UNITS` 的提示文案（当前前端渲染路径未直接展示该表，`bootstrap.categoryUnits` 前端未消费）。**后端 `seed_data.py` 遥感/Token 条目仍是旧文案**（后端不在本批前端改动范围），已在文件头注释说明 |
+| 2026-10-22 | 修复 | **BUG-36 交付物弹窗与附件清理**：① 详情页交付物弹窗改持 `viewingId` + `computed` 从 `db.assetDeliverables` 取值（标记就绪/上传附件后随刷新自动同步，不再显示旧对象）；② assets/create 页新增 `releaseContractFile()`，**替换**时上传成功后删除旧散列文件（`deleteUploadFile`），**移除**时清字段后同删，400 引用占用被忽略并给轻提示；③ 附件上传中禁用「创建/保存」按钮 | src/views/assets/detail.vue（337-357）、src/views/assets/create.vue（161-201、444） | FIX-20261022 / BUG-36 | **用户可见**：交付物弹窗点「标记就绪」后状态标签立即变「已就绪」（原来要点开列表才刷新）；产品清单替换/移除会顺带清理服务端旧文件（仍被引用时提示「原附件仍被引用，暂未删除服务端文件」）；上传过程中保存按钮置灰防丢附件 |
+| 2026-10-22 | 修复 | **BUG-37 交付记录数量列 Token 口径**：新增 `qtyText(outbound)`，按产品 `pricingMode` 走 `formatAssetQty`（amount → `formatTokens`，其余 → `formatWan`），产品已删除回退 `formatWan`；表格「数量/额度」列、撤销交付确认文案、补录时「可售 X」提示同源 | src/views/sales/outbound/index.vue（87-97、157、210、335） | FIX-20261022 / BUG-37 | **用户可见**：Token 产品的交付数量显示「3 亿」而不是「300,000,000」；普通产品千分位口径不变 |
+| 2026-10-22 | 修复 | **BUG-38 撤销单删除入口禁用**：列表行「删除」对 `terminated && cartRefilled` 禁用 + tooltip「撤销单保留历史，不可删除」，`handleDelete` 内再兜一层早退（同后端 403 判据） | src/views/sales/projects/index.vue（310-317、525-545） | FIX-20261022 / BUG-38 / ADR-028 | **用户可见**：撤销产生的终止单「删除」按钮直接灰掉并给出原因，不再点完弹 403 |
+| 2026-10-22 | 修复 | **BUG-39 详情页 tooltip 收窄**：删除包裹全部动作按钮的 `el-tooltip`（原 hover「撤销/重新提交」也会弹「已完成/已终止不可编辑」），改为仅给「编辑 / 审核订单」按钮挂 tooltip（无权限时提示 `NO_PERM_TIP`）；「已完成」禁用态「编辑」保留自身 tooltip | src/views/sales/projects/detail.vue（331-400） | FIX-20261022 / BUG-39 | **用户可见**：hover 撤销/重新提交/接手不再出现无关的「不可编辑」提示；编辑按钮的禁用/无权限提示仍在 |
+| 2026-10-22 | 修复 | **BUG-40 详情页分页状态失效**：新增 `invalidatePager()`，监听 `db.logs.length` / `db.flows.length` 变化重置 `opLog/flow.loaded`（当前停在该页签则立即重载，否则下次进入重拉）；`db.rsItems.length` 变化只重置 `rs.loaded`（本页 CRUD 已有显式重载，避免双请求）；流水类型筛选态下分页隐藏全量 `total`（`layout` 切为 `prev, pager, next`） | src/views/assets/detail.vue（500-522、1149） | FIX-20261022 / BUG-40 | **用户可见**：在本页做交付物/明细操作后再看「操作记录」「数量流水」，列表已是新数据；「数量流水」选了类型筛选后不再出现「筛选 0 条却显示共 37 条」的矛盾数字（筛选只作用于当前页的既有口径不变） |
+| 2026-10-22 | 修复 | **BUG-44 金额输入去步进按钮（§6 硬约束）**：`assets/create.vue` 销售单价、`projects/create.vue` 明细单价补 `:controls="false"`（原 `controls-position="right"` 删除）；数量类输入（产品总数、明细数量、补录交付数量）保留步进按钮；其余金额输入（参考区间上下限、合同金额只读、审核页改价、可售明细单价、补录交付金额）复核后本已合规 | src/views/assets/create.vue:360、src/views/sales/projects/create.vue:979-987 | FIX-20261022 / BUG-44 | **用户可见**：单价输入框右侧上下小箭头消失（纯输入），数量框仍可点步进 |
+| 2026-10-22 | 修复 | **BUG-46 抽屉「已售次数」改后端派生值**：`dRsSoldTotal` 不再遍历 `db.contracts`（viewer 的 contracts 已被后端按「自己下单」过滤 → 次数偏小、与行内 soldCount 口径不一致），改为优先汇总 `db.rsItems` 行级 `soldCount`，当前 bootstrap 的 `RsItemOut` 未携带该字段时回退产品级 `asset.soldCount`（同为后端派生，与行级合计等价） | src/views/assets/list.vue（303-325） | FIX-20261022 / BUG-46 | **用户可见**：生态人员打开遥感容器抽屉，「已售次数」与明细行内「已售次数」不再对不上。**需后端配合的降级点**：bootstrap 未下发 `rsItems[].soldCount`，故现走产品级 `soldCount` 回退；后续 bootstrap 带上该字段即自动切到行级汇总（代码已就绪） |
+| 2026-10-22 | 修改 | **BUG-23 复核（无需改动）**：审核页「清空服务期限」保持原调用方式——`review.vue` 逐行 `serviceStart = l.serviceStart \|\| null`、`serviceEnd = l.serviceEnd \|\| null`，即**显式传 `null`**（不是删字段），符合后端 FIX 后「未传 = 保持原值、显式 null = 清空」语义 | src/views/sales/projects/review.vue:230-231（只读核对） | FIX-20261022 / BUG-23 | 用户可见无变化；若后续把该字段改成 `undefined`/省略将失效，已在备注留痕 |
+
+**自查**
+
+- **§6 UI 硬约束**：本批未新增任何颜色/圆角/间距/阴影——改动集中在逻辑与 `v-if`/`:disabled`/`:controls`/`:loading` 属性；新增的注释不产生样式；弹窗仍复用既有 `.dlg-form`/`.dlg-wide`（未新增或改尺寸）；金额类 `el-input-number` 现已全部无步进按钮。
+- **验证**：`npx vue-tsc -p tsconfig.app.json --noEmit` → 本批改动文件 0 新增错误；仓库仍有 5 条**改动前既存在**的告警/错误（`SalesOrderDialog.vue` 未使用的 `ref`/`rsItemName`、`assets/detail.vue`+`assets/list.vue` 未使用的 `refresh`、`review.vue` 的 `ContractItem.discountRate` 缺类型），均不在本批范围，未顺手修改。
+- **未做**：未执行 `npm run build`、未起 dev server、未改后端/`docs/architecture.md`/缺陷报告、未动 lockfile。
+
+---
+
+## 2026-10-22 ｜ 修复：销售项目快览抽屉「生态人员」显示姓名（TASK-FE-037）
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-22 | 修复 | 销售项目快览抽屉「概览 → 生态人员」由裸账号改为显示姓名：`{{ drawerProject.rep \|\| '-' }}` → `{{ repName(drawerProject.rep) \|\| '-' }}`（走既有 `/users/options/all` 全量名册账号→姓名映射；空值仍显示 `-`；对不上账号的存量自由文本姓名由 `repName` 内 `u?.name \|\| rep` 原样回退）。**抽屉内全量复查**：人员字段仅「商务负责人」（既已走 `ownerLabel`）与「生态人员」两处，销售记录卡片（客户/主体/状态/金额/明细产品/锁定交付日期）与 footer（审核订单/交付/终止/查看详情，确认框文案只引用项目名）无其它人员字段，无同类裸账号 | src/views/sales/projects/index.vue（`<el-drawer class="project-drawer">` 概览区第 2 行） | TASK-FE-037 | 未改后端与数据结构、未改筛选逻辑（`repFilter` 仍按 username 值比对，`reps` 选项值仍为 username，仅 label 走 `repName`），未动抽屉样式/布局；列表「生态人员」列、项目详情页、产品「销售关联」三处显示口径未改动，实测回归一致（均「刘尚坤」）；vue-tsc 0 error、read_lints 0 诊断；**技术债**：`repName`/`ownerLabel` 目前在 5 个文件（`sales/projects/index.vue`、`sales/projects/detail.vue`、`sales/projects/create.vue`、`sales/projects/review.vue`、`assets/detail.vue`）重复实现，建议后续抽公共 util（本次按约束未做） |
+
+---
+
+## 2026-10-21 ｜ 修复：购物车结算条文字排版（TASK-FE-036）
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-21 | 修复 | 购物车结算条文字排版（灰字统一 13px + 竖分隔 + 标签与金额中线对齐 + 件数数字加粗）：① **模板** `.co-selected` 与 `.co-total` 之间插入 `<span class="co-divider" aria-hidden="true">`（纯装饰），件数 `{{ totalQty }}` 用 `<b>` 包裹；② `.co-left` `gap: 22px → 13px`；③ 新增 `.co-divider { width:1px; height:16px; background: var(--divider-color /* #E7EDF5 */); flex:0 0 auto; align-self:center }`；④ `.co-selected` 13px / `var(--text-secondary)` / `line-height:1.2`，新增 `.co-selected b { font-weight:600; color: var(--text-primary /* #1A2E4E */) }`；⑤ `.co-total` `align-items: baseline → center`、`gap: 8px → 6px`（22px/700/主蓝/`tabular-nums` 不变）；⑥ `.co-total small` 12px → 13px、`font-weight:400`、`var(--text-secondary)`、`line-height:1.2`；⑦ `.co-btn` 显式 `margin-left: auto`（父级 `space-between` 与 16px `gap` 保留） | src/views/cart/index.vue（`.cart-checkout` 区块模板 + `.co-left` / `.co-selected` / `.co-divider` / `.co-total` / `.co-total small` / `.co-btn` 样式） | TASK-FE-036 | 业务逻辑零改动（totalQty/totalAmount 计算、openOrder 三必填校验、sticky、disabled、结算弹窗、空车 `v-else` 结构）；配色全走变量（`--divider-color` / `--text-secondary` / `--text-primary` / `--primary-color` / `--border-color`），无新增色值；**条高不变（实测 62px，22px 数字行盒 30px < 按钮 32px 未撑高）**，`.cart-page { padding-bottom: 130px }` 维持不变；浏览器实测：`.co-selected` 与 `.co-total small` 行盒完全重合（y=731.5、h=15.6 → 墨迹重心 31 / 30 差 1px 属字形抗锯齿噪声），件数与金额 cy 均为 739.3（中线对齐），分隔线 1×16 `rgb(231,237,245)`；1440×900 / 1280×800 / 1024×768 三档滚到底末行距条顶均 35px（无遮挡）、左侧信息区与按钮间距最小 272.6px（1024 档，无重叠无换行）；空车态结算条 0 个节点、`.el-empty`「购物车为空」正常；vue-tsc 0 error、read_lints 0 诊断；测试购物车行（id 8/9/10）已 `DELETE /api/cart/{id}` 清零，资产 3/25/26 `lockedQty` 仍为 0 |
+
+---
+
+## 2026-10-21 ｜ 修改：购物车底部结算条由深色块改为白卡吸附工具条（TASK-FE-035）
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-21 | 修改 | 购物车底部结算条由深色块改为白卡吸附工具条（视觉对齐平台白卡体系，主蓝仅用于合计金额与结算按钮） | src/views/cart/index.vue | TASK-FE-035 | `.cart-checkout`：`#112d54` → `var(--card-bg)`、新增 `1px solid var(--border-color)` 描边、圆角 14px → 10px、投影 `0 14px 35px rgba(16,35,63,.24)` → `0 6px 20px rgba(26,46,78,.08)`、padding 15→14px、删 `color:#fff`（sticky/bottom:16/z-index:10 与 flex 结构不变）；`.co-selected`、`.co-total small` 改 `var(--text-secondary)`（13px / 12px）；`.co-total` 数字改 `var(--primary-color)` 22px/700 保留 `tabular-nums`；`.co-btn` 去掉发光投影 `0 5px 13px rgba(23,105,212,.35)`（继承 global.css 主按钮 `0 2px 8px rgba(23,105,212,.28)`）、padding 10px 22px、圆角沿用全局 7px 不重复声明；`.cart-page` padding-bottom 复测维持 130px（实测条高 62px，三档视口滚到底末行距条顶 35px 不遮挡）。业务逻辑（openOrder 前置校验 / 结算弹窗 / 金额计算 / disabled 条件）零改动 | 白卡 + 描边 + 轻投影与上方「待售产品」el-card 同套语言，`#112d54`/`rgba(255,255,255,…)` 等深底专用色值已清零；vue-tsc 0 error、read_lints 0 诊断；空车态沿用原 `v-else` 结构（结算条不渲染），结构未改 |
+
+---
+
+## 2026-10-21 ｜ 修改：生态人员订单提交后隐藏编辑入口（四处）+ 已撤销单详情页留痕提示条（TASK-FE-033 / ADR-028）
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-21 | 修改 | 生态人员（viewer）订单提交后禁编辑，四处入口收敛 + 一条提示：① **列表** `canEditProject` 首行 `if (isViewer) return false`（删除原「viewer 可编辑自己 pending 单」分支与「待审核项目由商务人员接手确认后生效」tooltip 分支），行操作「编辑」整块对 viewer **不渲染**（连禁用态也不给），tooltip 首分支改为「订单已提交，不可编辑，如需修改请「撤销」后重新下单」；「撤销」/「重新提交」入口与判据零改动；② **详情** 头部「编辑」按钮与 delivering/delivered 的禁用态「编辑」对 viewer 隐藏（`v-if="!isViewer && ..."`），`goEdit()` 首行 viewer 拦截兜底（toast 同文案、不跳转），「撤销」「重新提交」及 `onWithdrawn`/`handleResubmit` 未动；③ **详情新增提示条**：`project.status === 'terminated' && project.cartRefilled` 时头部下方渲染「该订单已撤销，历史记录已保留；撤销原因见下方销售记录备注」，复用全局 `.info-bar`（浅蓝底/既定边框），仅补 16px 下边距，不新增配色与布局块；④ **create** `onMounted` 编辑模式下 `isViewer` → `ElMessage.warning('订单已提交，不可编辑，如需修改请「撤销」后重新下单')` + `router.replace` 到该单详情页并 return（置于项目查找之前），原「新建对 viewer 一律禁止」拦截保留；⑤ **路由** `viewerAllowedPath` 正则由 `(detail\|edit)` 改为仅 `detail`，并在 viewer 守卫内对 `/sales/projects/:id/edit` 直达给同一文案提示 + 重定向到 `/sales/projects/:id/detail`（避免静默掉到 `/assets/embodied` 且无提示，detail 在白名单内无死循环）；⑥ **类型** `Project` 新增 `cartRefilled?: boolean`（后端 `ProjectOut` 既有字段，bootstrap 直出） | src/views/sales/projects/index.vue、src/views/sales/projects/detail.vue、src/views/sales/projects/create.vue、src/router/index.ts、src/types.ts | TASK-FE-033 / ADR-028 | 不动 `src/api/index.ts` 接口签名与后端契约（viewer 调 `PUT /projects/{id}` 由后端 403 兜底）；商务/管理员的编辑、审核订单、接手/转交、删除路径与文案不变；vue-tsc 0 error（仓库未配 eslint）；每处权限注释均标注 ADR-028 |
+
+---
+
+## 2026-10-21 ｜ 修改：「重新提交」改为回填购物车并跳转 + 移除 create 页 copy 模式（TASK-FE-031 / ADR-027）
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-21 | 修改 | 「重新提交」收口购物车并移除 create 页 copy 模式：① `api/index.ts` 新增 `refillProjectCart(id)` + `RefillCartResult`（`POST /projects/{id}/refill-cart`，无 body，**不调 afterWrite**，由调用方 `await refresh()`），删除已无调用方的 `resubmitProject` 封装（后端端点保留并标 deprecated）；② 列表页行「重新提交」与详情页页头「重新提交」改为：行级/按钮 loading → `refillProjectCart` → `await refresh()` → `router.push('/cart')`，toast 区分 `alreadyRefilled`（「明细已在购物车，可直接修改后提交」/「明细已回填购物车，可修改后提交」），`skipped>0` 追加「（N 行未能回填，请核对明细）」，失败 `showError` 并停留原页；③ `create.vue` 删除 copy 模式全套（`copyProjectId`/`copyPrefillOk`/原单明细预填/`resubmitProject` 提交分支/标题 copy 分支/`canSubmit` 的 copy 放行/「保存草稿」的 copy 隐藏判断），仅保留新建与编辑（`:id/edit`）两形态，功能与权限判定不变；④ `router/index.ts` 移除 viewer 因 query 参数放行 `/sales/projects/create` 的判断（`viewerAllowedPath` 同步去掉未用 `query` 形参） | src/api/index.ts、src/views/sales/projects/index.vue、src/views/sales/projects/detail.vue、src/views/sales/projects/create.vue、src/router/index.ts | TASK-FE-031 / ADR-027 | vue-tsc 0 error；grep `copy=` / `copyProjectId` / `resubmitProject(` 0 命中；curl 实测 `refill-cart` 200（alreadyRefilled=true）/ 400「仅已终止的项目可重新提交」/ 403「生态人员仅可重新提交自己下单的项目」/ 404 与契约一致；浏览器实测列表页 + 详情页（admin 与 viewer）点击 → `/cart` + toast 两态区分、mock 400 失败停留原页且提示后端 detail；回归 /sales/projects/create（新建）与 /sales/projects/2/edit（admin + viewer 本人单）表单/按钮正常，viewer 直连新建页仍回 `assets/embodied` |
+
+---
+
+## 2026-10-21 ｜ 修改：项目详情页删除页头描述行 / 基本信息行业行 / 销售记录清单说明文案 + 明细表格行高统一 36px（TASK-FE-030）
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-21 | 修改 | 销售项目详情页按截图红框删除三处展示元素：① 页头描述行 `.desc`（编号/客户/N 份销售记录）整块；② 基本信息 `.info-grid` 中「行业」`info-item`；③ 「销售记录清单」`block-head` 内 `.bh-sub` 派生规则说明文案（标题与图标保留）；④ 销售记录卡片明细表 `.contract-items` 行高统一：`:deep()` 覆盖 `.el-table__header th.el-table__cell` / `.el-table__body td.el-table__cell` 为 `height:36px; padding:0`，`.cell` 固定 `line-height:22px` + 单行省略（仅本页该表，全局 `.el-table` 未动；外框/分隔线/hover 沿用全局）；⑤ 配套：产品列加 `show-overflow-tooltip`（单行截断后悬停可看全名，不丢信息）。业务逻辑、接口调用、按钮与其它区块零改动 | src/views/sales/projects/detail.vue | TASK-FE-030 | vue-tsc 0 error；浏览器实测：`.page-head .desc`=0、`行业` 字段不在、`.bh-sub`=0、`.info-grid` 9 格无空洞；三张卡片表头与数据行 `offsetHeight` 均 36（改动前表头 32 / 数据行 55，因产品名换行撑高）；页头→首卡片 20px、`block-head`→首卡片 16px；产品列超长名（220px 列 vs 344px 文本）省略显示 + tooltip 兜底，其余列无裁切 |
+
+---
+
+## 2026-10-21 ｜ 新增：生态人员「撤销」待审核订单三处入口 + 统一撤销对话框（TASK-FE-029 / ADR-026）
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-21 | 新增 | 撤销待审核订单：① `api/index.ts` 新增 `withdrawProject(id, reason)` + `WithdrawResult` 类型（`POST /projects/{id}/withdraw`，**不调 afterWrite**，由调用方 `await refresh()`）；② 新建统一对话框 `WithdrawProjectDialog.vue`（`.dlg-form` 640px，浅蓝 `.info-bar` 说明 + 必填原因 textarea rows=3 maxlength=200 show-word-limit + footer 取消/确认撤销 danger，空原因 toast 拦截、失败走 `showError`、成功 toast「已撤销，明细已回填到购物车」并 emit `done`）；③ 三处入口仅 `status==='pending'` 且「本人（creator==当前登录）或 admin」可见（editor 不显示走驳回）：列表行操作「撤销」（link danger，成功后 `await refresh()` 停留列表）、详情页头部「撤销」（plain danger，成功后 refresh 并跳 `/cart`）、编辑页底部「撤销订单」替换 pending 态的「取消订单（终止）」（非 pending「终止项目」不变；成功后 refresh 并跳 `/cart`） | src/api/index.ts、src/components/WithdrawProjectDialog.vue（新增）、src/views/sales/projects/index.vue、src/views/sales/projects/detail.vue、src/views/sales/projects/create.vue | TASK-FE-029 / ADR-026 | vue-tsc 0 error；列表操作列 190→220px 容纳四按钮；实测 viewer/admin/editor 角色矩阵、空原因拦截、400 失败提示、成功 toast + `/cart` 跳转；后端 `ProjectOut` 未出 `creator`（bootstrap 缺该字段）→ 可见性按「creator 缺省即本人单（viewer 的 projects 已由后端过滤）」兜底 |
+
+---
+
+## 2026-10-21 ｜ 修改：项目详情页销售记录卡头改「甲方：客户；乙方：主体全称」
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-21 | 修改 | 项目详情页销售记录卡片头部元素改文本式：`甲方：{客户名称}`（生态人员下单时输入）+ `乙方：{签约主体全称}`（原为 `客户名 + 主体简称胶囊`），两者以「；」分隔，状态标签保留；移除 `entityShort` 依赖与 `.contract-customer/.contract-subject` 样式，新增 `.contract-party/.cp-label` | `src/views/sales/projects/detail.vue`（销售记录清单卡头） | 用户要求 | 仅详情页，审核页/列表页/抽屉口径未动；乙方用主体全称（不再缩写） |
+
+---
+
+## 2026-10-21 ｜ 修改：审核页明细行改固定列网格（输入框全行对齐、标签不截断）+ 服务期限日期框放大（TASK-FE-028）
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-21 | 修改 | 审核页明细行改固定列网格（输入框全行对齐、标签不截断）+ 服务期限日期框放大，纯布局：① `.rv-line-main-row` flex → `display:grid`（`minmax(150px,1fr) 78px 92px 176px 280px minmax(132px,auto)`，column-gap 10px，padding 9px 0），「标签+值」包成 `.rv-c-disc/.rv-c-orig/.rv-c-edit` 成对分组容器，`.rv-c-edit .rv-lbl` 定宽 112px（容纳「销售金额（整数元）」不截断）+ `.rv-input` 158px → unit/amount/rs 三分支输入框左边缘吸附同一列；`.rv-c-amt` 末列 `justify-self:end` 保持右对齐；`.rv-line-name` 改块级省略（裁切只作用于产品名，标签不再被 `overflow:hidden` 切断）；② 服务期限行去 `size="small"`（默认尺寸）+ `.rv-date` 170px（el-date-picker 根无 scope 属性，改 `.rv-line-svc-row :deep(.rv-date)` 命中并压过 EP 默认 220px）、`.el-input__inner` 13px、行 gap 10px / padding 10px 0 10px 2px、`~` 前后 2px、「服务期限」标签 13px（其余标签仍 12px）；③ ≤1360px 列宽收缩（产品名列 `minmax(0,1fr)` 优先让位、输入框 150px、标签定宽保持 112px）。文案/字段/按钮/v-model/@click/tooltip/校验/提交/分支条件零改动 | src/views/sales/projects/review.vue | TASK-FE-028 | 浏览器实测 1440px：三行输入框 `getBoundingClientRect().left` 均为 1076（1360px 时均为 848）；最长标签 112px 无截断，最长右列文案不溢出（rowScrollW=rowW）；日期框 170×32、13px；vue-tsc 0 error |
+
+## 2026-10-21 ｜ 修改：订单审核页纯布局优化（TASK-FE-027）
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-21 | 修改 | 审核页纯布局优化：明细行改两层结构（主行 + 服务期限行，均单行不换行）、卡片头单行（客户名/主体标签/合计金额 22px 基线）、金额列右对齐（min-width 150px，同一合同各行右边缘对齐）、总金额条与卡片同宽同内边距（space-between 左标签右数值）、行间/层间单条 1px 细线（去 dashed）、页头说明 max-width 920px；无内容与业务变更（v-model/@click/v-if 链/校验/提交零改动） | src/views/sales/projects/review.vue | TASK-FE-027 | vue-tsc 0 error；diff 无新增字段/文案/按钮；1440px 实测 3 行金额右边缘同为 1 处 |
+
+---
+
+## 2026-10-21 ｜ 修复：销售项目详情页待审核状态重复渲染「审核订单」按钮
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-21 | 修复 | 详情页头部操作区 v-if/v-else 链断裂：`el-tooltip v-else`（禁用态「审核订单」）实际挂在「重新提交」的 `v-if` 上，导致待审核项目同时渲染两个「审核订单」（一个可用 + 一个禁用）。改为独立 `v-if`：禁用态仅 `pending && !canReview && !isViewer` 渲染；禁用「编辑」改为 `delivering`/`delivered`；各状态最多一个按钮 | src/views/sales/projects/detail.vue（head-actions） | 用户反馈（商务账号右上角两个审核订单） | 列表页 index.vue 与建单页 create.vue 经排查为独立 v-if，无同问题 |
+
+---
+
+## 2026-10-21 ｜ 修改：卫星 Token 单位文案「个」+ amount 模式单价展示百万Token 口径（ADR-025）
+
+**关联任务**：TASK-FE-026；决策依据 `docs/adr/ADR-025.md`（卫星 Token 数量单位「个」+ 单价展示百万Token 口径）。纯展示层换算，交易链路（输入/校验/提交）零改动。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-21 | 修改 | 卫星 Token 单位文案：`constants.ts` CATEGORY_UNITS 卫星Token 行 unit `颗（Token 额度）` → `个`，note 恢复原文案「按 Token 额度与有效期售卖」（新建/编辑产品表单单位下拉与说明随之更新；数量展示仍走 `formatTokens` 不变） | src/constants.ts | TASK-FE-026 / ADR-025 | 前端 grep `颗（Token 额度）` 0 命中 |
+| 2026-10-21 | 修改 | amount 模式（pricingMode='amount'，卫星 Token）销售单价展示统一换算到百万Token 口径：新增展示 helper `displayUnitPrice(asset)`（types.ts，与 formatMoney 同口径：`formatMoney(salePrice × 1e6)` + `/百万Token`，如 `¥33,333.33/百万Token`），覆盖 4 处展示点——① 产品列表「销售单价」列（list.vue `salePriceText`）；② 产品列表抽屉「关键信息」销售单价行；③ 产品详情「数量与归属」销售单价行（detail.vue）；④ 购物车「销售单价」列（cart/index.vue，amount 行副文案「元/{unit}」不再重复展示）。unit 模式展示 0 变化；销售记录/审核页的行级派生单价（金额÷数量，「约」口径）非产品挂牌价展示，维持不变；产品登记/编辑页「销售单价」输入框不改（维持元/个输入） | src/types.ts、src/views/assets/list.vue、src/views/assets/detail.vue、src/views/cart/index.vue | TASK-FE-026 / ADR-025 | 仅展示层换算（number 运算，formatMoney 两位小数，33,333.33 场景实测无 float 偏差）；后端数据（salePrice=0.03333333）未就绪前显示旧值，刷新后生效 |
+
+### 验证
+
+- `npx vue-tsc --noEmit` 0 error；IDE 诊断 0。
+- 前端 grep `颗（Token 额度）` 0 命中；`node` 实测 `formatMoney(0.03333333 × 1e6)` = `¥33,333.33`。
+- 未执行构建/部署命令；未 commit。
+
+## 2026-10-21 ｜ 删除/新增：交付物模板下线 + 抽屉删「最近动态」+ 交付物单文件附件（ADR-024）
+
+**关联任务**：TASK-FE-024；决策依据 `docs/adr/ADR-024.md`（交付物模板彻底下线 + 交付物单文件附件 + 抽屉/详情两处预览 + 抽屉删「最近动态」）。接口契约：`PUT /api/assets/{asset_id}/deliverables/{item_id}` patch 白名单新增 `file`（""/null=清空）；bootstrap `assetDeliverables` 每行含 `file?: string | null`；上传复用 `POST /upload`（前端 accept 更严：仅 .pdf/.docx/图片，禁 .doc/.xlsx，选择后前端校验扩展名不符 toast 拦截）；文件删除复用 `DELETE /api/upload/{filename}`（api 层新增 `deleteUploadFile` 封装，400「仍被引用」由调用方 catch 提示并仅清空字段）；预览统一走 `fileUrl(filename, inline?)` + `FilePreview` 全屏弹窗（弹窗内自带下载入口）。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-21 | 删除 | ⚠️ **Breaking** 交付物设置页彻底下线：删 `views/settings/deliverables.vue` 页面、`router/index.ts` 路由与 admin 守卫分支（/settings/users 放行保留）、`MainLayout.vue`「基础设置」子菜单中「交付物设置」项（子菜单仅剩一项，改回扁平菜单项「账号与审计」，样式不变）；api 层删 bootstrap 镜像 `deliverableTemplates` 字段与 refresh 赋值、`getDeliverableTemplate`、模板 CRUD 三函数（add/update/deleteTemplateItem）；types 删 `DeliverableTemplateItem`。交付物实例改为详情页「交付物」页签全手动维护（新增入口保留） | views/settings/deliverables.vue（删除）、router/index.ts、layouts/MainLayout.vue、api/index.ts、types.ts | TASK-FE-024 / ADR-024 | 前端 grep `deliverableTemplate`/`settings/deliverables`/`DeliverableTemplateItem` 0 命中；/settings/users 正常可达，/settings/deliverables 不再可达（命中 catch-all 回 /dashboard） |
+| 2026-10-21 | 删除 | 产品列表抽屉删除「最近动态」区块：删模板区块（rs-tl 细线时间线）与脚本 `DrawerActivity`/`dActivities`/`loadDrawerActivities`、drawerVisible watch 中调用；`dProjects` 仅该区块使用一并清理；随之失效的 `listAssetFlows`/`listAssetLogs`/`projectItemsOfAsset`/`FLOW_TYPES` 导入与 `.rs-tl*` 样式段全部移除。抽屉其余区块（数量进度/repeatSale/产品清单/关键信息/可售明细/交付物）渲染不变 | views/assets/list.vue | TASK-FE-024 / ADR-024 | 抽屉打开不再拉取 flows/logs 两个分页接口 |
+| 2026-10-21 | 修复 | 修复交付物页签 v-else 断裂导致详情页编译失败（交付物清单行附件区两处 v-if/v-else 链断裂，Vite 报 `v-else/v-else-if has no adjacent v-if or v-else-if`，详情页动态 import 失败；已恢复 canWrite 上传/预览/删除与 viewer「无附件」弱文案语义） | views/assets/detail.vue | TASK-FE-024 / ADR-024 | 验证：Vite 编译 detail.vue/list.vue 通过，`npx vue-tsc --noEmit` 0 error |
+| 2026-10-21 | 新增 | 交付物单文件附件 + 两处预览：types `AssetDeliverable` 加 `file?: string \| null`；api 新增 `deleteUploadFile(filename)`（DELETE /upload/{filename}，400 由调用方处理）。详情页「交付物」页签清单行 `.dl-right` 增加附件操作：无附件显示「上传」文字按钮（仅 canWrite，viewer 显示「无附件」弱文案），有附件显示原名（`fileDisplayName`，点击→预览）+「预览」+「删除」小按钮（canWrite 可见）；上传用隐藏 input[type=file]（accept 仅 .pdf/.docx/.png/.jpg/.jpeg/.gif/.webp，禁 .doc/.xlsx，选择后前端校验扩展名不符 toast 拦截），成功 `uploadFile` → `updateAssetDeliverable(file)` + afterWrite 刷新，替换=重新上传覆盖；删除先 `updateAssetDeliverable(file: "")` 再 `deleteUploadFile`（400 被引用则 toast 提示且仅清空字段不删物理文件）；预览 = `el-dialog` 全屏 + `FilePreview`（复用 create.vue/list.vue 现有模式，弹窗内自带下载入口）。抽屉「交付物」区块每行有附件时显示文件名（可点击→同一全屏预览弹窗，所有角色含 viewer 可预览，无上传/删除入口）；新增交付物对话框（openDelCreate）不加附件字段 | views/assets/detail.vue、views/assets/list.vue、api/index.ts、types.ts | TASK-FE-024 / ADR-024 | 交互对齐「产品清单」(contractFile, create.vue)；样式仅复用平台 token（主蓝文字链接 + 现有文字按钮，无新颜色/圆角）；file 字段后端未就绪前为 undefined，UI 按「无附件」优雅显示 |
+
+### 验证
+
+- `npx vue-tsc --noEmit` 0 error；IDE 诊断 0。
+- 前端 grep：`deliverableTemplate` / `settings/deliverables` / `DeliverableTemplateItem` / `dActivities` / `dProjects` / `rs-tl` 0 命中（仅一条 ADR-024 删除说明注释）；`/settings/deliverables` 路由已删，访问命中 catch-all 回 /dashboard，菜单无「交付物设置」，「账号与审计」为扁平菜单项正常可达。
+- 未执行构建/部署命令；未 commit。
+
 ## 2026-10-25 ｜ 修改：删除购物车输入框类 hover 提示（用户反馈「太碍事」）
 
 **关联任务**：用户反馈购物车表格内挂在输入类组件上的 el-tooltip hover 浮层「太碍事」（截图：hover 客户输入框弹出「结算时按「产品 + 客户」分组生成销售记录」浮层挡住内容）。范围严格限定：删除挂在**输入类组件**上的 tooltip，保留挂在文本/列头上的 tooltip；业务逻辑零变更（只动模板包裹层与随之失效的死函数）。
