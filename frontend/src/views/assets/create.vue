@@ -9,7 +9,7 @@
  *  - ① 基本信息：板块 / 类型 / 名称 / 规格 / 所在主体（遥感容器追加 info-bar + 可重复售卖禁用态开关）
  *  - ② 数量与价格（仅非容器）：计量单位 / 产品总数 / 销售单价（元）/ 参考价格区间（元）/ 可重复售卖
  *  - ③ 有效期与附件：产品有效期（原「长期买断」）/ 到期时间 / 登记时间（仅编辑，只读）/ 产品清单附件
- *  - ④ 状态与备注：状态由数量自动判定（可售 / 全部出售），备注
+ *  - ④ 备注：仅备注（UI-OPT-20261022：「产品状态」展示块已移除——状态本就由数量自动派生，无输入价值）
  *  产品编号自动生成，供应商/交付地点/序列号/预计金额等字段已移除
  *  2026-10-15：功能清单附件上传已移除（后端字段保留，提交 payload 不再携带）；
  *  产品清单附件 2026-10-15 误删后已恢复（上传/回显/预览）
@@ -35,11 +35,9 @@ import {
   Upload,
 } from '@element-plus/icons-vue'
 import {
-  ASSET_STOCK_STATE,
   BOARDS,
   today,
   type AssetStatus,
-  type AssetStockState,
   type Board,
 } from '@/types'
 import { createAsset, db, deleteUploadFile, fileDisplayName, getAsset, refresh, showError, updateAsset, uploadFile, type AssetInput } from '@/api'
@@ -127,20 +125,6 @@ watch(
     if (!touchedMax.value) form.priceMax = Math.round(v * 1.02 * 100) / 100
   },
 )
-
-/**
- * 数量状态展示：与列表页口径统一，走派生函数（可售 / 已售罄）。
- * 基于表单实时值派生，勾选/取消「可重复售卖」瞬间状态标签即时联动：
- *  - repeatSale → 可售（与 assetStockState 口径一致）
- *  - 否则按 form.quantity 实时值 + 已存锁定/售卖量（编辑模式取已存值，新建模式为 0）判定
- */
-const stockState = computed<AssetStockState>(() => {
-  if (form.repeatSale) return 'in_stock'
-  const a = isEdit.value ? getAsset(assetId.value) : null
-  // 与 noSellableStock/availableQty 同口径：quantity - lockedQty - shippedQty <= 0（repeatSale 已排除）
-  const noStock = form.quantity - (a?.lockedQty ?? 0) - (a?.shippedQty ?? 0) <= 0
-  return noStock ? 'no_stock' : 'in_stock'
-})
 
 function loadAsset() {
   if (!isEdit.value) return
@@ -365,7 +349,7 @@ onMounted(async () => {
               <el-input-number v-model="form.salePrice" :min="0" :precision="2" :controls="false" style="width: 100%;" />
             </el-form-item>
             <!-- ADR-018（PRICING-20261020）：参考价格区间——元/{unit}，选填（可单边），
-                 下单时行折扣单价（销售金额÷数量）须落在区间内，超区间后端 400
+                 下单时单价（销售金额 ÷ 数量）须落在区间内，超区间后端 400
                  ADR-036 §3：新建时销售单价填写后自动同步（min=单价、max=单价×1.02）；
                  用户手改（@change）置 touchedMin/touchedMax 后不再自动覆盖（编辑模式不自动同步） -->
             <el-form-item label="参考价格区间（元）">
@@ -375,7 +359,7 @@ onMounted(async () => {
                 <el-input-number v-model="form.priceMax" :min="0" :precision="2" :controls="false" placeholder="上限（选填）" style="width: 100%;" @change="touchedMax = true" />
               </div>
               <div class="muted" style="font-size: 12px; margin-top: 4px;">
-                元/{{ form.unit || '单位' }}，选填（可只填一边）；下单折扣区间校验用，未设置则不限制
+                元/{{ form.unit || '单位' }}，选填（可只填一边）；下单时单价校验用，未设置则不限制
               </div>
             </el-form-item>
             <!-- ADR-008：包量定价说明（浅蓝提示条） -->
@@ -450,20 +434,12 @@ onMounted(async () => {
           </div>
         </div>
 
-        <!-- 4. 状态与备注 -->
+        <!-- 4. 备注（UI-OPT-20261022：「产品状态」展示块已整体移除，卡片仅保留备注） -->
         <div class="form-card">
           <div class="block-head">
             <span class="bh-icon" aria-hidden="true"><el-icon><CircleCheck /></el-icon></span>
-            <span class="bh-title">状态与备注</span>
+            <span class="bh-title">备注</span>
           </div>
-          <el-form-item label="产品状态">
-            <div class="status-line">
-              <el-tag :type="ASSET_STOCK_STATE[stockState].tag" size="large" round>
-                {{ ASSET_STOCK_STATE[stockState].label }}
-              </el-tag>
-              <span class="status-tip muted">状态由数量自动判定，无需手动修改</span>
-            </div>
-          </el-form-item>
           <el-form-item label="备注" prop="remark">
             <el-input v-model="form.remark" type="textarea" :rows="3" placeholder="填写特殊约定或注意事项" />
           </el-form-item>
@@ -555,18 +531,6 @@ onMounted(async () => {
   font-size: 13px;
   line-height: 32px;
   color: var(--text-primary);
-}
-
-/* ===== 产品状态行：tag 在上，muted 12px 提示置于其正下方，左缘与 tag 对齐 ===== */
-.status-line {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 6px;
-}
-.status-line .status-tip {
-  font-size: 12px;
-  line-height: 18px;
 }
 
 /* ===== 产品清单 ===== */

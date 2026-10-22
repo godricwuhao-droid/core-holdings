@@ -23,6 +23,7 @@ import {
   Operation,
   Plus,
   Tickets,
+  TopRight,
   Upload,
 } from '@element-plus/icons-vue'
 import {
@@ -30,9 +31,11 @@ import {
   DELIVERABLE_CATEGORIES,
   FLOW_TYPES,
   PROJECT_STATUS,
+  RS_ITEM_STATUS,
   assetStockState,
   availableQty,
   boardLabel,
+  checkDeliverableUrl,
   displayUnitPrice,
   entityShort,
   expiryText,
@@ -67,7 +70,7 @@ import {
   listAssetLogs,
   listAssetRsItems,
   projectItemsOfAsset,
-  refresh,
+  removeAssetDeliverable,
   showError,
   translateFileNames,
   updateAssetDeliverable,
@@ -188,13 +191,69 @@ function goEditAsset() {
   router.push(`/assets/${asset.value.id}/edit`)
 }
 
+/**
+ * 复制产品编号。
+ * CLIPBOARD-20261022：`navigator.clipboard` 是 secure-context-only API——
+ * http + 局域网 IP 访问时为 undefined（本项目实际部署形态），原先只能走 catch 弹编号。
+ * 降级链：clipboard API → execCommand('copy')（不受安全上下文限制）→ 弹窗展示让用户手抄。
+ * 注意：execCommand 需要 user gesture，必须在点击的同一 task 内同步调用（不要在它之前 await）。
+ */
 async function copyCode() {
   if (!asset.value) return
-  try {
-    await navigator.clipboard.writeText(asset.value.code)
+  const code = asset.value.code
+  // 1 级：异步 Clipboard API（https / localhost 才有）
+  if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+    try {
+      await navigator.clipboard.writeText(code)
+      ElMessage.success('产品编号已复制')
+      return
+    } catch {
+      // 权限被拒 / 非聚焦文档 → 继续降级
+    }
+  }
+  // 2 级：execCommand（需 user gesture；此处仍在点击的同步调用链上）
+  if (copyByExecCommand(code)) {
     ElMessage.success('产品编号已复制')
+    return
+  }
+  // 3 级：兜底展示
+  ElMessage.info(`产品编号：${code}`)
+}
+
+/**
+ * textarea + execCommand 兜底复制；返回是否成功。同步实现，勿引入 await。
+ * CLIPBOARD-20261022：textarea 的移除放在 finally——成功 / 返回 false / execCommand 抛错
+ * 三条路径都会摘除节点，不留 DOM 残留（`document.body.children.length` 回到调用前）。
+ */
+function copyByExecCommand(text: string): boolean {
+  const prevFocus = document.activeElement as HTMLElement | null
+  const ta = document.createElement('textarea')
+  try {
+    ta.value = text
+    // 防滚动/防闪烁：移出视口 + 只读 + 无边框
+    ta.setAttribute('readonly', '')
+    ta.style.position = 'fixed'
+    ta.style.top = '0'
+    ta.style.left = '-9999px'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.select()
+    ta.setSelectionRange(0, text.length) // iOS Safari 需要
+    return document.execCommand('copy')
   } catch {
-    ElMessage.info(`产品编号：${asset.value.code}`)
+    return false
+  } finally {
+    // 无论成功 / 返回 false / execCommand 抛错，只要挂上过就摘除 → 不留 DOM 残留
+    ta.parentNode?.removeChild(ta)
+    // 焦点归还给触发前的元素（select() 会把焦点吸到 textarea 上）；
+    // 该元素可能已脱离文档，focus 自身也可能抛错 → 内层 try 吞掉，保证 finally 不外抛
+    if (prevFocus && typeof prevFocus.focus === 'function') {
+      try {
+        prevFocus.focus()
+      } catch {
+        // 忽略：焦点归还失败不影响复制结果
+      }
+    }
   }
 }
 
@@ -305,11 +364,12 @@ const delCreate = reactive({
     category: 'install' as DeliverableCategory,
     required: true,
     note: '',
+    url: '', // ADR-044：外部链接（选填）
   },
 })
 
 function openDelCreate() {
-  delCreate.form = { name: '', category: 'install', required: true, note: '' }
+  delCreate.form = { name: '', category: 'install', required: true, note: '', url: '' }
   delCreate.visible = true
 }
 
@@ -319,9 +379,22 @@ async function confirmDel() {
     ElMessage.warning('请输入交付物名称')
     return
   }
+  // ADR-044：外链与后端 `_normalize_deliverable_url` 同规则（http/https + ≤512），不合法中断提交
+  const url = delCreate.form.url.trim()
+  const urlErr = checkDeliverableUrl(url)
+  if (urlErr) {
+    ElMessage.warning(urlErr)
+    return
+  }
   // FIX-20261022 / BUG-09：写操作补 catch（后端 400/422 此前完全静默）
   try {
-    await addAssetDeliverable(asset.value.id, { ...delCreate.form })
+    await addAssetDeliverable(asset.value.id, {
+      name: delCreate.form.name,
+      category: delCreate.form.category,
+      required: delCreate.form.required,
+      note: delCreate.form.note,
+      url, // 空串也照传（后端归一为 ''，便于「只上传附件」语义）
+    })
     ElMessage.success('新增成功')
     delCreate.visible = false
   } catch (e) {
@@ -340,8 +413,14 @@ const viewing = computed<AssetDeliverable | null>(() =>
   viewingId.value == null ? null : deliverables.value.find((d) => d.id === viewingId.value) ?? null,
 )
 
+/** ADR-044：弹窗内「外部链接」编辑草稿（清空后保存 → 传 url: ''，即清除链接） */
+const delUrlDraft = ref('')
+const delUrlSaving = ref(false)
+
 function openView(id: number) {
   viewingId.value = id
+  // ADR-044：链接编辑草稿按打开瞬间的值播种（之后由用户编辑，不随镜像刷新重播，避免打字被打断）
+  delUrlDraft.value = deliverables.value.find((d) => d.id === id)?.url ?? ''
   viewDialog.value = true
 }
 
@@ -354,6 +433,70 @@ async function setDelStatus(status: 'ready' | 'todo') {
     ElMessage.success(status === 'ready' ? '已置为「已就绪」' : '已置为「待完善」')
   } catch (e) {
     showError(e, '状态更新失败')
+  }
+}
+
+/**
+ * ADR-044：保存外部链接。
+ * - 校验失败：提示并**不发请求**；
+ * - 输入框清空后保存 → `url: ''`（显式清空，而非不传字段，否则后端保留旧值）。
+ */
+async function saveDelUrl() {
+  const a = asset.value
+  const d = viewing.value
+  if (!a || !d) return
+  const id = d.id // 先取 id：成功刷新镜像后 computed 可能已换对象
+  const url = delUrlDraft.value.trim()
+  const err = checkDeliverableUrl(url)
+  if (err) {
+    ElMessage.warning(err)
+    return
+  }
+  delUrlSaving.value = true
+  try {
+    await updateAssetDeliverable(a.id, id, { url })
+    delUrlDraft.value = url
+    ElMessage.success('链接已保存')
+  } catch (e) {
+    showError(e, '链接保存失败')
+  } finally {
+    delUrlSaving.value = false
+  }
+}
+
+/**
+ * ADR-044：删除交付物（ADR-044 §4：入口只在详情弹窗底部左侧，二次确认）。
+ * 删除前先把 id / 名称取到本地 —— 成功后镜像刷新，`viewing` 已找不到该对象（再读即 undefined）。
+ * 成功后置 `viewingId = null` 并关闭弹窗，避免弹窗指向已删对象。
+ */
+async function removeDeliverable() {
+  const a = asset.value
+  const d = viewing.value
+  if (!a || !d) return
+  const id = d.id
+  const name = d.name
+  const assetIdNow = a.id
+  try {
+    await ElMessageBox.confirm(
+      `确定删除交付物「${name}」？删除后该交付物的附件文件不再被引用（文件本身保留在文件库，可由管理员清理），此操作不可撤销。`,
+      '删除交付物',
+      {
+        type: 'warning',
+        confirmButtonText: '删除',
+        confirmButtonClass: 'el-button--danger',
+        cancelButtonText: '取消',
+      },
+    )
+  } catch {
+    return // 取消 / 关闭 → 无操作
+  }
+  try {
+    await removeAssetDeliverable(assetIdNow, id) // 内部 afterWrite() → 镜像自动刷新
+    viewingId.value = null
+    viewDialog.value = false
+    ElMessage.success('交付物已删除')
+  } catch (e) {
+    showError(e, '删除失败')
   }
 }
 
@@ -448,6 +591,17 @@ const rs = reactive({
   loaded: false,
 })
 
+/** ADR-038：行级 in-flight 互斥（同购物车 qtyBusy）——请求在飞期间该行开关禁用 */
+const rsBusy = reactive<Record<number, boolean>>({})
+/** ADR-038：开关显示值的局部副本（按明细 id），不直接改行对象 → 失败可回滚 */
+const rsDraft = reactive<Record<number, boolean>>({})
+/**
+ * RS-STATUS-20261022：行「状态」的局部副本（按明细 id），与 `rsDraft` 同模式、同生命周期。
+ * 开关保存成功后由 `PUT /rs-items/{id}` 响应体（已含后端重算后的 status）回写，
+ * 缺省回退行快照 `row.status` → 行内状态随开关切换即时更新，不必等分页重拉。
+ */
+const rsStatusDraft = reactive<Record<number, RsItem['status']>>({})
+
 async function loadRsItems() {
   const a = asset.value
   if (!a) return
@@ -456,6 +610,12 @@ async function loadRsItems() {
     const res = await listAssetRsItems(a.id, rs.page, rs.pageSize)
     rs.total = res.total
     rs.items = res.items
+    // ADR-038：每次加载按服务端值重播种开关副本，消除「弹窗编辑后副本残留旧值」的漂移
+    for (const it of res.items) {
+      rsDraft[it.id] = it.repeatSale
+      // RS-STATUS-20261022：状态副本同批按服务端值重播种（分页接口已返回 status）
+      rsStatusDraft[it.id] = it.status
+    }
     rs.loaded = true
   } catch (e) {
     showError(e, '加载可售明细失败')
@@ -534,6 +694,8 @@ const rsForm = reactive({
   // 参考价格区间（ADR-021，RSITEM-RANGE-20261020）：选填（可单边），与产品区间同口径
   priceMin: undefined as number | undefined,
   priceMax: undefined as number | undefined,
+  // 可重复售卖（ADR-038，RS-REPEAT-20261022）：默认 false = 单次售卖（售出即占用）
+  repeatSale: false,
 })
 
 function openRsCreate() {
@@ -545,6 +707,7 @@ function openRsCreate() {
   rsForm.price = undefined
   rsForm.priceMin = undefined
   rsForm.priceMax = undefined
+  rsForm.repeatSale = false // ADR-038：新增默认关闭（单次售卖）
   rsForm.visible = true
 }
 
@@ -558,6 +721,8 @@ function openRsEdit(it: RsItem) {
   // ADR-021（RSITEM-RANGE-20261020）：参考区间回显（未设为 null → 输入框留空）
   rsForm.priceMin = it.priceMin ?? undefined
   rsForm.priceMax = it.priceMax ?? undefined
+  // ADR-038：回显该明细现有开关值（编辑不改默认，改不改都由用户决定）
+  rsForm.repeatSale = it.repeatSale
   rsForm.visible = true
 }
 
@@ -588,8 +753,8 @@ async function saveRsItem() {
     // ADR-021（RSITEM-RANGE-20261020）：参考区间 undefined → null（区分「未设」，含清空场景）
     priceMin: rsForm.priceMin ?? null,
     priceMax: rsForm.priceMax ?? null,
-    // 编辑沿用既有可重复售卖设置；新增默认 true（只计次不扣量）
-    repeatSale: rsForm.editing ? rsForm.editing.repeatSale : true,
+    // ADR-038（RS-REPEAT-20261022）：明细级「可重复售卖」随整行提交；默认 false = 单次售卖
+    repeatSale: rsForm.repeatSale,
   }
   try {
     const wasEdit = !!rsForm.editing
@@ -606,6 +771,71 @@ async function saveRsItem() {
     loadRsItems()
   } catch (e) {
     showError(e, '保存失败')
+  }
+}
+
+/** 开关显示值：优先局部副本（`rsDraft`），缺省 = 行镜像值 */
+function rsRepeatValue(row: RsItemWithSold): boolean {
+  return rsDraft[row.id] ?? row.repeatSale
+}
+
+/** RS-STATUS-20261022：状态显示值：优先局部副本（`rsStatusDraft`）→ 行快照值（只读，不参与写入）；
+ * 旧后端/旧快照缺 `status` 时按「可售」降级（与 `isRsItemSoldOut` 的缺省口径一致） */
+function rsStatusValue(row: RsItemWithSold): RsItem['status'] {
+  return rsStatusDraft[row.id] ?? row.status ?? 'in_stock'
+}
+
+/** 整行入参（PUT 整行覆盖：明细字段一个不漏，priceMin/priceMax 未设 → null） */
+function rsRowInput(row: RsItem, repeatSale: boolean): RsItemInput {
+  return {
+    province: row.province,
+    city: row.city,
+    resolution: row.resolution,
+    saleMonth: row.saleMonth,
+    price: row.price,
+    priceMin: row.priceMin ?? null,
+    priceMax: row.priceMax ?? null,
+    repeatSale,
+  }
+}
+
+/**
+ * ADR-038（RS-REPEAT-20261022）：列表「可重复售卖」由只读胶囊改为**行内开关**，切换即提交。
+ *
+ * 一致性三保障（与购物车 `qtyBusy` 同思路，BUG-25）：
+ *  1. 局部副本 `rsDraft`：开关显示值读副本（缺省回退行值），**从不直接改 `row.repeatSale`**——
+ *     行对象保持首次 GET 的快照不写回，回滚目标取「点击前的显示值」（= 上一次成功落库值）；
+ *  2. 行级互斥 `rsBusy`：请求在飞期间该行开关 disabled + loading，防连点与响应乱序
+ *     （连续切两次时第二次直接被忽略，最终状态 = 第一次请求的结果）；
+ *  3. 成功后按 `db.rsItems`（`updateRsItem` → `afterWrite()` 已刷新镜像）回写副本值，
+ *     服务端权威优先，避免本地乐观值覆盖后端实际落库值。
+ * 契约 §1：`PUT /rs-items/{id}` 为**整行覆盖**，故开关也走 `rsRowInput(row, next)` 全量提交。
+ */
+async function toggleRsRepeat(row: RsItemWithSold, val: unknown) {
+  const next = val === true
+  if (rsBusy[row.id]) return // 本行上一次请求未回：忽略（开关同时 disabled）
+  // 提交前的显示值 = 「上一次成功落库值」：在飞期间被 rsBusy 拦住、失败即回滚，
+  // 故它既是「无变化」的判据（防重复提交），也是失败时的回滚目标（不能拿 row.repeatSale 当判据，
+  // 行对象是首次 GET 的快照、永不回写，否则第二次反向切换会被误判为「无变化」）
+  const committed = rsRepeatValue(row)
+  if (next === committed) return
+  // RS-STATUS-20261022：状态的回滚目标同样取「点击前的显示值」
+  const committedStatus = rsStatusValue(row)
+  rsBusy[row.id] = true
+  rsDraft[row.id] = next // 乐观显示新状态（row 不动，可回滚）
+  try {
+    const updated = await updateRsItem(row.id, rsRowInput(row, next))
+    const mirror = db.rsItems.find((r) => r.id === row.id)
+    rsDraft[row.id] = mirror ? mirror.repeatSale : next
+    // RS-STATUS-20261022：PUT 响应已含后端重算后的最新 status（切 true → in_stock），
+    // 优先用它回写本行状态；镜像（afterWrite 刷新）与旧值依次兜底，避免多等一次分页重拉
+    rsStatusDraft[row.id] = updated.status ?? mirror?.status ?? committedStatus
+  } catch (e) {
+    rsDraft[row.id] = committed // 回滚到上一次成功落库值
+    rsStatusDraft[row.id] = committedStatus // 状态同步回滚
+    showError(e, '保存失败')
+  } finally {
+    delete rsBusy[row.id] // 只清自己的行锁（行 id 唯一）
   }
 }
 
@@ -716,11 +946,7 @@ function operatorText(f: AssetFlow): string {
           </div>
         </div>
 
-        <div v-if="isWipBoard()" class="info-bar">
-          <el-icon aria-hidden="true"><InfoFilled /></el-icon>
-          <span>算力服务板块建设中，本页仅支持查看。后续启用时将支持资源池管理、可售算力、服务期额度与交付开通记录。</span>
-        </div>
-
+        <!-- ADR-041/UI-CLEANUP-20261022：移除页面说明条（用户要求，纯展示删除） -->
         <!-- 六页签 -->
         <el-tabs v-model="activeTab" class="asset-tabs">
           <!-- 1 基本信息：左 2/3 基础资料(1列) + 右 1/3 数量与归属(含可售数量) -->
@@ -798,10 +1024,7 @@ function operatorText(f: AssetFlow): string {
                     <span class="iv">{{ asset.subject || '-' }}</span>
                   </div>
                 </div>
-                <div class="info-bar soft" style="margin-top: 12px;">
-                  <el-icon aria-hidden="true"><InfoFilled /></el-icon>
-                  <span>产品基础信息登记后生成；修改关键字段将记录操作日志。</span>
-                </div>
+                <!-- ADR-041/UI-CLEANUP-20261022：移除基础信息说明条（用户要求，纯展示删除） -->
               </div>
             </div>
           </el-tab-pane>
@@ -812,7 +1035,9 @@ function operatorText(f: AssetFlow): string {
               <div class="card-head">
                 <div>
                   <div class="card-title">可售明细</div>
-                  <div class="card-desc">按 省/精度/月份 维护可售卖明细，每份明细独立计价（整数元/份），默认可重复售卖（只计次不扣量）。</div>
+                  <!-- ADR-038（RS-REPEAT-20261022）：默认单次售卖；开启后只计次不扣量；
+                       RS-STATUS-20261022：补「可售数量」口径说明（= 状态为可售的明细条数） -->
+                  <div class="card-desc">按 省/精度/月份 维护可售卖明细，每份明细独立计价（整数元/份）；<b>默认为单次售卖</b>（售出即占用），开启「可重复售卖」后只计次不扣量；<b>可售数量 = 状态为「可售」的明细条数</b>。</div>
                 </div>
                 <el-tooltip :content="NO_PERM_TIP" :disabled="canWrite" placement="bottom">
                   <span>
@@ -823,25 +1048,46 @@ function operatorText(f: AssetFlow): string {
                 </el-tooltip>
               </div>
               <el-table v-if="rs.loading || rs.items.length" v-loading="rs.loading" :data="rs.items" border stripe>
-                <el-table-column label="省 / 市" min-width="180" align="left">
+                <!-- RS-STATUS-20261022：新增「状态」列后本表列宽重新配平（省/市 180→170、单价 150→140，
+                     合计 950px），1280 视口（侧栏 220 + 页边距 24×2 + 卡片内距 18×2）下不出横向滚动条 -->
+                <el-table-column label="省 / 市" min-width="170" align="left">
                   <template #default="{ row }">{{ row.city ? `${row.province} / ${row.city}` : row.province }}</template>
                 </el-table-column>
                 <el-table-column label="精度" width="90" align="center">
                   <template #default="{ row }">{{ row.resolution }}m</template>
                 </el-table-column>
                 <el-table-column label="月份" width="110" align="center" prop="saleMonth" />
-                <el-table-column label="单价" width="150" align="center" show-overflow-tooltip>
-                  <!-- ADR-021（RSITEM-RANGE-20261020）：有参考区间时追加「（参考区间 {min}~{max}）」，无区间维持原展示（与产品价同口径） -->
+                <el-table-column label="单价" width="140" align="center" show-overflow-tooltip>
+                  <!-- ADR-021（RSITEM-RANGE-20261020）：有参考区间时追加「（参考区间 {min}~{max}）」；无区间维持原展示（与产品价同口径） -->
                   <template #default="{ row }">
                     {{ formatMoney(row.price) }}<template v-if="priceRangeText(row)">（参考区间 {{ priceRangeText(row) }}）</template>
                   </template>
                 </el-table-column>
-                <el-table-column label="可重复售卖" width="110" align="center">
+                <!-- RS-STATUS-20261022：明细状态**只读展示**（后端按 repeatSale + 有效合同引用维护），
+                     不承载操作——切换仍是右侧「可重复售卖」开关；颜色走既有 tag 类型（success/info），不新增色值 -->
+                <el-table-column label="状态" width="90" align="center">
                   <template #default="{ row }">
-                    <!-- 胶囊标签：重复售卖 = 紫蓝、单次 = 灰（平台 token 色，参照 stock-pill） -->
-                    <span class="rs-pill" :class="row.repeatSale ? 'repeat' : 'once'">
-                      {{ row.repeatSale ? '重复售卖' : '单次' }}
-                    </span>
+                    <el-tag :type="tagInfo(RS_ITEM_STATUS, rsStatusValue(row)).tag" size="small" effect="light">
+                      {{ tagInfo(RS_ITEM_STATUS, rsStatusValue(row)).label }}
+                    </el-tag>
+                  </template>
+                </el-table-column>
+                <el-table-column label="可重复售卖" width="130" align="center">
+                  <template #default="{ row }">
+                    <!-- ADR-038（RS-REPEAT-20261022）：只读胶囊 → 行内开关，切换即 PUT 整行；
+                         请求在飞期间该行开关禁用（rsBusy，防连点/响应乱序），失败回滚 + 提示 -->
+                    <el-tooltip :content="NO_PERM_TIP" :disabled="canWrite" placement="top">
+                      <span class="rs-toggle-cell">
+                        <el-switch
+                          :model-value="rsRepeatValue(row)"
+                          size="small"
+                          :loading="!!rsBusy[row.id]"
+                          :disabled="!canWrite || !!rsBusy[row.id]"
+                          @change="toggleRsRepeat(row, $event)"
+                        />
+                        <span class="rs-toggle-text">{{ rsRepeatValue(row) ? '重复售卖' : '单次' }}</span>
+                      </span>
+                    </el-tooltip>
                   </template>
                 </el-table-column>
                 <el-table-column label="已售次数" width="100" align="center">
@@ -976,6 +1222,17 @@ function operatorText(f: AssetFlow): string {
                       </div>
                       <div class="dl-meta muted">
                         {{ DELIVERABLE_CATEGORIES[d.category].label }} · {{ d.version }} · {{ d.meta }} · 更新于 {{ d.updatedAt }}
+                      </div>
+                      <!-- ADR-044：外部链接（仅 url 非空时渲染；rel 防 window.opener 劫持；@click.stop 不触发行点击） -->
+                      <div v-if="d.url" class="dl-extlink" @click.stop>
+                        <el-icon class="dl-extlink-ic" aria-hidden="true"><TopRight /></el-icon>
+                        <a
+                          class="dl-extlink-a"
+                          :href="d.url"
+                          :title="d.url"
+                          target="_blank"
+                          rel="noopener noreferrer"
+                        >{{ d.url }}</a>
                       </div>
                     </div>
                     <div class="dl-right">
@@ -1221,6 +1478,15 @@ function operatorText(f: AssetFlow): string {
           <el-form-item label="适用说明">
             <el-input v-model="delCreate.form.note" type="textarea" :rows="2" placeholder="版本 / 格式 / 适用范围" />
           </el-form-item>
+          <!-- ADR-044：外部链接（选填，仅 http/https；与附件可并存） -->
+          <el-form-item label="外部链接">
+            <div style="width: 100%;">
+              <el-input v-model="delCreate.form.url" placeholder="https://…" clearable />
+              <div class="muted" style="font-size: 12px; line-height: 18px; margin-top: 4px;">
+                可填写交付物的外部地址（在线文档/网盘/下载页）；也可只上传附件，两者可并存。
+              </div>
+            </div>
+          </el-form-item>
         </el-form>
         <template #footer>
           <el-button @click="delCreate.visible = false">取消</el-button>
@@ -1263,28 +1529,62 @@ function operatorText(f: AssetFlow): string {
             <el-icon aria-hidden="true"><InfoFilled /></el-icon>
             <span>已被项目引用的版本不可直接覆盖，应新增新版本。</span>
           </div>
+          <!-- ADR-044：外部链接（仅 url 非空时渲染链接；canWrite 可编辑，清空后保存 = 清除） -->
+          <div class="dl-url-block">
+            <div class="dl-url-row">
+              <span class="dl-url-label muted">外部链接</span>
+              <a
+                v-if="viewing.url"
+                class="dl-extlink-a"
+                :href="viewing.url"
+                :title="viewing.url"
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                <el-icon class="dl-extlink-ic" aria-hidden="true"><TopRight /></el-icon>
+                <span class="dl-extlink-txt">{{ viewing.url }}</span>
+              </a>
+              <span v-else class="dl-url-none muted">未填写</span>
+            </div>
+            <div v-if="canWrite" class="dl-url-edit">
+              <el-input
+                v-model="delUrlDraft"
+                placeholder="https://…"
+                clearable
+                @keyup.enter="saveDelUrl"
+              />
+              <el-button type="primary" plain :loading="delUrlSaving" @click="saveDelUrl">保存</el-button>
+            </div>
+          </div>
         </template>
         <template #footer>
-          <el-tooltip :content="NO_PERM_TIP" :disabled="canWrite" placement="top">
-            <el-button
-              v-if="viewing && viewing.status !== 'ready'"
-              type="primary"
-              :disabled="!canWrite"
-              @click="setDelStatus('ready')"
-            >
-              标记就绪
+          <div class="dl-detail-footer">
+            <el-button v-if="viewing && canWrite" type="danger" plain @click="removeDeliverable">
+              删除交付物
             </el-button>
-          </el-tooltip>
-          <el-tooltip :content="NO_PERM_TIP" :disabled="canWrite" placement="top">
-            <el-button
-              v-if="viewing && viewing.status === 'ready'"
-              :disabled="!canWrite"
-              @click="setDelStatus('todo')"
-            >
-              退回待完善
-            </el-button>
-          </el-tooltip>
-          <el-button @click="viewDialog = false">关闭</el-button>
+            <div class="dl-detail-footer-right">
+              <el-tooltip :content="NO_PERM_TIP" :disabled="canWrite" placement="top">
+                <el-button
+                  v-if="viewing && viewing.status !== 'ready'"
+                  type="primary"
+                  :disabled="!canWrite"
+                  @click="setDelStatus('ready')"
+                >
+                  标记就绪
+                </el-button>
+              </el-tooltip>
+              <el-tooltip :content="NO_PERM_TIP" :disabled="canWrite" placement="top">
+                <el-button
+                  v-if="viewing && viewing.status === 'ready'"
+                  :disabled="!canWrite"
+                  @click="setDelStatus('todo')"
+                >
+                  退回待完善
+                </el-button>
+              </el-tooltip>
+              <el-button @click="viewDialog = false">关闭</el-button>
+            </div>
+          </div>
         </template>
       </el-dialog>
 
@@ -1336,7 +1636,7 @@ function operatorText(f: AssetFlow): string {
             <div class="dlg-hint">整数元/份，须大于 0</div>
           </el-form-item>
           <!-- ADR-021（RSITEM-RANGE-20261020）：参考价格区间——元/份，选填（可单边），
-               下单时行折扣单价须落在区间内，超区间后端 400；交互/样式与产品区间一致 -->
+               下单时单价须落在区间内，超区间后端 400；交互/样式与产品区间一致 -->
           <el-form-item label="参考价格区间（元）">
             <div class="price-range-row">
               <el-input-number v-model="rsForm.priceMin" :min="0" :precision="2" :controls="false" placeholder="下限（选填）" style="width: 100%;" />
@@ -1344,7 +1644,15 @@ function operatorText(f: AssetFlow): string {
               <el-input-number v-model="rsForm.priceMax" :min="0" :precision="2" :controls="false" placeholder="上限（选填）" style="width: 100%;" />
             </div>
             <div class="muted" style="font-size: 12px; margin-top: 4px;">
-              元/份，选填（可只填一边）；下单折扣区间校验用，未设置则不限制
+              元/份，选填（可只填一边）；下单时单价校验用，未设置则不限制
+            </div>
+          </el-form-item>
+          <!-- ADR-038（RS-REPEAT-20261022）：明细级「可重复售卖」，默认关闭 = 单次售卖；
+               RS-STATUS-20261022：弹窗内不手工选状态（状态由系统维护），仅补一行状态口径说明 -->
+          <el-form-item label="可重复售卖">
+            <el-switch v-model="rsForm.repeatSale" />
+            <div class="dlg-hint" style="width: 100%;">
+              开启后该明细不会被标为「已售罄」（只计次）；关闭时售出/锁定即置为「已售罄」
             </div>
           </el-form-item>
         </el-form>
@@ -1425,9 +1733,10 @@ function operatorText(f: AssetFlow): string {
   color: var(--primary-color);
   background: var(--primary-light);
 }
-:deep(.el-dropdown-menu .danger-item) {
-  color: #d9534f;
-}
+/* ADR-040（2026-10-22）：此处原有 scoped `:deep(.el-dropdown-menu .danger-item)`（编译为
+   [data-v-x] .el-dropdown-menu .danger-item）无法命中 teleport 到 body 的 dropdown popper，
+   属"看起来有样式其实没有"的死规则，已移至 styles/global.css 全局定义
+   （.el-dropdown-menu__item.danger-item），本组件模板内仍保留 item 的 class="danger-item"。 */
 
 /* 状态点胶囊 */
 .status-pill {
@@ -1452,23 +1761,19 @@ function operatorText(f: AssetFlow): string {
   background: #fdecea;
 }
 
-/* 可售明细「可重复售卖」胶囊标签：重复售卖 = 紫蓝、单次 = 灰（平台 token 色，与 stock-pill 同款） */
-.rs-pill {
+/* 可售明细「可重复售卖」行内开关（ADR-038）：开关 + 状态文字，行高与既有单元格一致（18px 行高，不加内边距） */
+.rs-toggle-cell {
   display: inline-flex;
   align-items: center;
+  gap: 6px;
+  /* 与原胶囊（18px 行高 + 2px 上下内边距 = 22px）等高，保证表格行高不变 */
+  min-height: 22px;
+}
+.rs-toggle-text {
   font-size: 12px;
   line-height: 18px;
-  padding: 2px 10px;
-  border-radius: 999px;
+  color: var(--text-secondary);
   white-space: nowrap;
-}
-.rs-pill.repeat {
-  color: #4e63a8;
-  background: #eef0ff;
-}
-.rs-pill.once {
-  color: #71829a;
-  background: #eef2f8;
 }
 
 /* ============ 页签 ============ */
@@ -1540,10 +1845,7 @@ function operatorText(f: AssetFlow): string {
     grid-column: span 1;
   }
 }
-.info-bar.soft {
-  background: #f7fafd;
-  border: 1px solid #e7edf5;
-}
+/* ADR-041/UI-CLEANUP-20261022：基础信息说明条专用浅底变体（soft）唯一使用点已删 → 死样式同步移除 */
 
 /* 序列号空态 */
 .serial-empty {
@@ -1670,6 +1972,76 @@ function operatorText(f: AssetFlow): string {
 }
 .dl-file-none {
   font-size: 12px;
+}
+
+/* ADR-044：外部链接（复用 --primary-color，无新色值/圆角；超长省略，title 显示完整 URL） */
+.dl-extlink {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 4px;
+  font-size: 12px;
+  min-width: 0;
+}
+.dl-extlink-ic {
+  color: var(--primary-color);
+  flex-shrink: 0;
+}
+.dl-extlink-a {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--primary-color);
+  font-size: 12px;
+  min-width: 0;
+  text-decoration: none;
+}
+.dl-extlink-a:hover {
+  text-decoration: underline;
+}
+.dl-extlink-txt {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 320px;
+}
+/* 详情弹窗：链接展示 + 编辑行 */
+.dl-url-block {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--divider-color);
+}
+.dl-url-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.dl-url-label {
+  font-size: 12px;
+  flex-shrink: 0;
+}
+.dl-url-none {
+  font-size: 12px;
+}
+.dl-url-edit {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+/* 弹窗底部：左侧删除、右侧既有动作 */
+.dl-detail-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.dl-detail-footer-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
 }
 
 /* 分类图标 */

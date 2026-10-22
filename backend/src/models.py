@@ -322,6 +322,9 @@ class AssetDeliverable(Base):
     meta: Mapped[str] = mapped_column(String(255), default="")
     status: Mapped[str] = mapped_column(String(16), default="ready")
     file: Mapped[str | None] = mapped_column(String(255), nullable=True)  # ADR-024：单文件附件（散列名，空/NULL=无附件）
+    # ADR-044（DELIV-20261022）：外部链接（交付物可只有链接、只有附件、或两者并存）。
+    # 仅允许 http/https（渲染为可点击外链，伪协议 = 存储型 XSS 入口）；空串 = 无链接。
+    url: Mapped[str] = mapped_column(String(512), default="")
     updatedAt: Mapped[str] = mapped_column(String(32), default="")
 
     asset: Mapped["Asset"] = relationship(back_populates="deliverables")
@@ -446,7 +449,8 @@ class RsItem(Base):
     """遥感数据可售明细（ADR-011）：父产品（assets 行，容器）下的真正售卖单位。
 
     维度 = 省（可含市）× 精度（米）× 月份（YYYY-MM），每份一个单价（整数元/份），
-    默认可重复售卖（只计次不扣量）。唯一性 (assetId, province, city, resolution, saleMonth)
+    默认**单次售卖**（ADR-038：一期通常只卖一次；需要重复售卖的可逐条打开）。
+    唯一性 (assetId, province, city, resolution, saleMonth)
     双防线：服务层判重（Python 层，含浮点容差）+ DB 唯一索引（uq_rs_items_dim，
     main._ensure_unique_indexes 为存量表幂等补建，新库由 create_all 随约束生成）。
     """
@@ -468,6 +472,17 @@ class RsItem(Base):
     # 生态下单遥感行折扣金额校验改用本明细自身区间（不再取父产品容器区间）
     priceMin: Mapped[float | None] = mapped_column(Float, nullable=True)
     priceMax: Mapped[float | None] = mapped_column(Float, nullable=True)
-    repeatSale: Mapped[bool] = mapped_column(Boolean, default=True)  # 可重复售卖（只计次不扣量）
+    # 可重复售卖（ADR-038）：默认 False = 单次售卖（售出/锁定即占用，从容器可售数扣除）。
+    # True = 只计次不扣量（售出后仍计入可售）。SQLite 无 DDL 变更（默认值只在 ORM 层，
+    # 存量数据由 backend/scripts/normalize_rs_repeat_sale.py 一次性归一）。
+    repeatSale: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 明细状态标识（RS-STATUS-20261022，ADR-038 Decision 3 修订；与 assets.status 同枚举）：
+    # - 'in_stock'（可售，默认）/ 'all_sold'（已售罄）
+    # - 容器「可售数量」= status='in_stock' 的明细条数（_rs_container_available_counts）；
+    # - **禁止各处手写赋值**：唯一维护入口 services._sync_rs_item_status 按真值重算
+    #   （repeatSale=true 或未被非 terminated 合同引用 → in_stock；否则 all_sold）；
+    # - 存量补列由 main._ensure_migration 幂等 ALTER（DEFAULT 'in_stock'），真值归一走
+    #   backend/scripts/sync_rs_item_status.py。
+    status: Mapped[str] = mapped_column(String(32), default="in_stock", index=True)
     createdAt: Mapped[str] = mapped_column(String(32), default="")
     updatedAt: Mapped[str] = mapped_column(String(32), default="")

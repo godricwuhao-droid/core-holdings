@@ -6,20 +6,19 @@
  * 入口及其非购物车分支（客户名称/预计签约/备注/合同金额输入等直接下单专用字段）已整体删除，
  * 购物车成为唯一下单链路（后端 POST /sales/order 保留并标记 deprecated，前端不再调用）。
  *
- * 表单字段：仅项目名称（默认「采购订单」可修改）；客户已在购物车行级填写（按（产品, 客户）
+ * 表单字段：仅项目名称（PROJNAME-20261022：默认留空，由下单人填写且必填）；客户已在购物车行级填写（按（产品, 客户）
  * 双键分组拆合同，ADR-016），销售金额合计只读展示（行级金额已由 PUT /cart/{id} 持久化，
  * 结算 payload 不携带金额，后端按 cart_items 落库值派生）。
  * previewGroups 传入时顶部展示「将生成 1 个项目 · N 份销售记录」分组预览（含服务期限，ADR-020）。
  * 提交后由父组件调用 checkoutCart，生成「待审核」销售项目并锁定数量（不自动交付）。
  */
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, reactive, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { InfoFilled } from '@element-plus/icons-vue'
 import {
   entityShort,
   formatMoney,
   formatYuan,
-  rsItemName,
   type Asset,
 } from '@/types'
 import { rsItemById, type OrderFields } from '@/api'
@@ -88,8 +87,9 @@ const form = reactive({
 })
 
 function reset() {
-  // 购物车模式：客户已行级填写，项目名称默认「采购订单」（可修改）
-  form.projectName = '采购订单'
+  // PROJNAME-20261022：项目名称默认留空，由下单人（生态人员）自行填写——
+  // 原先自动填「采购订单」会让用户误以为是系统既定值而直接提交，导致项目名千篇一律。
+  form.projectName = ''
   // 2026-10-19 UI 优化：rep 静默取当前登录账号（保证「自己下单」的 rep 归属口径，仅供展示与可见性兜底）
   // 2026-10-20（问题10）：rep 统一存 username（原存姓名，与建单页口径不一致导致账号/姓名混存）
   form.rep = currentUser.value?.username ?? ''
@@ -104,7 +104,7 @@ watch(
   },
 )
 
-/** 项目名称是否被用户手动改过（默认「采购订单」，可修改） */
+/** 项目名称必填校验（PROJNAME-20261022：默认留空，空值提交前拦截） */
 function validate(): boolean {
   if (!form.projectName.trim()) {
     ElMessage.warning('请填写项目名称')
@@ -189,7 +189,7 @@ function close() {
 
     <el-form label-position="top" class="sod-form">
       <el-form-item label="项目名称" required>
-        <el-input v-model="form.projectName" placeholder="默认采购订单，可修改" />
+        <el-input v-model="form.projectName" placeholder="请填写项目名称" />
       </el-form-item>
       <!-- 购物车模式：多销售记录下单，单值金额语义模糊 → 只读汇总展示（Σ各行小计），金额由后端按分组小计派生 -->
       <el-form-item label="销售金额合计（元）">

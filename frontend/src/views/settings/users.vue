@@ -8,7 +8,7 @@
  */
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { InfoFilled, Plus, Search, User, UserFilled, Document } from '@element-plus/icons-vue'
+import { Plus, Search, User, UserFilled, Document } from '@element-plus/icons-vue'
 import {
   createUser,
   deleteUser,
@@ -273,14 +273,7 @@ onMounted(() => {
       </div>
     </div>
 
-    <!-- 权限说明 -->
-    <div class="info-bar">
-      <el-icon aria-hidden="true"><InfoFilled /></el-icon>
-      <span>
-        管理员：全部权限（含账号与审计）；商务人员：业务写操作（产品 / 销售 / 交付 / 基础资料）；生态人员：仅产品浏览与购物车（加购 / 改数量 / 改客户 / 删行 / 结算 / 直接下单），产品编辑类操作禁用。
-      </span>
-    </div>
-
+    <!-- ADR-041/UI-CLEANUP-20261022：移除页面说明条（用户要求，纯展示删除） -->
     <!-- 页签卡 -->
     <el-card shadow="never">
       <el-tabs v-model="activeTab">

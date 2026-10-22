@@ -72,7 +72,8 @@
 
 ### 3. 购物车金额与区间校验（PUT /cart/{id}、POST /cart、/cart/batch、/cart/checkout）
 - unit 模式行 `amount` 放开（整数元，≥ 0 可空）；viewer 与商务同口径可输。
-- 后端校验（行更新时 + checkout 时）：`amount` 非空且产品区间已设时，`amount / qty`（保留 6 位小数）须 ∈ [priceMin, priceMax]，否则 **400「折扣单价超出该产品参考区间（{min}~{max} 元/{unit}）」**（单边区间按单边校验）。
+- 后端校验（行更新时 + checkout 时）：`amount` 非空且产品区间已设时，`amount / qty`（保留 6 位小数）须 ∈ [priceMin, priceMax]，否则 **400「单价超出该产品参考区间（{min}~{max} 元/{unit}）」**（单边区间按单边校验）。
+  - 文案沿革：本行原写「折扣**单价**超出…」，已于 `NO-DISCOUNT-20261022` 文案收口去掉「折扣」二字（折扣功能随 ADR-039 下线，见本文件末批）。**校验口径、区间数值格式、400 状态码从未变更**，仅错误字符串变化；前端若对该 `detail` 做字符串匹配需同步。
 - 不输 amount = 原价成交（unit 行 salePrice×qty；amount 行现状兜底逻辑不变）。
 
 ### 4. 下单落库（checkout / 手动建单 POST /projects）
@@ -348,3 +349,75 @@
   - 编辑：「登记时间」只读展示；参考区间不自动同步；
   - 重复售卖：移除「卫星数据自动勾选」；容器显示禁用态开关 + 说明「容器按可售明细售卖，剩余数量 = 未售明细数」；非容器开关可开可关。
 - 购物车（`cart/index.vue`）：**viewer 不渲染折扣列/输入**（editor/admin 不变）；viewer 金额超上限不再出现 400。
+
+---
+
+## UI-OPT-20261022 批次：容器可售口径 + 登记页状态块 + 站点标题
+
+### 1. `GET /bootstrap` 的 `assets[]` 新增派生字段 `availableCount`（仅容器非空）
+
+- 字段：`availableCount: int | null`（**加性字段**，非容器恒 `null`）。
+- 口径（ADR-011 容器模型）：`明细总数 − 已被"非 terminated 销售记录"占用的明细数`；占用 = `project_items.itemId` 命中且所属 `contracts.status != 'terminated'`（锁定 pending/active/delivering 与已交付 delivered 都算占用）。
+- 语义：与普通产品的 `quantity − lockedQty − shippedQty` 对齐，只是容器的"数量"是明细条数。
+- 存量示例：`assets#29 遥感数据-2026` → 97 明细、0 占用 → `availableCount = 97`。
+- **viewer 视角同样正确**（后端派生，不依赖前端可见的销售记录）——避免重演 BUG-46「前端本地汇总在 viewer 下失真」。
+
+### 2. 前端消费
+
+- `availableQty(asset)`：容器优先读 `asset.availableCount`（缺失时回退旧口径 `quantity−lockedQty−shippedQty`，兼容旧快照）；非容器逻辑不变。
+- 产品列表「可售数量」列、列表抽屉「可售 N 份」、状态派生（可售/售罄）三处统一走该函数——容器不应再显示父产品 `quantity=1`。
+- 登记/编辑页「状态与备注」卡片：**移除「产品状态」展示块**（自动派生、无输入价值），仅保留备注；卡片标题改「备注」。新建页同样处理。
+
+### 3. 站点标题
+
+- `index.html` `<title>` → **蜂云产品及服务平台**（顶栏与登录页文案已是该值，本次仅统一浏览器标签标题）。
+
+---
+
+## RS-REPEAT-20261022 批次：明细级重复售卖开关（ADR-038）
+
+### 1. 明细入参新增 `repeatSale`（默认 false）
+
+- `POST /api/assets/{id}/rs-items`、`PUT /api/rs-items/{id}` 请求体新增 **`repeatSale?: boolean`（缺省 false）**；此前该字段**不接受**（前端无法设置）。
+- 语义：`true` = 该明细可重复售卖（售出不占用可售数，只计次）；`false`（默认）= 单次售卖，售出/锁定即占用。
+- `PUT` 仍为**整行覆盖**（province/city/resolution/saleMonth/price/priceMin/priceMax/repeatSale 全量提交），本批不引入 PATCH。
+
+### 2. `bootstrap.assets[].availableCount` 口径修订（覆盖 UI-OPT-20261022 §1）
+
+- 新口径：`明细总数 − 被占用且 repeatSale = false 的明细数`。
+- 占用仍指「被非 terminated 销售记录引用」；但 `repeatSale = true` 的明细**不参与扣减**（售出后仍可售）。
+- 存量示例：`#29` 60 条全部置 `false`、当前 0 占用 → `availableCount = 60`。
+
+### 3. 前端消费
+
+- **可售明细页签**（`assets/detail.vue`）：
+  - 「可重复售卖」列由只读 pill 改为 **`el-switch`（小号）**，切换即 `PUT /rs-items/{id}` 提交整行；请求期间该行开关禁用（防连点）；失败回滚开关状态 + `showError`；成功后 `afterWrite()` 同步。
+  - 页签顶部说明文案改为「按省/精度/月份维护可售明细，每份明细独立计价（整数元/份）；**默认为单次售卖**（售出即占用），开启「可重复售卖」后只计次不扣量」。
+  - 新增/编辑弹窗增加「可重复售卖」开关（默认关，带一行说明）。
+- 明细行 `repeatSale` 仍照常返回于 `GET /assets/{id}/rs-items`（`RsItemOut` 不变）。
+
+---
+
+## NO-DISCOUNT-20261022 批次：购物车折扣功能下线（ADR-039，Deprecates ADR-023）
+
+### 1. 入参不再接收 `discountRate`
+
+| 端点 | 变化 |
+|---|---|
+| `PUT /api/cart/{id}` | `discountRate` **忽略**（传 null/数字均不校验、不落库，不再返回 400「折扣率须为 0 到 1 之间的正数」） |
+| `POST /api/cart/checkout` | 同上；新单 `discountRate` 恒为 `null` |
+| `POST /api/projects/{id}/review` | 同上（审核改价不再写折扣快照） |
+
+- 存量行的 `discountRate` **保留在库里**（历史快照可查），响应体可继续返回该字段，前端不再展示。
+
+### 2. 前端移除清单
+
+- 购物车：折扣输入、折扣摘要提示行、金额 placeholder 的折扣预览、顶部提示条折扣说明、`discountDrafts` 及 `onDiscountInput/onDiscountChange/discountDraft/discountInvalid/discountSummary/discountPreviewRate` 等全部删除。
+- 审核页：删除「折扣」只读列 + `discountRateText`（列宽重排，其余列不压缩）。
+- 金额 placeholder 统一「必填，整数元」；金额仍是唯一权威（ADR-022 不变）。
+
+### 3. 文案/提示
+
+- 顶部提示条去掉折扣相关句子，保留「销售金额必填、整数元、参考区间」提示。
+- 不新增任何页面、区块或字段。
+- **区间校验 400 文案收口**（本批附带，纯字符串）：`折扣单价超出该产品参考区间（{min}~{max} 元/{unit}）` → `单价超出该产品参考区间（{min}~{max} 元/{unit}）`。同批前端产品登记页/详情页「参考区间」说明小字由「下单折扣区间校验用」改为「下单时单价校验用」。**逻辑、区间算法、错误码、响应结构零改动**；前端不得依赖该 `detail` 的文案做分支判断（历史上也未依赖）。

@@ -12,7 +12,7 @@
  */
 import { reactive } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { InfoFilled, Plus } from '@element-plus/icons-vue'
+import { Plus } from '@element-plus/icons-vue'
 import { createEntity, db, deleteEntity, showError, updateEntity } from '@/api'
 import { formatDate, type Entity } from '@/types'
 
@@ -126,14 +126,7 @@ async function handleDelete(row: Entity) {
       </div>
     </div>
 
-    <!-- 权限/行为说明 -->
-    <div class="info-bar">
-      <el-icon aria-hidden="true"><InfoFilled /></el-icon>
-      <span>
-        修改主体全称不会回写存量产品（产品仍挂旧名称，需到产品页逐个改选）；被产品引用的主体不可删除。
-      </span>
-    </div>
-
+    <!-- ADR-041/UI-CLEANUP-20261022：移除页面说明条（用户要求，纯展示删除） -->
     <!-- 主体列表 -->
     <el-card shadow="never">
       <div class="table-head">

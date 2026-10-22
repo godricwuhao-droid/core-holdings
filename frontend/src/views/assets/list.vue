@@ -7,7 +7,7 @@
  */
 import { computed, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Box, Close, Document, InfoFilled, Plus, Search, ShoppingCart } from '@element-plus/icons-vue'
+import { Box, Close, Document, Plus, Search, ShoppingCart, TopRight } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import {
   ASSET_STOCK_STATE,
@@ -38,7 +38,6 @@ import {
   fileUrl,
   getAssetDeliverables,
   listAssetRsItems,
-  refresh,
   showError,
 } from '@/api'
 import FilePreview from '@/components/FilePreview.vue'
@@ -341,31 +340,27 @@ const dProgress = computed(() => {
   }
 })
 
-/** 各板块的说明文案与业务规则提示 */
+/** 各板块的说明文案 */
 const boardMeta = computed(() => {
   switch (board.value) {
     case 'embodied':
       return {
         desc: '机器人、数采设备与平台软件产品的登记、数量与销售追踪统一台账。',
-        rule: '机器人产品默认整机交付，可选序列号交付管理；数采设备按套登记与销售。',
       }
     case 'satellite':
       return {
         desc: '卫星 Token、卫星数据与遥感数据产品的销售台账，按额度、批次与区域精度追踪销售进度。',
-        rule: '卫星数据默认支持重复售卖，不随销售交付扣减原始数据量；卫星 Token 按包量售卖（销售金额整数元为准）；遥感数据为容器产品，按 省/精度/月份 维护可售明细售卖（可重复售卖，只计次不扣量）。',
       }
     case 'software':
       return {
         desc: '软件产品台账，支持永久、年限或账号等许可方式追踪。',
-        rule: '软件按套销售，许可方式可选永久、年限或账号；可重复售卖类产品支持多次出售。',
       }
     case 'hardware':
       return {
         desc: '硬件集群产品台账，核入后登记，支持整机柜或单台交付。',
-        rule: '硬件集群支持整机柜或单台交付，整机序列号交付管理。',
       }
     default:
-      return { desc: '', rule: '' }
+      return { desc: '' }
   }
 })
 
@@ -391,12 +386,7 @@ const boardMeta = computed(() => {
       </div>
     </div>
 
-    <!-- 业务规则提示条 -->
-    <div class="info-bar">
-      <el-icon aria-hidden="true"><InfoFilled /></el-icon>
-      <span>{{ boardMeta.rule }}</span>
-    </div>
-
+    <!-- ADR-041/UI-CLEANUP-20261022：移除页面说明条（用户要求，纯展示删除） -->
     <!-- 表格卡 -->
     <el-card shadow="never">
       <div class="table-head">
@@ -493,6 +483,8 @@ const boardMeta = computed(() => {
         <el-table-column label="销售单价" width="120" align="center" show-overflow-tooltip>
           <template #default="{ row }">{{ salePriceText(row) }}</template>
         </el-table-column>
+        <!-- 可用数量（UI-OPT-20261022）：一律走 availableQty——容器读后端派生 availableCount（明细条数），
+             非容器 quantity−lockedQty−shippedQty；禁止在此另算，避免容器又显示父产品 quantity=1 -->
         <el-table-column label="可用数量" width="100" align="center">
           <template #default="{ row }">
             <el-tag v-if="row.repeatSale" size="small" type="success" effect="plain">重复售卖</el-tag>
@@ -506,7 +498,10 @@ const boardMeta = computed(() => {
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="160" fixed="right" align="center">
+        <!-- ADR-040（2026-10-22）：移除操作列「编辑」按钮——编辑入口列表/快览抽屉底部/详情页共 3 个，
+             删后仍剩 2 个（goEdit 保留，抽屉「去上传」与底部「编辑」仍在调用），能力零损失；
+             操作列 160px → 110px，viewer 视角只剩「加入购物车」 -->
+        <el-table-column label="操作" width="110" fixed="right" align="center">
           <template #default="{ row }">
             <!-- 单行加购对三角色均可用（含生态人员） -->
             <span class="op-tip" @click.stop>
@@ -514,13 +509,6 @@ const boardMeta = computed(() => {
                 加入购物车
               </el-button>
             </span>
-            <el-tooltip :content="NO_PERM_TIP" :disabled="canWrite" placement="top">
-              <span class="op-tip" @click.stop>
-                <el-button link type="primary" size="small" :disabled="!canWrite" @click.stop="goEdit(row)">
-                  编辑
-                </el-button>
-              </span>
-            </el-tooltip>
           </template>
         </el-table-column>
         <template #empty>
@@ -565,15 +553,10 @@ const boardMeta = computed(() => {
           <div class="dr-bar-legend muted">
             <span><i class="dot dot-shipped" />已交付 {{ drawerAsset.shippedQty }}</span>
             <span><i class="dot dot-locked" />锁定 {{ drawerAsset.lockedQty }}</span>
+            <!-- 可售：同走 availableQty（容器 = 可售明细数，UI-OPT-20261022）；底行「总数量」保持父产品 quantity 口径 -->
             <span><i class="dot dot-avail" />可售 {{ formatAssetQty(drawerAsset, availableQty(drawerAsset)) }}</span>
             <span class="bar-total">总数量 {{ formatAssetQty(drawerAsset, drawerAsset.quantity) }} {{ drawerAsset.unit }}</span>
           </div>
-        </div>
-
-        <!-- 可重复售卖说明（仅可重复产品；ADR-011：容器产品不展示） -->
-        <div v-if="drawerAsset.repeatSale && !isRemote" class="dr-notice">
-          <el-icon><InfoFilled /></el-icon>
-          <span>可重复售卖：重复售卖不扣减原始数据量，按售卖次数与金额累计。</span>
         </div>
 
         <!-- 产品清单（全类型统一 15px 标题 + 弱说明） -->
@@ -661,10 +644,6 @@ const boardMeta = computed(() => {
               </div>
             </template>
           </div>
-          <div v-if="boardMeta.rule" class="dr-rule muted">
-            <el-icon><InfoFilled /></el-icon>
-            <span>{{ boardMeta.rule }}</span>
-          </div>
         </div>
 
         <!-- ADR-011：容器产品五段式第 3 段——可售明细 -->
@@ -723,6 +702,11 @@ const boardMeta = computed(() => {
               <div v-if="d.file" class="del-file">
                 <el-icon class="del-file-ic"><Document /></el-icon>
                 <a class="del-file-name" @click="openDelPreview(d.file as string)">{{ fileDisplayName(d.file) }}</a>
+              </div>
+              <!-- ADR-044：外部链接（只读展示，抽屉不提供编辑/删除；url 缺失 → 整条不渲染） -->
+              <div v-if="d.url" class="del-link">
+                <el-icon class="del-link-ic"><TopRight /></el-icon>
+                <a :href="d.url" :title="d.url" target="_blank" rel="noopener noreferrer">{{ d.url }}</a>
               </div>
             </div>
             <el-empty v-if="!dDeliverables.length" description="暂无交付物，请在产品详情维护" :image-size="56" />
@@ -951,24 +935,6 @@ const boardMeta = computed(() => {
   margin-left: auto;
 }
 
-/* 可重复售卖说明条 */
-.asset-drawer .dr-notice {
-  display: flex;
-  align-items: flex-start;
-  gap: 6px;
-  background: #eef4ff;
-  border: 1px solid rgba(23, 105, 212, 0.15);
-  border-radius: 8px;
-  padding: 10px 12px;
-  font-size: 12px;
-  color: var(--text-secondary);
-  margin-bottom: 18px;
-}
-.asset-drawer .dr-notice .el-icon {
-  color: var(--primary-color);
-  margin-top: 1px;
-  flex-shrink: 0;
-}
 /* 产品清单 */
 .asset-drawer .contract-row {
   display: flex;
@@ -1019,23 +985,6 @@ const boardMeta = computed(() => {
   align-items: center;
   gap: 8px;
 }
-/* 该类产品业务规则提示 */
-.asset-drawer .dr-rule {
-  display: flex;
-  align-items: flex-start;
-  gap: 6px;
-  margin-top: 10px;
-  padding: 8px 12px;
-  font-size: 12px;
-  line-height: 1.6;
-  border-top: 1px dashed var(--divider-color);
-}
-.asset-drawer .dr-rule .el-icon {
-  color: var(--primary-color);
-  margin-top: 1px;
-  flex-shrink: 0;
-}
-
 /* 交付物列表 */
 .asset-drawer .dr-dels {
   max-height: 220px;
@@ -1116,6 +1065,31 @@ const boardMeta = computed(() => {
   white-space: nowrap;
 }
 .asset-drawer .del-file-name:hover {
+  text-decoration: underline;
+}
+
+/* ADR-044：交付物外部链接行（只读；复用 --primary-color，无新色值） */
+.asset-drawer .del-link {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 4px;
+  font-size: 12px;
+  min-width: 0;
+}
+.asset-drawer .del-link-ic {
+  color: var(--primary-color);
+  flex-shrink: 0;
+}
+.asset-drawer .del-link a {
+  color: var(--primary-color);
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-decoration: none;
+}
+.asset-drawer .del-link a:hover {
   text-decoration: underline;
 }
 </style>

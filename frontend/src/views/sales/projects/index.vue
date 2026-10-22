@@ -12,20 +12,26 @@
 import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Close, InfoFilled, Search, Tickets } from '@element-plus/icons-vue'
+// ADR-040（2026-10-22）：补 ArrowDown（「更多▾」）/ Delete（菜单项图标），均为既有依赖内图标
+import { ArrowDown, Close, Delete, Search, Tickets } from '@element-plus/icons-vue'
 import {
   PROJECT_STATUS,
   entityShort,
   formatDate,
   formatMoney,
+  outcomeReason,
+  projectOutcome,
   tagInfo,
   type Contract,
   type ContractItem,
+  type OpLog,
   type Project,
   type ProjectStatus,
 } from '@/types'
-import { allUserOptions, changeProjectStatus, claimProject, db, deleteProject, getAsset, refillProjectCart, refresh, showError, userOptions, type UserOption } from '@/api'
+import { allUserOptions, changeProjectStatus, claimProject, db, deleteProject, getAsset, refresh, showError, userOptions, type UserOption } from '@/api'
 import { canWrite, currentUser, isViewer, isAdmin, NO_PERM_TIP } from '@/auth'
+// ADR-042 / REFILL-20261022：「重新提交」动线收敛到 composable（与详情页共用同一套弹窗/失败/归属逻辑）
+import { useResubmitProject } from '@/composables/useResubmitProject'
 import TransferDialog from '@/components/TransferDialog.vue'
 import WithdrawProjectDialog from '@/components/WithdrawProjectDialog.vue'
 
@@ -127,22 +133,23 @@ async function onWithdrawn() {
 }
 
 /**
- * 重新提交（ADR-027 / TASK-FE-031）：不再进 create 页 copy 模式——
- * 调 POST /projects/{id}/refill-cart 确保明细在下单人购物车（幂等）→ `refresh()` → 跳 /cart 改单重提。
- * 行级 loading（refillId = 正在回填的项目 id）；失败 showError 并停留原页，不跳转。
+ * 重新提交（ADR-027 / TASK-FE-031；ADR-042 / REFILL-20261022 改造）：
+ * 不再进 create 页 copy 模式，也不再内联维护「提示文案 + 跳转」——
+ * 统一走 `useResubmitProject()`（购物车非空三选弹窗 / 全部失败不跳空车 / 部分失败带警告条 / 归属提示）。
+ * 本处只保留**行级 loading**（refillId = 正在回填的项目 id）与入口判断；
+ * 失败提示（showError）与停留原页同样由 composable 统一处理。
  */
+const { resubmit: resubmitProject } = useResubmitProject()
 const refillId = ref(0)
 async function handleResubmit(row: Project) {
   if (refillId.value) return
   refillId.value = row.id
   try {
-    const res = await refillProjectCart(row.id)
-    await refresh()
-    const base = res.alreadyRefilled ? '明细已在购物车，可直接修改后提交' : '明细已回填购物车，可修改后提交'
-    ElMessage.success(res.skipped > 0 ? `${base}（${res.skipped} 行未能回填，请核对明细）` : base)
-    router.push('/cart')
-  } catch (e) {
-    showError(e, '重新提交失败')
+    // creator/rep 仅供 composable 做「弹窗前归属预判」（避免给别人的购物车弹三选框，ADR-042 §5）
+    await resubmitProject(
+      { id: row.id, code: row.code, name: row.name, creator: row.creator, rep: row.rep },
+      { cartCount: db.cart.length },
+    )
   } finally {
     refillId.value = 0
   }
@@ -251,6 +258,52 @@ const legacyItemSummary = computed(() => {
     .join(' · ')
 })
 
+// ==================== ADR-041 / FLOW-20261022：抽屉「流转过程」 ====================
+/** FLOW-20261022-F2（ADR-041 补遗3）：ADR-030 之前的历史日志 projectId 为 NULL，
+ *  按项目编号（SP- 全局唯一）兜底匹配；**不按 targetName 匹配**（重名/改名会串台）。 */
+function legacyMatch(l: OpLog, p: { id: number; code: string }): boolean {
+  if (l.projectId != null) return false // 已有外键 → 只认外键，不做文本兜底
+  if (!p.code) return false // code 为空/异常：`''.includes('')` 恒真，必须先挡住
+  return (l.detail || '').includes(p.code)
+}
+
+/**
+ * 抽屉流转日志：只取 `target='project'`（FLOW-20261022-F2 / ADR-041 补遗2——交付单 outbound 日志
+ * 也写 projectId，并入会与「销售记录状态变更」重复），按 `projectId` 精确过滤（对齐 assetId 做法，
+ * 避免同名/改名串台；无外键的存量日志按项目 code 兜底），窗口起于本项目「新增项目」日志，时间升序。
+ * 降级：`l.projectId` 全为 undefined（后端未输出该字段）时走 code 兜底；都匹配不到 →
+ * 抽屉展示「暂无流转记录」空态，不报错、不白屏；终止成因仍由 projectOutcome 的 remark 兜底区分。
+ */
+const dLogs = computed<OpLog[]>(() => {
+  const p = drawerProject.value
+  if (!p) return []
+  const mine = db.logs.filter((l) => l.target === 'project'
+    && (l.projectId === p.id || legacyMatch(l, p)))
+  // FLOW-20261022-F2（ADR-041 补遗1）：SQLite 无 AUTOINCREMENT，删除项目后 id 会复用，
+  // 旧项目日志会挂到新项目时间线（实测混入「删除项目 SP-xxx」）。以本项目自身「新增项目」
+  // 日志时刻为起点，丢弃更早的日志；存量单无该日志则不设起点。
+  const t0 = mine.find((l) => l.action === '新增项目')?.time
+  const scoped = t0 ? mine.filter((l) => l.time >= t0) : mine
+  return scoped.slice().sort((a, b) => a.time.localeCompare(b.time) || a.id - b.id)
+})
+
+/**
+ * 时间线色点：复用 el-timeline-item 的 type 属性（不自定义色值）；'' = 默认灰。
+ * 「重新提交」用前缀匹配：ADR-027 回填链路写的 action 是「重新提交（回填购物车）」（services.py:1497），
+ * 精确等值会漏色点。
+ */
+function flowDotType(l: OpLog): 'success' | 'primary' | 'danger' | '' {
+  if (l.action === '撤销订单' || l.action === '驳回订单') return 'danger'
+  if (l.action === '确认下单') return 'success'
+  if (l.action === '新增项目' || l.action.startsWith('重新提交')) return 'primary'
+  return ''
+}
+
+/** 是否终止成因事件（撤销/驳回）——此类事件下方单独补一行「原因：…」 */
+function isOutcomeEvent(l: OpLog): boolean {
+  return l.action === '撤销订单' || l.action === '驳回订单'
+}
+
 // 项目状态由合同状态自动派生（ADR-007）：列表页不再提供手动状态变更入口，
 // 交付 / 终止操作在「项目详情 → 合同清单」的合同卡片上进行。
 
@@ -348,12 +401,7 @@ async function handleDelete(p: Project) {
            手动建单页保留路由（直连 URL 可进，供代录/数据修复等特殊场景，API 保留） -->
     </div>
 
-    <!-- 业务规则提示条 -->
-    <div class="info-bar">
-      <el-icon aria-hidden="true"><InfoFilled /></el-icon>
-      <span>下单（购物车，下单入口已统一收口）统一进入「待审核」（数量已锁定），由商务人员接手后确认下单（可修改单价/销售金额/服务期限）或驳回。项目状态由销售记录状态自动派生：「进行中」项目已锁定数量，商务录入签订时间后销售记录转「交付中」，在项目详情页对销售记录执行「交付」即扣减数量并生成交付记录；执行「终止」释放锁定（已交付终止将撤销交付并回退「交付中」）。产品明细支持「重复售卖」类型不扣减额度。</span>
-    </div>
-
+    <!-- ADR-041/UI-CLEANUP-20261022：移除页面说明条（用户要求，纯展示删除） -->
     <!-- 表格卡 -->
     <el-card shadow="never">
       <div class="table-head">
@@ -421,8 +469,10 @@ async function handleDelete(p: Project) {
         </el-table-column>
         <el-table-column label="项目状态" width="110" align="center">
           <template #default="{ row }">
-            <el-tag :type="tagInfo(PROJECT_STATUS, row.status).tag" size="small" effect="light">
-              {{ tagInfo(PROJECT_STATUS, row.status).label }}
+            <!-- ADR-041 / FLOW-20261022：终止态细分展示（已撤销 / 已驳回 / 已终止）——纯展示，
+                 筛选下拉与按钮可用性仍按真实 status（后端只有 terminated） -->
+            <el-tag :type="projectOutcome(row, db.logs, db.contracts).tag" size="small" effect="light">
+              {{ projectOutcome(row, db.logs, db.contracts).label }}
             </el-tag>
           </template>
         </el-table-column>
@@ -441,9 +491,10 @@ async function handleDelete(p: Project) {
         <el-table-column prop="lastFollowDate" label="最近跟进" width="110" align="left">
           <template #default="{ row }">{{ row.lastFollowDate || '-' }}</template>
         </el-table-column>
-        <!-- 操作列：详情入口收敛到快览抽屉底部「查看详情」（点击行即开抽屉），此处保留编辑 / 删除
-             ADR-026：新增「撤销」（仅 pending 本人/admin）→ 列宽 190 → 220，避免四按钮挤压换行 -->
-        <el-table-column label="操作" width="220" fixed="right" align="center">
+        <!-- 操作列：详情入口收敛到快览抽屉底部「查看详情」（点击行即开抽屉），此处保留编辑 / 撤销 / 重新提交
+             ADR-026：新增「撤销」（仅 pending 本人/admin）→ 列宽 190 → 220，避免四按钮挤压换行
+             ADR-040（2026-10-22）：删除收进行尾「更多▾」且仅 admin → 列宽 220 → 190（省 30px） -->
+        <el-table-column label="操作" width="190" fixed="right" align="center">
           <template #default="{ row }">
             <div class="op-actions">
               <!-- ADR-012 §5.1：接手（pending 未指派）/ 转交（他人已负责，pending 或 active 均可）；
@@ -500,10 +551,13 @@ async function handleDelete(p: Project) {
                   </el-button>
                 </span>
               </el-tooltip>
-              <!-- ADR-027（2026-10-21）：重新提交——已终止（驳回/终止）项目由下单账号（或商务/管理员）
-                   回填购物车（幂等）后跳 /cart 改单重提，旧项目保留终止历史 -->
+              <!-- ADR-027（2026-10-21）：重新提交——已终止（驳回/终止）项目由下单账号（或管理员）
+                   回填购物车（幂等）后跳 /cart 改单重提，旧项目保留终止历史。
+                   ADR-043（2026-10-22）：权限收紧为「下单人本人（viewer）+ 管理员」——商务（editor）
+                   回填目标恒为下单人（明细进别人的车、自己购物车毫无变化），故**整块不渲染**
+                   （含禁用态）；后端已对该角色 403。列表页仅此一处入口（抽屉底部无该按钮）。 -->
               <el-button
-                v-if="row.status === 'terminated' && (canWrite || isViewer)"
+                v-if="row.status === 'terminated' && (isAdmin || isViewer)"
                 link
                 type="warning"
                 size="small"
@@ -523,25 +577,29 @@ async function handleDelete(p: Project) {
               >
                 撤销
               </el-button>
-              <!-- FIX-20261022 / BUG-38（ADR-028）：撤销单（terminated && cartRefilled）保留历史不可删除，
-                   入口直接禁用 + tooltip 说明（原实现点了才 403） -->
-              <el-tooltip
-                :content="isUndeletable(row) ? '撤销单保留历史，不可删除' : NO_PERM_TIP"
-                :disabled="canWrite && !isUndeletable(row)"
-                placement="top"
-              >
-                <span class="op-tip" @click.stop>
-                  <el-button
-                    link
-                    type="danger"
-                    size="small"
-                    :disabled="!canWrite || isUndeletable(row)"
-                    @click.stop="handleDelete(row)"
-                  >
-                    删除
-                  </el-button>
+              <!-- ADR-040（2026-10-22）：删除从常驻按钮收进行尾「更多▾」，仅 admin 渲染（editor / viewer 完全
+                   看不到入口，无任何删除入口）；视觉照抄 assets/detail.vue 的「更多▾」（.more-btn + danger-item）。
+                   护栏沿用原 FIX-20261022 / BUG-38（ADR-028）：撤销单（terminated && cartRefilled）菜单项禁用，
+                   文案承载原因（el-dropdown-item 不支持内部 tooltip）；@click.stop 阻断整行点击（行点击=开快览抽屉），
+                   handleDelete / isUndeletable 逻辑原样复用，逐字未改 -->
+              <el-dropdown v-if="isAdmin" trigger="click">
+                <span class="more-btn" @click.stop>
+                  更多
+                  <el-icon><ArrowDown /></el-icon>
                 </span>
-              </el-tooltip>
+                <template #dropdown>
+                  <el-dropdown-menu>
+                    <el-dropdown-item
+                      :disabled="isUndeletable(row)"
+                      class="danger-item"
+                      @click.stop="handleDelete(row)"
+                    >
+                      <el-icon><Delete /></el-icon>
+                      {{ isUndeletable(row) ? '删除项目（撤销单不可删）' : '删除项目' }}
+                    </el-dropdown-item>
+                  </el-dropdown-menu>
+                </template>
+              </el-dropdown>
             </div>
           </template>
         </el-table-column>
@@ -560,8 +618,9 @@ async function handleDelete(p: Project) {
           <div class="dr-head-main">
             <div class="dr-title">
               <span class="dr-name">{{ drawerProject.name }}</span>
-              <el-tag :type="tagInfo(PROJECT_STATUS, drawerProject.status).tag" size="small" effect="light">
-                {{ tagInfo(PROJECT_STATUS, drawerProject.status).label }}
+              <!-- ADR-041 / FLOW-20261022：抽屉头部同样细分终止成因（已撤销 / 已驳回 / 已终止） -->
+              <el-tag :type="projectOutcome(drawerProject, db.logs, db.contracts).tag" size="small" effect="light">
+                {{ projectOutcome(drawerProject, db.logs, db.contracts).label }}
               </el-tag>
             </div>
             <div class="dr-sub muted">
@@ -632,6 +691,30 @@ async function handleDelete(p: Project) {
             该项目暂无销售记录（存量数据），明细摘要：{{ legacyItemSummary }}
           </div>
           <el-empty v-else description="该项目暂无销售记录（存量数据）" :image-size="56" />
+        </div>
+
+        <!-- ADR-041 / FLOW-20261022：「流转过程」（抽屉最后一块）——数据源 db.logs，只取 target='project'、
+             按 projectId 精确过滤（存量无外键的按 code 兜底）+ t0 守卫（丢弃 id 复用的旧日志）、
+             时间升序；撤销/驳回事件下方单独高亮原因（日志 detail 提取，提不到回退合同 remark，再空则「（未填写）」）。
+             容器不加 max-height（抽屉自身可滚，避免双层滚动）。 -->
+        <div class="dr-section">
+          <div class="sec-title">流转过程</div>
+          <el-timeline v-if="dLogs.length" class="dr-timeline">
+            <el-timeline-item
+              v-for="l in dLogs"
+              :key="l.id"
+              :timestamp="`${l.time}${l.operator ? ' · ' + ownerLabel(l.operator) : ''}`"
+              placement="top"
+              :type="flowDotType(l)"
+            >
+              <div class="tl-action">{{ l.action }}</div>
+              <div class="tl-detail muted">{{ l.detail }}</div>
+              <div v-if="isOutcomeEvent(l)" class="tl-reason">
+                原因：{{ outcomeReason(drawerProject, db.logs, db.contracts) || '（未填写）' }}
+              </div>
+            </el-timeline-item>
+          </el-timeline>
+          <el-empty v-else description="暂无流转记录（存量项目无日志）" :image-size="56" />
         </div>
       </template>
 
@@ -706,6 +789,28 @@ async function handleDelete(p: Project) {
 .op-tip {
   display: inline-flex;
 }
+/* ADR-040（2026-10-22）：「更多▾」文字按钮——与 assets/detail.vue 同款定义（.more-btn），不新增色值 or token。
+   危险菜单项（.danger-item）的红色改由 styles/global.css 全局接管（popper teleport 到 body，scoped :deep 命中不到）。 */
+.more-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 32px;
+  padding: 0 6px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  user-select: none;
+  border-radius: 6px;
+}
+.more-btn:hover {
+  color: var(--primary-color);
+  background: var(--primary-light);
+}
+/* ADR-040（2026-10-22 / FT-20261022-B）：删除原 scoped `:deep(.el-dropdown-menu .danger-item)`——popper
+   teleport 到 body，祖先链上无本组件 data-v 属性，规则不生效；红色改由 styles/global.css 全局接管，
+   模板中 item 的 class="danger-item" 保留（全局选择器依赖它）。
+   注：.more-btn 及其 :hover 保留在本组件（它在模板内，scoped 正常生效）。 */
 /* 关联合同列：合同数（hover tooltip 列出客户） */
 .ct-count {
   font-weight: 600;
@@ -908,5 +1013,33 @@ async function handleDelete(p: Project) {
   display: flex;
   justify-content: flex-end;
   gap: 10px;
+}
+
+/* ADR-041 / FLOW-20261022：抽屉「流转过程」时间线（不加 max-height，抽屉自身可滚，避免双层滚动） */
+.project-drawer .dr-timeline {
+  padding-left: 2px;
+}
+.project-drawer .dr-timeline .tl-action {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.project-drawer .dr-timeline .tl-detail {
+  margin-top: 2px;
+  font-size: 12px;
+  line-height: 1.6;
+}
+/* 撤销/驳回原因：浅红底提示（复用既有 --el-color-danger-light-9 / --danger-color，不新增 token） */
+.project-drawer .dr-timeline .tl-reason {
+  display: inline-block;
+  margin-top: 6px;
+  padding: 3px 8px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--danger-color);
+  background: var(--el-color-danger-light-9);
+  border-radius: 4px;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 </style>

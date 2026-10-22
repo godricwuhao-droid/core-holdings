@@ -6,11 +6,12 @@
 - 交付撤销→反向流水；历史补录不扣数量
 """
 import uuid
+from collections.abc import Iterable
 from datetime import date, datetime
 from decimal import Decimal
 
 from fastapi import HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from . import models, schemas
@@ -371,14 +372,19 @@ def _check_discount_range(asset: models.Asset | None, qty: int, amount,
                           unit: str = "",
                           rs: models.RsItem | None = None,
                           enforce_max: bool = True) -> Decimal | None:
-    """ADR-018 §1/§3（PRICING-20261020）：折扣金额校验 + 参考区间校验。
+    """ADR-018 §1/§3（PRICING-20261020）：金额（销售金额）参考区间校验。
     购物车行更新 / 加购 / checkout / 直接下单（sales/order）各入口共用，不信任前端。
+
+    函数名中的 "discount" 为历史命名（ADR-018 当年叫「折扣金额」）——NO-DISCOUNT-20261022
+    / ADR-039 后**折扣率已下线**：本函数只校验 `unit_price = amount ÷ qty` 的金额区间，
+    内部**没有任何「用折扣率推算金额」的路径**（入参里也没有 rate）；ADR-018/021/037 口径不变。
 
     - amount 为 None → 原价成交，返回 None（unit 行 salePrice×qty / 遥感行明细 price）；
     - amount 须为非负整数元，否则 400；
     - 折扣单价 = amount ÷ qty（Decimal 保留 6 位）须落在参考区间 [priceMin, priceMax] 内：
       未设置区间 = 不限制；单边区间按单边校验；超限 400
-      「折扣单价超出该产品参考区间（{min}~{max} 元/{unit}）」（契约 §3 文案）。
+      「单价超出该产品参考区间（{min}~{max} 元/{unit}）」（契约 §3 文案；NO-DISCOUNT-20261022
+      文案收口：去「折扣」字样，与 ADR-039 折扣下线一致）。
     - ADR-021（RSITEM-RANGE-20261020）：遥感明细行（rs 非空）区间取该 rs_item 自身的
       priceMin/priceMax（不再取父产品容器 assets 的区间）；普通产品行行为不变。
     - ADR-037 §3（FORMS-20261022）：区间校验分角色——`enforce_max=False`（viewer/生态人员）
@@ -406,7 +412,7 @@ def _check_discount_range(asset: models.Asset | None, qty: int, amount,
     u = unit or (asset.unit if asset else "")
     # ADR-037 §3：enforce_max=False（viewer）只校验下限，上限放开
     if (lo is not None and unit_price < _dec(lo)) or (enforce_max and hi is not None and unit_price > _dec(hi)):
-        raise HTTPException(400, f"折扣单价超出该产品参考区间（{_range_label(lo, hi, u)}）")
+        raise HTTPException(400, f"单价超出该产品参考区间（{_range_label(lo, hi, u)}）")
     return amt
 
 
@@ -478,15 +484,9 @@ def _validate_service_period(start: str | None, end: str | None) -> tuple[str | 
     return s, e
 
 
-def _validate_discount_rate(rate: float | None) -> float | None:
-    """折扣率校验（DISCOUNT-20261021/ADR-023）：0 < rate ≤ 1（0.9=九折），
-    违反 400「折扣率须为 0 到 1 之间的正数」；None 允许（=清空/无折扣）。
-    后端只存不算——不做金额回填计算（金额权威原则，区间校验仍对 amount 生效）。"""
-    if rate is None:
-        return None
-    if not (0 < rate <= 1):
-        raise HTTPException(400, "折扣率须为 0 到 1 之间的正数")
-    return float(rate)
+# 注（NO-DISCOUNT-20261022 / ADR-039）：折扣率功能已下线，`_validate_discount_rate`
+# 随全部调用点移除而删除（原 DISCOUNT-20261021 / ADR-023：0 < rate ≤ 1 否则 400）。
+# 入参中的 `discountRate` 由 Pydantic 保留定义以兼容旧客户端（不 422），后端**不读不校验不写**。
 
 
 def _item_pricing(a: models.Asset | None, it: schemas.ProjectItemInput,
@@ -723,6 +723,16 @@ def update_asset(db: Session, asset_id: int, patch: dict, operator: str = "admin
     # 按「存量值 + 本次 patch」的最终落库值校验（覆盖 type 改为遥感数据 / repeatSale 改为 true 两种路径）
     if patch.get("type", a.type) == RS_DATA_TYPE and patch.get("repeatSale", a.repeatSale):
         raise HTTPException(400, "遥感数据容器按明细售卖，不支持重复售卖")
+    # REVERT-FIX-20261022（DEFECT-2 方案 A）：遥感数据容器的 quantity 是**派生量**
+    # （= 可售明细条数，见 `_sync_container_quantity`），不接受手改——
+    # 手改小会让 apply_item_lock 的条件更新 `quantity-lockedQty-shippedQty>=q` 提前失败，
+    # 明细明明还在却「可用数量不足」，售卖被卡住。
+    # 处理：容器场景**忽略入参 quantity**（保留当前值，随后由 `_sync_container_quantity`
+    # 规则决定），且不进入字段级 diff 日志；接口**不报错**——前端编辑表单可能回传表单里的
+    # 旧 quantity，报错会打断整个编辑（保持幂等/兼容）。非容器产品行为完全不变。
+    eff_type = patch.get("type") or a.type  # 与 repeatSale 校验同口径：按「存量值 + 本次 patch」
+    if eff_type == RS_DATA_TYPE and "quantity" in patch:
+        patch.pop("quantity")
     # ADR-011：ADR-010 的 4 个废弃列（province/city/resolution/imageDate）不再接受修改
     old_repeat = a.repeatSale
     old_type = a.type
@@ -776,6 +786,11 @@ def update_asset(db: Session, asset_id: int, patch: dict, operator: str = "admin
             f"产品总数不能低于已锁定 {a.lockedQty}{a.unit} + 已交付 {a.shippedQty}{a.unit}"
             f"（合计 {a.lockedQty + a.shippedQty}{a.unit}），请先处理相关销售项目/交付记录",
         )
+    # REVERT-FIX-20261022（DEFECT-2）：容器 quantity 忽略入参后，按派生规则复核一次——
+    # 无锁定/无交付时自愈为明细条数（顺手修掉历史被手改小的漂移值）；在售中不改数量，
+    # 仅校验 quantity >= lockedQty + shippedQty（不满足 → 不变量告警，与明细维护路径同口径）。
+    if a.type == RS_DATA_TYPE:
+        _sync_container_quantity(db, a.id, operator=operator)
     refresh_status(a)
     # 仅当有实际变更时打编辑日志（无变更不打日志）
     if changes:
@@ -864,6 +879,11 @@ def _rs_item_desc(it: models.RsItem) -> str:
     return f"{loc} {it.resolution:g}m {it.saleMonth}"
 
 
+def _rs_repeat_desc(repeat_sale: bool) -> str:
+    """明细售卖模式的可读描述（OpLog 用，ADR-038）。"""
+    return "可重复售卖" if repeat_sale else "单次售卖"
+
+
 def _rs_item_dup(db: Session, asset_id: int, province: str, city: str,
                  resolution: float, sale_month: str,
                  exclude_id: int | None = None) -> models.RsItem | None:
@@ -930,6 +950,171 @@ def _rs_item_sold_counts(db: Session, item_ids: list[int] | None = None) -> dict
     return {item_id: cnt for item_id, cnt in q.group_by(models.ProjectItem.itemId).all()}
 
 
+def _rs_item_occupied(db: Session, item_id: int) -> bool:
+    """该明细当前是否**被有效合同占用**（真值查询，`_sync_rs_item_status` 的唯一占用判据）。
+
+    占用 = `project_items.itemId == 明细 id` **且** 所属 `contracts.status != 'terminated'`
+    （pending / active / delivering / delivered 全算占用；terminated 不占用）。
+    与 `repeatSale` 无关——`repeatSale` 只在状态真值规则里作为「永不售罄」的短路条件。
+    """
+    return db.execute(
+        select(models.ProjectItem.id)
+        .join(models.Contract, models.Contract.id == models.ProjectItem.contractId)
+        .where(
+            models.ProjectItem.itemId == item_id,
+            models.Contract.status != "terminated",
+        )
+        .limit(1)
+    ).scalars().first() is not None
+
+
+def _sync_rs_item_status(db: Session, item_id: int | None) -> str | None:
+    """按真值重算**单条**明细状态并落库（明细 `status` 的**唯一写入实现**，RS-STATUS-20261022）。
+
+    真值规则（业务方方案，ADR-038 Decision 3 修订；与外层产品状态同构）：
+        repeatSale = true                  → in_stock（可重复售卖只计次，永不售罄）
+        否则 被非 terminated 合同占用      → all_sold（已售罄，不可再选）
+        否则 未被任何有效合同引用          → in_stock（可售）
+
+    幂等 / 自愈：每次调用都**重新查真值**并与现值比较，无变化不写库、不写日志；
+    因此允许在任意位置冗余调用（遗漏点也会在后续动作中被纠正）。
+    WHY 不回写 OpLog：这是可重算的派生字段，一次结算含 N 条明细会产生 N 条噪声日志，
+    而占用变化的业务动作本身已有流水（project_lock / cancel_release / sale_out）+ OpLog 覆盖。
+
+    调用点（**所有占用状态变化点，禁止各处手写 `item.status = ...`**）：
+    `_create_project_core`（下单锁定后）、`_apply_item_delivery`（交付）、
+    `_apply_item_release`（释放）、`_revert_outbound_inner`（撤销交付回 locked）、
+    `update_rs_item`（repeatSale 切换）、`review_project`（驳回批量）、
+    `change_project_status`（批量终止/交付兜底）、`delete_project`（删除后兜底）。
+
+    返回落库后的状态；明细不存在 / item_id 为空时返回 None（非遥感行直接跳过）。
+    """
+    if not item_id:
+        return None
+    rs = db.get(models.RsItem, item_id)
+    if rs is None:
+        return None
+    if rs.repeatSale:
+        new_status = "in_stock"
+    else:
+        new_status = "all_sold" if _rs_item_occupied(db, rs.id) else "in_stock"
+    if rs.status != new_status:
+        # session 为 autoflush=False：显式 flush，让同事务内后续按库值统计的调用方
+        #（_rs_container_available_counts / _rs_container_item_count）读到最新状态
+        rs.status = new_status
+        db.flush()
+    return rs.status
+
+
+def _sync_rs_item_statuses(db: Session, item_ids: Iterable[int | None]) -> None:
+    """批量版 `_sync_rs_item_status`（去重 + 跳过空值），供批量动作（驳回/批量状态/删项目）兜底自愈。
+
+    WHY 需要批量兜底：批处理里「合同状态」与「明细释放」的写入顺序不保证先落库
+    （如驳回是 `_apply_item_release` → `c.status = "terminated"`），单点重算此刻读到的
+    仍是旧合同状态；调用方在批量结束后统一 flush + 重算一次，状态才等于真值。
+    """
+    for item_id in {i for i in item_ids if i}:
+        _sync_rs_item_status(db, item_id)
+
+
+def _rs_container_available_counts(
+    db: Session, rs_items: list[models.RsItem]
+) -> dict[int, int]:
+    """容器「可售数量」= `status='in_stock'` 的明细条数（派生字段 `availableCount` 的唯一实现）。
+
+    口径（RS-STATUS-20261022，ADR-038 Decision 3 修订；**替换**上一版
+    「明细总数 − 被非 terminated 合同占用且 repeatSale=false 的明细数」的 join 推导）：
+        `availableCount = COUNT(rs_items WHERE status = 'in_stock' GROUP BY assetId)`
+    明细状态由 `_sync_rs_item_status` 在各占用状态变化点按真值维护，可售数直接数状态即可——
+    与外层产品 `quantity − lockedQty − shippedQty` 完全同构（一个数数量、一个数状态）。
+
+    **1 条聚合查询**（走 idx_rs_items_assetId / ix_rs_items_status；与产品数/明细数解耦，
+    禁止按产品循环查询 → 无 N+1）；结果**不依赖**调用方传入的 `rs_items` 是否全量（防漏数）。
+
+    **与调用者可见性无关**：查询是全量、不看 `Visibility`——viewer 的 bootstrap 只含
+    自己下单的项目/合同，用它算会失真（同 `_rs_item_sold_counts` 的思路，避免重演 BUG-46）。
+
+    返回 `{assetId: availableCount}`；无明细 / 明细全部售罄的容器不在结果中（调用方按 0 兜底）。
+
+    参数 `rs_items`：保留入参以兼容既有唯一调用点（`bootstrap`，已整表加载明细）；
+    本函数口径**不再依赖**它的内容。
+    """
+    return {
+        asset_id: int(cnt)
+        for asset_id, cnt in (
+            db.query(models.RsItem.assetId, func.count(models.RsItem.id))
+            .filter(models.RsItem.status == "in_stock")  # 已售罄明细不计入可售数
+            .group_by(models.RsItem.assetId)
+            .all()
+        )
+    }
+
+
+def _rs_container_item_count(db: Session, asset_id: int) -> int:
+    """容器**明细总条数**（含已售罄；`_sync_container_quantity` 的唯一计数口径 = 容器 quantity 语义）。
+
+    注意与 `_rs_container_available_counts` 区分：本函数数的是「一共登记了多少期」，
+    后者数的是「还有几期可售（status='in_stock'）」。
+    """
+    return int(
+        db.query(func.count(models.RsItem.id))
+        .filter(models.RsItem.assetId == asset_id)
+        .scalar()
+        or 0
+    )
+
+
+def _sync_container_quantity(db: Session, asset_id: int | None,
+                             operator: str = "") -> int | None:
+    """遥感容器 `quantity` 与可售明细条数同步（**唯一实现**，RS-REPEAT-20261022-FIX）。
+
+    WHY（缺陷根因）：容器的「数量」语义 = 可售明细条数（一期明细 = 一期可售）。
+    父产品 `quantity` 若停留在 1（登记时的占位值），则明细行下单时
+    `apply_item_lock(asset_id=容器, qty=1)` 的条件更新
+    `quantity - lockedQty - shippedQty >= 1` 只有第一条能成功，第二条起 rowcount=0 → 400
+    「可用数量不足」；`_validate_item_stock` 的聚合校验、`_apply_item_delivery` 的
+    `shippedQty + qty > quantity` 同样因此失真（后者表现为 500 不变量告警）。
+    把 `quantity` 与明细条数对齐后，上述三处 `quantity - lockedQty - shippedQty`
+    口径天然等于 `availableCount`（RS-STATUS-20261022 起 = `COUNT(status='in_stock')`）——
+    锁一条明细 ⇒ lockedQty +1 且该明细置 all_sold（可售 −1），两个口径同涨同落。
+    注：`quantity` 是**容器明细总条数**（含已售罄），手改一律被忽略（见 update_asset DEFECT-2）。
+
+    规则：
+    - 非遥感容器 / 产品不存在 → 不做任何事，返回 None；
+    - `lockedQty == 0 and shippedQty == 0`（无任何真实锁定/已交付）→ `quantity = 明细条数`；
+    - 否则（在售数据）→ **不改数量**（避免把进行中的锁定/交付统计冲掉），
+      仅校验 `quantity >= lockedQty + shippedQty`，不满足 → `_invariant_violation`（500 + 审计告警）。
+
+    调用点：`create_rs_item` / `delete_rs_item`（提交前同事务）；
+    `scripts/import_rs_items.py` / `scripts/reset_rs_items.py` /
+    `scripts/sync_container_quantity.py` 内以等价 SQL 实现（脚本不 import 业务包）。
+    返回同步后的 quantity（未处理时返回 None）。
+    """
+    if not asset_id:
+        return None
+    a = get_asset(db, asset_id)
+    if a is None or a.type != RS_DATA_TYPE:
+        return None
+    locked, shipped = int(a.lockedQty or 0), int(a.shippedQty or 0)
+    if locked == 0 and shipped == 0:
+        count = _rs_container_item_count(db, a.id)
+        if a.quantity != count:
+            old, a.quantity = a.quantity, count
+            refresh_status(a)  # 数量变化会影响「可售 / 全部出售」两态判定
+            add_log(db, "asset", a.name, "同步容器数量",
+                    f"容器数量按可售明细条数同步：{old} → {count}（明细 {count} 条）",
+                    asset_id=a.id, operator=operator)
+        return a.quantity
+    if a.quantity < locked + shipped:
+        _invariant_violation(
+            db,
+            f"{a.name} 容器数量 {a.quantity} 小于已锁定 {locked} + 已交付 {shipped}"
+            f"（明细 {_rs_container_item_count(db, a.id)} 条，已锁定/交付中不可自动同步数量）",
+            asset=a,
+        )
+    return a.quantity
+
+
 def create_rs_item(db: Session, asset_id: int, data: schemas.RsItemInput,
                    operator: str = "") -> models.RsItem:
     a = get_asset(db, asset_id)
@@ -951,8 +1136,11 @@ def create_rs_item(db: Session, asset_id: int, data: schemas.RsItemInput,
     db.add(it)
     db.flush()
     add_log(db, "asset", a.name, "新增可售明细",
-            f"新增明细 #{it.id}：{_rs_item_desc(it)}，单价 {_fmt_amount_yuan(price)}",
+            f"新增明细 #{it.id}：{_rs_item_desc(it)}，单价 {_fmt_amount_yuan(price)}"
+            f"，{_rs_repeat_desc(it.repeatSale)}",
             asset_id=a.id, operator=operator)
+    # RS-REPEAT-20261022-FIX §1：容器 quantity = 可售明细条数（同事务提交前同步）
+    _sync_container_quantity(db, a.id, operator=operator)
     db.commit()
     db.refresh(it)
     return it
@@ -967,14 +1155,29 @@ def update_rs_item(db: Session, item_id: int, data: schemas.RsItemInput,
     province, city, resolution, sale_month, price = _rs_item_fields(data)
     if _rs_item_dup(db, it.assetId, province, city, resolution, sale_month, exclude_id=it.id):
         raise HTTPException(400, "该父产品下已存在相同 省/市 + 精度 + 月份 的明细")
+    old_repeat = bool(it.repeatSale)
     it.province, it.city, it.resolution = province, city, resolution
     it.saleMonth, it.price, it.repeatSale = sale_month, price, data.repeatSale
     # ADR-021（RSITEM-RANGE-20261020）：参考区间（与产品区间同口径；传 null 清空=不限制）
     _validate_price_range(data.priceMin, data.priceMax)
     it.priceMin, it.priceMax = data.priceMin, data.priceMax
     it.updatedAt = now_str()
+    # RS-STATUS-20261022（§二.5）：repeatSale 切换会改变「是否计入可售」→ 立刻按真值重算状态：
+    #   切到 true  → 永不售罄，回 in_stock（容器可售数 +1）；
+    #   切回 false → 若仍被非 terminated 合同占用则回 all_sold（可售数 −1）。
+    # 必须在 add_log / commit 之前调用（同一事务、日志描述里的状态才与落库一致）。
+    old_status = it.status
+    new_status = _sync_rs_item_status(db, it.id)
+    # ADR-038：重复售卖开关变更对可售口径有直接影响 → OpLog 记录「是 → 否」变化，便于追溯
+    repeat_change = ""
+    if old_repeat != bool(it.repeatSale):
+        repeat_change = (f"，可重复售卖：{'是' if old_repeat else '否'} → "
+                         f"{'是' if it.repeatSale else '否'}")
+    if old_status != new_status:
+        repeat_change += f"，状态：{old_status} → {new_status}"
     add_log(db, "asset", a.name, "编辑可售明细",
-            f"明细 #{it.id} 更新为：{_rs_item_desc(it)}，单价 {_fmt_amount_yuan(price)}",
+            f"明细 #{it.id} 更新为：{_rs_item_desc(it)}，单价 {_fmt_amount_yuan(price)}"
+            f"，{_rs_repeat_desc(it.repeatSale)}{repeat_change}",
             asset_id=a.id, operator=operator)
     db.commit()
     db.refresh(it)
@@ -995,10 +1198,15 @@ def delete_rs_item(db: Session, item_id: int, operator: str = "") -> None:
     if ref_cnt is not None:
         raise HTTPException(400, "该明细存在销售关联，无法删除")
     desc = _rs_item_desc(it)
+    asset_id = it.assetId  # 先取，flush 后实例进入 deleted 态不可再读属性
     db.delete(it)
-    add_log(db, "asset", a.name if a else f"产品 #{it.assetId}", "删除可售明细",
+    add_log(db, "asset", a.name if a else f"产品 #{asset_id}", "删除可售明细",
             f"删除明细 #{item_id}：{desc}",
-            asset_id=it.assetId if a else None, operator=operator)
+            asset_id=asset_id if a else None, operator=operator)
+    # RS-REPEAT-20261022-FIX §1：容器 quantity = 可售明细条数。
+    # session 为 autoflush=False，必须先显式 flush，否则 COUNT 仍统计到待删行。
+    db.flush()
+    _sync_container_quantity(db, asset_id, operator=operator)
     db.commit()
 
 
@@ -1082,68 +1290,206 @@ def _withdraw_owner(db: Session, p: models.Project) -> models.User | None:
     return None
 
 
-def _refill_cart_from_project(db: Session, p: models.Project, target_user_id: str) -> dict:
-    """把项目全部明细回填 `target_user_id` 的购物车（ADR-026 §4 口径，ADR-027 两处复用）。
+# ADR-042 §2：回填模式白名单（merge=保留购物车现有商品，同键行被覆盖；
+# replace=先清空目标用户购物车再回填，同一事务、不可撤销）
+REFILL_MODES = ("merge", "replace")
+
+# REFILL-20261022-B3：回填逐行结果 `rows[].code` 白名单——给前端**结构化**失败类别，
+# 避免其用正则解析 `reason` 中文串（文案随时可能调整）。
+# ok=成功 / insufficient=可售不足（含被占用）/ no_asset=明细未关联产品或产品已不存在 /
+# other=其它（区间不符、金额校验失败等写阶段校验失败）。
+REFILL_ROW_CODES = ("ok", "insufficient", "no_asset", "other")
+
+
+def _refill_owner_brief(u: models.User | None) -> dict | None:
+    """回填对象（下单人）摘要：供前端判断「回填对象是否当前登录者」（ADR-042 §5）。
+    理论上回填目标必定存在；None 仅作防御（不让响应炸掉）。"""
+    if u is None:
+        return None
+    return {"id": u.id, "username": u.username, "name": u.name}
+
+
+def _refill_cart_from_project(db: Session, p: models.Project, target_user_id: str, *,
+                              mode: str = "merge") -> dict:
+    """把项目全部明细回填 `target_user_id` 的购物车（ADR-026 §4 口径，ADR-027 两处复用，
+    ADR-042 增补「同键替换 / mode / 逐行结果」）。
 
     **唯一实现**：`withdraw_project`（撤销）与 `refill_project_cart`（重新提交）都调本函数，
     避免「客户/数量/金额/服务期限/折扣率/遥感明细 itemId」两套口径漂移。
     - 行级客户取**所属合同**的 customer（ADR-007 拆合同口径），存量无合同明细回退项目客户；
-    - 判重键 (userId, assetId, itemId, customer) 由 `_cart_add_inner` 天然合并累加；
-    - 容错：单行因区间/可售/数据缺失无法回填时**不中断**——先降级 `amount=None`（原价成交）
+    - ADR-042 §1：判重键 (userId, assetId, itemId, customer) 命中已有行时**覆盖**
+      qty/amount/serviceStart/serviceEnd（`existing_policy="replace"`），不新增行、不累加——
+      重试天然幂等（修「重试翻倍」）；`POST /cart` 加购仍为累加（不在本函数内）。
+    - ADR-042 §2：`mode="replace"` 先清空目标用户购物车（`_clear_cart`，**不提交**），
+      记录 `cleared` 行数；`mode="merge"` 保留现有商品。非法 mode → 400。
+    - ADR-042 补遗1：`mode="replace"` **先预检、后清空**（两阶段）——预检为纯计算、零写入；
+      **可行行数 == 0 → 跳过清空**（`cleared=0`，全量 rows 计 skipped）直接返回，绝不出现
+      「购物车被清空且回填全失败」的数据破坏。
+    - ADR-042 补遗2：`mode="replace"` 仅允许清空**本人**购物车——守卫在 `refill_project_cart`
+      的幂等短路与全部写操作之前（代操作 → 400，只能走 merge）。
+    - ADR-042 §4：逐行**预检可售**（复用统一口径 `_avail`）——不足则直接计 skipped 并给出
+      带库存数值的「已被其他订单占用」文案，不再透传 `_cart_add_inner` 的泛化报错；
+      预检只判「可售是否够」，区间/金额校验仍在写阶段由 `_cart_add_inner` 单一来源负责；
+    - 容错：单行因区间/数据缺失无法回填时**不中断**——先降级 `amount=None`（原价成交）
       重试，仍失败则跳过并计入 skipped/skippedReasons；
     - **不提交事务**（调用方单事务收口），**不加锁**（回填不占 lockedQty，与下单锁量无关）。
 
-    返回 `{restored, amountFallback, skipped, skippedReasons}`。
+    返回 `{restored, amountFallback, skipped, skippedReasons, mode, cleared, rows}`，
+    `rows = [{assetName, qty, ok, reason, assetId, code, need}]` 逐行结果（成功行
+    `ok=True, reason=""`）。`assetId/code/need` 为 REFILL-20261022-B3 **加性**字段
+    （旧 4 键全保留），`reason` 与 `skippedReasons` 的文案**逐字未变**——新增字段只为
+    让前端做结构化渲染（产品名 + 数量 + 状态胶囊 + 库存/锁定/出库/需求），不解析中文文案。
     """
+    if mode not in REFILL_MODES:
+        # 内部函数同样防御（唯一合法值见 REFILL_MODES），校验置于任何写操作之前
+        raise HTTPException(400, "非法的回填模式")
+
+    def _label(it: models.ProjectItem) -> str:
+        """行标签（产品名；产品已删/未关联时给兜底文案）。`db.get` 走 identity map，重复调用不再发 SQL。"""
+        a = get_asset(db, it.assetId)
+        return a.name if a is not None else f"产品 #{it.assetId}"
+
+    def _row(it: models.ProjectItem, label: str, ok: bool, reason: str, code: str) -> dict:
+        """逐行结果（键顺序即响应 JSON 顺序）。
+
+        REFILL-20261022-B3 加性字段：
+        - `assetId`：产品 id（未关联产品时为 `None`），前端按 id 从 bootstrap 镜像读库存；
+        - `code`：失败类别，取值见 `REFILL_ROW_CODES`（成功行 `"ok"`）；
+        - `need`：本次需要数量（= 行 qty，**成功行也填**），与 `qty` 同源。
+        `reason` 保持既有完整文案（日志/旧消费方仍可用），本次一个字未改。
+        """
+        qty = int(it.qty or 0)
+        return {
+            "assetName": label,
+            "qty": qty,
+            "ok": ok,
+            "reason": reason,
+            "assetId": int(it.assetId) if it.assetId else None,
+            "code": code,
+            "need": qty,
+        }
+
+    # ---------- 阶段 1：预检（纯计算，零写入，ADR-042 补遗1） ----------
+    # 只判「可售是否够」：可售口径复用唯一实现 `_avail`（= quantity - lockedQty - shippedQty，
+    # clamp 0）+ repeatSale 豁免（与 `_check_stock` 同口径）。区间/金额/客户等校验属于写阶段，
+    # 仍由 `_cart_add_inner` 单一来源负责——预检**不重复实现**，避免两套校验漂移。
+    # planned = [(明细, 行级客户, 是否可行, 不可行原因, rows[].code)]，顺序 = p.items 顺序。
+    # REFILL-20261022-B3：第 5 位 code 与第 4 位 reason 一一对应（reason 文案不动，只并出结构化类别）。
+    planned: list[tuple[models.ProjectItem, str, bool, str, str]] = []
+    for it in list(p.items):
+        a = get_asset(db, it.assetId)
+        if not it.assetId:
+            planned.append((it, "", False, f"明细 #{it.id} 未关联产品，无法回填购物车",
+                            "no_asset"))
+            continue
+        if a is None:
+            planned.append((it, "", False, f"产品 #{it.assetId} 已不存在", "no_asset"))
+            continue
+        # ADR-042 §4 逐行预检（在 _cart_add_inner 之前）：可售口径复用唯一实现 `_avail`，
+        # 不另起一套算法。可重复售卖（明细 repeatSale / 产品 repeatSale）不占数量，跳过预检。
+        rs = db.get(models.RsItem, it.itemId) if it.itemId else None
+        repeat = rs.repeatSale if rs is not None else a.repeatSale
+        available_qty = _avail(a)
+        if not repeat and available_qty < int(it.qty or 0):
+            # 此处 product 已确认存在 → assetId 为真实产品 id，need = 本次需求数量
+            planned.append((it, "", False,
+                            f"「{a.name}」可售数量不足（库存 {a.quantity}，已锁定 {a.lockedQty}，"
+                            f"已出库 {a.shippedQty}，本次需 {it.qty}），该产品已被其他订单占用，"
+                            f"请等待释放或补货后再提交", "insufficient"))
+            continue
+        # 行级客户：所属合同的客户（ADR-007 拆合同口径）；存量无合同明细回退项目客户
+        customer = (it.contract.customer if it.contract is not None else p.customer) or ""
+        planned.append((it, customer, True, "", "ok"))
+
     restored = 0
     amount_fallback = 0
     skipped = 0
     skipped_reasons: list[str] = []
-    for it in list(p.items):
-        a = get_asset(db, it.assetId)
-        label = a.name if a is not None else f"产品 #{it.assetId}"
-        if not it.assetId:
+    rows: list[dict] = []
+    cleared = 0
+    feasible_count = sum(1 for _it, _c, ok, _r, _code in planned if ok)
+
+    # ---------- 阶段 2a：仅 replace 才清空（且必须「有可行行」才清） ----------
+    if mode == "replace":
+        if feasible_count == 0:
+            # ADR-042 补遗1：可行行为 0 → **跳过清空**（cleared=0），不写任何数据直接返回；
+            # 用户原购物车一行不动，由前端弹「无法回填」列出逐行原因（修数据破坏级缺陷：
+            # 原实现「先清空再回填」，全部行因可售不足被跳过时购物车被清空且不可回滚）。
+            for it, _customer, _ok, reason, code in planned:
+                skipped += 1
+                skipped_reasons.append(reason)
+                rows.append(_row(it, _label(it), False, reason, code))
+            return {
+                "restored": 0,
+                "amountFallback": 0,
+                "skipped": skipped,
+                "skippedReasons": skipped_reasons,
+                "mode": mode,
+                "cleared": 0,
+                "rows": rows,
+            }
+        # ADR-042 §2：清空后回填（同一事务，不 commit；flush 让后续判重/合计看到删除结果）
+        cleared = len(_cart_list(db, target_user_id))
+        _clear_cart(db, target_user_id)
+        db.flush()
+
+    # ---------- 阶段 2b：逐行写入（merge 不清空；replace 已在上一段清空） ----------
+    for it, customer, ok, reason, code in planned:
+        label = _label(it)
+        if not ok:
+            # 预检已判不可行（未关联产品 / 产品已删 / 可售不足）：零写入，直接计入 skipped
+            # code 由预检给出（no_asset / insufficient），与 reason 一一对应
             skipped += 1
-            skipped_reasons.append(f"明细 #{it.id} 未关联产品，无法回填购物车")
+            skipped_reasons.append(reason)
+            rows.append(_row(it, label, False, reason, code))
             continue
-        if a is None:
-            skipped += 1
-            skipped_reasons.append(f"产品 #{it.assetId} 已不存在")
-            continue
-        # 行级客户：所属合同的客户（ADR-007 拆合同口径）；存量无合同明细回退项目客户
-        customer = (it.contract.customer if it.contract is not None else p.customer) or ""
+        # NO-DISCOUNT-20261022 / ADR-039：不再透传明细的 discountRate 快照（新购物车行恒 null；
+        # 历史值留在 project_items 里可追溯，不回填购物车）
         base = dict(
             assetId=it.assetId, qty=it.qty, customer=customer, itemId=it.itemId,
             serviceStart=it.serviceStart, serviceEnd=it.serviceEnd,
-            discountRate=it.discountRate,
         )
         first_err = ""
         try:
+            # ADR-042 §1：回填走「同键替换」，不累加（重试不翻倍）
             _cart_add_inner(db, schemas.CartItemInput(amount=it.amount or None, **base),
-                            user_id=target_user_id)  # type: ignore[arg-type]
+                            user_id=target_user_id,  # type: ignore[arg-type]
+                            existing_policy="replace")
             restored += 1
+            rows.append(_row(it, label, True, "", "ok"))
             continue
         except HTTPException as exc:
             first_err = str(exc.detail)
         if not it.amount:
             # 订单行本就无折扣金额（原价成交口径），无降级空间 → 跳过
+            # REFILL-20261022-B3：写阶段校验失败（区间不符 / 金额校验等）统一归 "other"
             skipped += 1
-            skipped_reasons.append(f"{label}：{first_err}")
+            reason = f"{label}：{first_err}"
+            skipped_reasons.append(reason)
+            rows.append(_row(it, label, False, reason, "other"))
             continue
         # 降级重试：amount=None（原价成交）——区间/金额口径失配时保证不被单行卡死
         try:
             _cart_add_inner(db, schemas.CartItemInput(amount=None, **base),
-                            user_id=target_user_id)  # type: ignore[arg-type]
+                            user_id=target_user_id,  # type: ignore[arg-type]
+                            existing_policy="replace")
             restored += 1
             amount_fallback += 1
+            rows.append(_row(it, label, True, "", "ok"))
         except HTTPException as exc:
+            # 降级（amount=None）仍失败 → 写阶段校验问题，归 "other"
             skipped += 1
-            skipped_reasons.append(f"{label}：{exc.detail}")
+            reason = f"{label}：{exc.detail}"
+            skipped_reasons.append(reason)
+            rows.append(_row(it, label, False, reason, "other"))
     return {
         "restored": restored,
         "amountFallback": amount_fallback,
         "skipped": skipped,
         "skippedReasons": skipped_reasons,
+        "mode": mode,
+        "cleared": cleared,
+        "rows": rows,
     }
 
 
@@ -1158,10 +1504,12 @@ def withdraw_project(db: Session, project_id: int, reason: str, user: models.Use
     ② 项目 status 置 terminated（含存量无合同项目）+ `_recompute_project` 保持
        金额/客户/主体派生口径一致；
     ③ 有商务负责人则解绑（置空）并留痕；
-    ④ 逐明细调 `_refill_cart_from_project`（ADR-027 共享实现）回填**下单人**购物车
-       （保留客户/数量/金额/服务期限/折扣率/遥感明细 itemId；判重键
-       (userId, assetId, itemId, customer) 天然合并累加），并置 `p.cartRefilled = True`
+    ④ 逐明细调 `_refill_cart_from_project`（ADR-027 共享实现，ADR-042 传 `mode="merge"`）
+       回填**下单人**购物车（保留客户/数量/金额/服务期限/遥感明细 itemId；判重键
+       (userId, assetId, itemId, customer) 命中即**覆盖**，不累加——ADR-042 §1 顺带修掉
+       「撤销后同键行翻倍」），并置 `p.cartRefilled = True`
        （幂等标记：之后点「重新提交」不再重复回填）；
+       ⚠️ 撤销**不清空**购物车（`mode="merge"`），OpLog 文案与本函数返回结构一字未改；
     ⑤ OpLog（`撤销订单`）+ 路由层审计。
 
     回填容错（ADR-026 §4）：单行因区间/可售/数据缺失无法回填时**不中断撤销**——
@@ -1209,7 +1557,9 @@ def withdraw_project(db: Session, project_id: int, reason: str, user: models.Use
     p.updatedAt = today()
 
     # ④ 逐明细回填下单人购物车（共享实现：单行失败绝不中断整体撤销）
-    refill = _refill_cart_from_project(db, p, target_user_id)
+    # ADR-042 §2：撤销固定 `mode="merge"`（**不清空**购物车），但自动获得 replace 的
+    # upsert 语义（同键覆盖不累加）；返回结构与 OpLog 文案保持原样，不携带 mode 字段
+    refill = _refill_cart_from_project(db, p, target_user_id, mode="merge")
     restored = refill["restored"]
     amount_fallback = refill["amountFallback"]
     skipped = refill["skipped"]
@@ -1241,22 +1591,44 @@ def withdraw_project(db: Session, project_id: int, reason: str, user: models.Use
 # ============================================================
 # 「重新提交」收口购物车（ADR-027）：终止项目明细确保在**下单人**购物车，只回填一次
 # ============================================================
-def refill_project_cart(db: Session, project_id: int, user: models.User) -> dict:
+def refill_project_cart(db: Session, project_id: int, user: models.User,
+                        mode: str = "merge") -> dict:
     """POST /projects/{id}/refill-cart（ADR-027）：终止项目「重新提交」改为**进购物车改单**。
 
     语义 = 确保原单全部明细在**下单人**购物车 → 前端跳 `/cart` 结算（与撤销后的动线一致）；
     **不新建订单**、不改项目状态、不改合同、不锁量（回填不占 lockedQty）。
 
-    - 守卫：项目存在（404）；`status == 'terminated'`（否则 400）；权限与 resubmit 同口径——
-      admin/editor 放行，viewer 必须 `user_sees_project`（creator 口径，存量回退 rep，403）；
-      下单账号不存在（400，无法确定回填目标）。
-    - **幂等只回填一次**：`p.cartRefilled` 为 True → 直接返回 `alreadyRefilled: true`
-      （不写库、不回填、不打日志，购物车行数不增加）。
-    - 回填逻辑与 `withdraw_project` **共用** `_refill_cart_from_project`（口径不漂移）。
+    - 守卫（顺序固定，全部在写操作之前，保持单事务）：项目存在（404）→ `status == 'terminated'`
+      （否则 400）→ 权限：**viewer 仅本人项目（`user_sees_project`，creator 口径、存量回退 rep，
+      否则 403）/ admin 放行 / editor → 403（ADR-043）** → 下单账号存在（400，无法确定回填目标）→
+      **`mode == 'replace'` 仅限本人（400，ADR-042 补遗2）** → 幂等短路。
+      `mode ∉ {merge, replace}` → 400（ADR-042 §2，同样前置）。
+    - **ADR-043（REFILL-20261022-B4）：商务（editor）禁入「重新提交」**——回填目标**恒为下单人**
+      （`_withdraw_owner`），editor 操作后自身购物车无变化，只会造成「提示成功但什么也没发生」的误解；
+      合法路径 = 通知下单人本人重新提交，或由 admin 代操作。**部分取代 ADR-027 的「admin/editor 放行」**
+      （editor 部分失效）；路由层 `require_order` 未改，三角色均可进端点，由本业务级守卫拒绝
+      （错误信息比通用 403 更准确）。撤销（`withdraw_project`）权限未变，editor 仍可撤销。
+    - **ADR-042 补遗2：`replace` 仅限本人购物车**——回填目标恒为下单人，若操作者不是下单人
+      （admin/其他商务代操作）则 `replace` 会清空**他人**购物车（跨用户破坏）→ 400
+      「只能对本人购物车执行『清空后回填』，他人项目请使用合并」；代操作场景只保留 `merge`。
+    - **ADR-042 补遗1：`replace` 先预检、后清空**（见 `_refill_cart_from_project`）——可行行为 0
+      时**不清空**（`cleared == 0` 且 `mode == "replace"` 是合法组合），用户原购物车不丢。
+    - **幂等只回填一次（仅对 merge 生效，ADR-042 §2）**：`p.cartRefilled` 为 True 且
+      `mode == 'merge'` → 直接返回 `alreadyRefilled: true`（不写库、不回填、不打日志）；
+      `mode == 'replace'`（用户主动「清空重建」）**跳过幂等短路**，返回 `forced: true`。
+      （owner 解析已提前到短路之前，短路分支直接复用该 owner，避免二次查询。）
+    - 回填逻辑与 `withdraw_project` **共用** `_refill_cart_from_project`（口径不漂移），
+      同键行**覆盖**而非累加（ADR-042 §1）。
     - 单事务：回填成功 → `p.cartRefilled = True` + OpLog（`重新提交（回填购物车）`）→ commit。
 
-    返回 `{ok, alreadyRefilled, restored, amountFallback, skipped, skippedReasons}`。
+    返回 `{ok, alreadyRefilled, restored, amountFallback, skipped, skippedReasons,
+    mode, forced, cleared, owner, rows}`（前 6 个字段为 ADR-027 原结构，ADR-042 加性扩展）。
+    `owner = {id, username, name}` 供前端判断「回填对象是否当前登录者」。
     """
+    # ADR-042 §2：mode 校验前置（写操作之前；缺省/空白按 merge 处理，保持旧调用兼容）
+    mode = (mode or "").strip().lower() or "merge"
+    if mode not in REFILL_MODES:
+        raise HTTPException(400, "非法的回填模式")
     p = get_project(db, project_id)
     if not p:
         raise HTTPException(404, "销售项目不存在")
@@ -1264,8 +1636,26 @@ def refill_project_cart(db: Session, project_id: int, user: models.User) -> dict
         raise HTTPException(400, "仅已终止的项目可重新提交")
     if user.role == "viewer" and not user_sees_project(user, p):
         raise HTTPException(403, "生态人员仅可重新提交自己下单的项目")
-    if p.cartRefilled:
+    # ADR-043（REFILL-20261022-B4）：商务（editor）禁用「重新提交」——回填目标恒为下单人，
+    # 商务操作后自身购物车无变化，只会造成"提示成功但什么也没发生"的误解。
+    # 合法路径：通知下单人本人重新提交，或由 admin 代操作。守卫置于任何写操作之前。
+    if user.role == "editor":
+        raise HTTPException(403, "商务人员不可使用「重新提交」，请通知下单人本人操作")
+    # ADR-042 补遗2：owner 解析**提前**到幂等短路之前——`replace` 的「仅限本人」守卫必须先拿到
+    # 目标账号才能判定；守卫顺序固定为：项目存在(404) → 已终止(400) → viewer 权限(403) →
+    # **editor 业务级拒绝(403，ADR-043)** → 下单账号存在(400) → **replace 仅限本人(400)** →
+    # 幂等短路（位置不得再调整）。
+    owner = _withdraw_owner(db, p)
+    if owner is None:
+        raise HTTPException(400, "下单账号不存在，无法回填购物车")
+    target_user_id = str(owner.id)  # cart_items.userId 存 users.id 字符串（ADR-009）
+    if mode == "replace" and target_user_id != str(user.id):
+        # ADR-042 补遗2：`replace` 会清空**回填目标**（下单人）购物车——代操作（admin/其他商务）
+        # 时目标为他人 → 跨用户清空，不可接受。守卫置于任何写操作之前（此刻一行未删）。
+        raise HTTPException(400, "只能对本人购物车执行『清空后回填』，他人项目请使用合并")
+    if p.cartRefilled and mode == "merge":
         # 已回填过：直接告知前端「明细已在购物车」，绝不重复回填（避免行数翻倍）
+        # ADR-042 §2：仅 merge 短路；replace 是用户显式「清空重建」，必须继续执行
         return {
             "ok": True,
             "alreadyRefilled": True,
@@ -1273,18 +1663,23 @@ def refill_project_cart(db: Session, project_id: int, user: models.User) -> dict
             "amountFallback": 0,
             "skipped": 0,
             "skippedReasons": [],
+            "mode": mode,
+            "forced": False,
+            "cleared": 0,
+            "owner": _refill_owner_brief(owner),
+            "rows": [],
         }
-    owner = _withdraw_owner(db, p)
-    if owner is None:
-        raise HTTPException(400, "下单账号不存在，无法回填购物车")
-    target_user_id = str(owner.id)  # cart_items.userId 存 users.id 字符串（ADR-009）
 
-    refill = _refill_cart_from_project(db, p, target_user_id)
+    refill = _refill_cart_from_project(db, p, target_user_id, mode=mode)
     # BUG-15：仅全部成功才置幂等标记；有跳过行时保持 False，允许再次点「重新提交」重试
+    # （ADR-042：replace 有跳过行时同样保持 False，允许重试）
     p.cartRefilled = (refill["skipped"] == 0)
     detail = (f"{refill['restored']} 行明细已回填购物车"
-              f"（原价回填 {refill['amountFallback']} 行，跳过 {refill['skipped']} 行），"
-              f"由下单人 {owner.username} 购物车改单后重新提交")
+              f"（原价回填 {refill['amountFallback']} 行，跳过 {refill['skipped']} 行）")
+    if mode == "replace":
+        # ADR-042 §2：仅 replace 追加模式信息（merge 保持原文案，避免噪声）
+        detail += f"（mode=replace，清空原有 {refill['cleared']} 行）"
+    detail += f"，由下单人 {owner.username} 购物车改单后重新提交"
     add_log(db, "project", p.name, "重新提交（回填购物车）", detail, operator=user.username,
             project_id=p.id)
     db.commit()
@@ -1295,6 +1690,11 @@ def refill_project_cart(db: Session, project_id: int, user: models.User) -> dict
         "amountFallback": refill["amountFallback"],
         "skipped": refill["skipped"],
         "skippedReasons": refill["skippedReasons"],
+        "mode": mode,
+        "forced": (mode == "replace"),
+        "cleared": refill["cleared"],
+        "owner": _refill_owner_brief(owner),
+        "rows": refill["rows"],
     }
 
 
@@ -1382,9 +1782,23 @@ def _item_repeat(db: Session, asset: models.Asset | None,
     return asset.repeatSale if asset else True
 
 
-def _validate_rs_item_ref(db: Session, it: schemas.ProjectItemInput) -> models.RsItem | None:
+def _validate_rs_item_ref(db: Session, it: schemas.ProjectItemInput,
+                          seen: set[int] | None = None) -> models.RsItem | None:
     """ADR-011：含 itemId 的明细行统一校验（三个下单入口共用）：
-    明细存在且归属 assetId；qty 强制 1。返回 RsItem（无 itemId 返回 None）。"""
+    明细存在且归属 assetId；qty 强制 1。返回 RsItem（无 itemId 返回 None）。
+
+    RS-STATUS-20261022 §3.2：**售罄护栏改为读明细状态**（替换上一版基于 join 的占用检查）——
+    `repeatSale == False` 且 `status == 'all_sold'` → 400「该可售明细已售罄，请选择其他明细」。
+    状态由 `_sync_rs_item_status` 在占用变化点维护（下单锁定即置 all_sold），
+    故「同一条单次售卖明细被卖第二次」在 SQL 层就被拦住。
+    `repeatSale == True`（可重复售卖）永不售罄，不校验，只计次不扣量。
+
+    同一请求内重复选同一条单次售卖明细：本请求的明细行尚未落库、状态检查看不见，
+    由调用方传入本请求已选用的 id 集合 `seen` 拦截（否则跨销售记录选同一明细会被卖两次：
+    `lockedQty` +2 而可售只减 1 条）。
+    检查与调用方同处一个事务（checkout 已是单事务 + `apply_item_lock` 条件更新，
+    SQLite 单写者），不引入新的读-改-写竞态。
+    """
     if not it.itemId:
         return None
     rs = db.get(models.RsItem, it.itemId)
@@ -1392,6 +1806,13 @@ def _validate_rs_item_ref(db: Session, it: schemas.ProjectItemInput) -> models.R
         raise HTTPException(400, "遥感数据明细不存在或不属于该产品")
     if it.qty != 1:
         raise HTTPException(400, "遥感数据明细行数量固定为 1")
+    if not rs.repeatSale:
+        if rs.status == "all_sold":
+            raise HTTPException(400, "该可售明细已售罄，请选择其他明细")
+        if seen is not None:
+            if rs.id in seen:
+                raise HTTPException(400, "同一条单次售卖明细不可在同一订单中重复下单，请选择其他明细")
+            seen.add(rs.id)
     return rs
 
 
@@ -1446,11 +1867,17 @@ def _create_project_core(db: Session, data: schemas.ProjectInput,
         if len(set(line_keys)) != len(line_keys):
             raise HTTPException(400, "同一销售记录中同一产品（含明细）不可重复，请合并为一行")
     # ---------------- 唯一权威校验链（BUG-08 / BUG-16 / BUG-05，ADR-029 §1）----------------
-    # 固定顺序：① 明细存在性 → ② 明细归属/qty → ③ 折扣率 → ④ 服务期限 → ⑤ 参考区间/金额
-    #           → ⑥ 按 assetId 聚合数量。所有建单入口（购物车结算 / 手动建单 / 重新提交）
+    # 固定顺序：① 明细存在性 → ② 明细归属/qty → ③ 服务期限 → ④ 参考区间/金额
+    #           → ⑤ 按 assetId 聚合数量。所有建单入口（购物车结算 / 手动建单 / 重新提交）
     # 必经此处，禁止在入口层重复实现（复制即漂移）。
+    # （原「③ 折扣率」一步已随 NO-DISCOUNT-20261022 / ADR-039 删除：入参 discountRate 不校验）
     rs_map: dict[int, models.RsItem] = {}
     service_map: dict[int, tuple[str | None, str | None]] = {}
+    # RS-STATUS-20261022：本请求内已选用的「单次售卖」明细 id（售罄护栏的第二道：同请求重复选）。
+    # WHY 需要单独记：售罄检查读的是明细 `status`，而本请求的明细行尚未落库、状态也还没重算；
+    # 同一条单次售卖明细若出现在两个销售记录里（同客户会被 ① 的 seen_contracts 拦下，
+    # 不同客户则不拦），会绕过售罄护栏被卖两次（lockedQty +2 而可售只减 1 条 → 两个口径打架）。
+    single_sale_seen: set[int] = set()
     for _customer, items, _amt, _remark in contracts_in:
         for it in items:
             # ① 明细存在性（BUG-16）：非空 assetId 必须指向真实产品——
@@ -1463,12 +1890,12 @@ def _create_project_core(db: Session, data: schemas.ProjectInput,
                 # 容器明细行（itemId 非空，指向 rs_items）放行，只拦父产品本身
                 if not it.itemId and a.type == "遥感数据":
                     raise HTTPException(400, "遥感数据容器不可直接购买，请购买其数据明细")
-            # ② 明细归属 / qty=1（ADR-011）
-            rs = _validate_rs_item_ref(db, it)
+            # ② 明细归属 / qty=1（ADR-011）+ 售罄护栏（RS-STATUS-20261022）
+            rs = _validate_rs_item_ref(db, it, seen=single_sale_seen)
             if rs is not None:
                 rs_map[it.itemId] = rs
-            # ③ 折扣率（ADR-023：0 < rate ≤ 1 否则 400；null = 无折扣；快照只写不改）
-            _validate_discount_rate(it.discountRate)
+            # ③ 折扣率：**已下线**（NO-DISCOUNT-20261022 / ADR-039）——入参 `it.discountRate`
+            # 容忍但忽略（不校验、不 400、不落库；旧客户端仍可传）
             # ④ 服务期限（ADR-020：YYYY-MM-DD 且 start ≤ end，否则 400）
             service_map[id(it)] = _validate_service_period(it.serviceStart, it.serviceEnd)
     # ADR-013：移除「记录内同主体」校验（一资产一记录天然单主体；手动建单可混合主体成一条记录）
@@ -1557,7 +1984,9 @@ def _create_project_core(db: Session, data: schemas.ProjectInput,
                 price=price, amount=amount,
                 origPrice=orig_price, origAmount=orig_amount,  # ADR-018 §2：原价快照
                 serviceStart=service_start, serviceEnd=service_end,  # ADR-020：服务期限
-                discountRate=it.discountRate,  # DISCOUNT-20261021/ADR-023：折扣率快照（只写不改）
+                # NO-DISCOUNT-20261022 / ADR-039：折扣率已下线——**一律写 null**（不读前端值，
+                # 旧客户端传了也忽略）；列保留，历史单的历史值不动、可追溯
+                discountRate=None,
                 status=status, deliveryReq=it.deliveryReq,
                 itemId=it.itemId,  # ADR-011：遥感明细行落库（非明细行 NULL）
                 # 契约 2：落「下单时刻是否真实加锁」事实（repeatSale/明细 repeatSale 下单不加锁）
@@ -1566,6 +1995,14 @@ def _create_project_core(db: Session, data: schemas.ProjectInput,
                 confirmedDate="", shippedDate="",
             ))
             total_item_count += 1
+            # RS-STATUS-20261022（ADR-038 Decision 3）：明细占用状态紧跟「下单锁定」按真值重算
+            #（被占用 → all_sold；repeatSale=true → 永不售罄，保持 in_stock）。
+            # WHY 必须在本行 append **且 flush 之后**：重算查的是库里的真值（project_items ⋈ contracts），
+            # 明细行还没落库时会被判成「未被占用」→ 刚锁定的单次售卖明细被错误置回 in_stock
+            #（表现为下单后 availableCount 不降、同一明细还能被再卖一次）。
+            if rs is not None:
+                db.flush()
+                _sync_rs_item_status(db, rs.id)
     # 项目派生字段落库：status/customer/subject/expectedAmount=Σ合同（ADR-007）
     _recompute_project(project)
     add_log(db, "project", project.name, "新增项目",
@@ -1634,6 +2071,9 @@ def _apply_item_delivery(db: Session, it: models.ProjectItem, operator: str = ""
         _flush_with_code(db, ob, lambda oid: f"CK-{str(oid).zfill(4)}")
     it.status = "shipped"
     it.shippedDate = today()
+    # RS-STATUS-20261022：交付后明细仍被有效合同引用 → 状态保持 all_sold（幂等重算，
+    # 兼作自愈：若上游漏调/历史数据把状态写歪，交付动作会把它纠回真值）
+    _sync_rs_item_status(db, it.itemId)
 
 
 def _apply_item_release(db: Session, it: models.ProjectItem, operator: str = "",
@@ -1648,6 +2088,10 @@ def _apply_item_release(db: Session, it: models.ProjectItem, operator: str = "",
                             contract_id=contract_id,
                             repeat_override=_item_repeat(db, a, it.itemId))
         it.status = "released"
+        # RS-STATUS-20261022：释放后该明细不再被占用 → 重算状态（合同已 terminated 时回 in_stock）。
+        # 注：驳回场景合同状态在本循环之后才写（c.status = "terminated"），故 review_project
+        # 批量结束后还有一次 `_sync_rs_item_statuses` 兜底（见该处注释）。
+        _sync_rs_item_status(db, it.itemId)
         return True
     return False
 
@@ -1972,6 +2416,8 @@ def review_project(db: Session, project_id: int, data: schemas.ReviewInput,
     ADR-018 §4（PRICING-20261020）：**删除**终审改价回写 assets.salePrice 的逻辑——
     挂牌价与参考区间仅由产品管理维护，改价只写 ProjectItem.price/amount（orig 快照不动）；
     ADR-020：行级入参可改服务期限（serviceStart/serviceEnd，格式/顺序校验）；
+    NO-DISCOUNT-20261022 / ADR-039：**折扣率已下线**——审核改价只写 price/amount/service，
+    既不读入参 discountRate、也**不回写** `ProjectItem.discountRate`（存量历史快照原值保留）；
     数量审核时不可改（需改数量 → 驳回重下）；确认后存在 amount<=0 行 → 400；
     合同 pending→active、项目派生 → active。
     reject：reason 必填；逐明细释放锁定（仅 it.locked）；合同 pending→terminated
@@ -2006,6 +2452,12 @@ def review_project(db: Session, project_id: int, data: schemas.ReviewInput,
             else:
                 c.remark = f"驳回：{reason}"
             c.updatedAt = today()
+        # RS-STATUS-20261022：驳回 = 全部明细释放 → 状态必须回 in_stock。
+        # 上面循环里 `_apply_item_release` 的重算读到的合同状态仍是 pending（本循环之后才置
+        # terminated），故此处 flush 后再统一重算一次（冗余自愈，杜绝「驳回后明细仍售罄」）。
+        db.flush()
+        _sync_rs_item_statuses(
+            db, [it.itemId for c in contracts for it in c.items])
         _recompute_project(p)
         add_log(db, "project", p.name, "驳回订单",
                 f"项目 {p.code} 订单已驳回：{reason}（锁定已释放）", operator=operator,
@@ -2253,6 +2705,11 @@ def change_project_status(db: Session, project_id: int, data: schemas.StatusInpu
         for c in targets:
             # 复用合同级核心（不提交），单事务收敛（H8）
             _change_contract_status_core(db, c, status, reason, operator=operator)
+        # RS-STATUS-20261022：批量动作结束后对相关明细统一 flush + 重算（幂等冗余）——
+        # 逐条路径已各自重算，这里兜底覆盖「合同状态由 ORM 属性延迟写入」等顺序差异，
+        # 保证一次批量终止/交付后所有明细状态都等于真值（无遗漏点）。
+        db.flush()
+        _sync_rs_item_statuses(db, [it.itemId for c in targets for it in c.items])
         add_log(db, "project", p.name, "状态变更",
                 f"项目批量{('交付' if status == 'delivered' else '终止')}：名下 {len(targets)} 条销售记录已执行",
                 operator=operator, project_id=p.id)
@@ -2450,9 +2907,30 @@ def delete_project(db: Session, project_id: int, operator: str = "") -> None:
     else:
         # 存量兼容：无合同项目走旧的项目级回滚
         _terminate_project(db, p, "项目删除回滚", operator=operator)
+    # RS-STATUS-20261022：项目删除 = 相关明细全部失去占用 → 状态必须回 in_stock。
+    # 先取 itemId（删除后明细行进入 deleted 态不可再读属性），删除 + flush 后再重算，
+    # 否则真值查询仍能看到「待删的 project_items/contracts」而把明细错误留在 all_sold。
+    deleted_item_ids = [it.itemId for it in p.items if it.itemId]
     db.delete(p)  # 级联删除合同 + 明细（cascade delete-orphan）
     add_log(db, "project", name, "删除", f"删除项目 {code}（已回滚锁定与交付）",
             operator=operator, project_id=project_id)
+    db.flush()
+    _sync_rs_item_statuses(db, deleted_item_ids)
+    # ADR-041 补遗1（FLOW-20261022-B2）：SQLite 无 AUTOINCREMENT，项目 id 会被复用——
+    # 删除后把本项目全部日志的外键置空（日志文本/targetName 全部保留，审计不丢），
+    # 否则旧日志会挂到未来复用同一 id 的新项目「流转过程」里（实测已发生）。
+    # ⚠️ 执行时机：必须在本项目**所有**日志（含上面最后那条「删除」）写入之后——若把本 UPDATE
+    # 放在 db.delete(p) 之前，那条「删除」日志是在 UPDATE 之后 INSERT 的，会保留旧 projectId，
+    # 新项目复用同一 id 时仍会串台（本任务实测：置空 3 条、残留「删除」1 条，B 的流转过程里
+    # 出现「删除项目 SP-…」）；放在 commit 前 + db.flush() 后 → 全部置空。
+    # 副作用：这些日志对 viewer 变为不可见（Visibility.log_visible 遇 projectId IS NULL 过滤），
+    # 但项目已删除、viewer 本就无法到达，可接受。
+    # 事务性质（H8）不变：仍是同一事务，任一步失败整体回滚（UPDATE 与删除同事务）。
+    db.execute(
+        update(models.OpLog)
+        .where(models.OpLog.projectId == project_id)
+        .values(projectId=None)
+    )
     db.commit()
 
 
@@ -2620,6 +3098,15 @@ def _revert_outbound_inner(db: Session, outbound_id: int, reason: str,
         # 再交付安全性：合同交付分支只处理 locked/confirmed 明细（跳过 shipped），
         # 故重新「交付」合同时只会补交被撤销的这条明细，不会重复扣量。
         if restore_contract and it is not None and it.status == "shipped":
+            # REVERT-FIX-20261022（DEFECT-1）：**必须先 flush 再调 apply_item_lock**。
+            # WHY：上面刚刚改的 shippedQty / soldCount / soldAmount 还挂在 session 里没落库
+            # （session 为 autoflush=False），而 apply_item_lock 内部会 `db.refresh(a)`——
+            # refresh 会 expire 实例并重新读库，把「未 flush 的待写值」直接丢弃（不是延迟，
+            # 而是永久丢失），表现为撤销交付后 shippedQty 残留、销量/销售额不回退；
+            # 同时它的条件更新 `quantity-lockedQty-shippedQty>=q` 读到的也是库里的旧
+            # shippedQty（数量=1 的产品甚至会误判 400「可用数量不足」）。
+            # 因此先落库（同一事务内，不改变原子性），再做条件加锁，两处口径才一致。
+            db.flush()
             if it.locked and not eff_repeat:
                 # 交付时释放过锁定（仅 it.locked 为真才释放过）→ 反向重新加锁
                 apply_item_lock(db, it.assetId, it.qty, True, ob.code,
@@ -2627,6 +3114,9 @@ def _revert_outbound_inner(db: Session, outbound_id: int, reason: str,
                                 repeat_override=eff_repeat)
             it.status = "locked"
             it.shippedDate = ""
+            # RS-STATUS-20261022：明细回到 locked（仍被该合同占用）→ 状态重算后仍是 all_sold；
+            # 冗余重算的意义是把「撤销交付不会让明细变回可售」写成显式事实（防后续改动误置 in_stock）
+            _sync_rs_item_status(db, it.itemId)
             c = db.get(models.Contract, ob.contractId)
             if c is not None and c.status == "delivered":
                 # ADR-019（PRICING-20261020）：撤销交付回退目标从 active 改为 delivering——
@@ -2755,13 +3245,35 @@ def delete_entity(db: Session, entity_id: int, operator: str = "") -> None:
 # ============================================================
 # 产品交付物（ADR-024：模板体系下线，实例完全手动添加，不再惰性生成）
 # ============================================================
+DELIVERABLE_URL_MAX = 512
+
+
+def _normalize_deliverable_url(raw: str | None) -> str:
+    """ADR-044：交付物外链归一化与校验。
+
+    规则：允许空（=无链接）；否则必须 http:// 或 https:// 开头、长度 ≤512。
+    WHY 白名单：该字段会被渲染为可点击 <a>，javascript:/data: 等伪协议等于存储型 XSS 入口，
+    不能只靠前端校验（curl 可绕过）。
+    """
+    u = (raw or "").strip()
+    if not u:
+        return ""
+    low = u.lower()
+    if not (low.startswith("http://") or low.startswith("https://")):
+        raise HTTPException(400, "链接地址必须以 http:// 或 https:// 开头")
+    if len(u) > DELIVERABLE_URL_MAX:
+        raise HTTPException(400, f"链接地址过长（最多 {DELIVERABLE_URL_MAX} 字符）")
+    return u
+
+
 def add_asset_deliverable(db: Session, asset_id: int, data: schemas.AssetDeliverableInput) -> None:
     a = get_asset(db, asset_id)
     if a:
         a.deliverables.append(models.AssetDeliverable(
             asset_id=asset_id, name=data.name, category=data.category, required=data.required,
             note=data.note, version="V1.0", meta=data.note,
-            status="todo" if "验收" in data.name else "ready", updatedAt=today(),
+            status="todo" if "验收" in data.name else "ready",
+            url=_normalize_deliverable_url(data.url), updatedAt=today(),
         ))
         # WHY：此前遗漏 asset_id，导致前端产品详情「操作记录」按 l.assetId === assetId 过滤时
         # 看不到这条「新增交付物」记录；与 update/remove_asset_deliverable 对齐补上 assetId。
@@ -2773,6 +3285,11 @@ def update_asset_deliverable(db: Session, asset_id: int, item_id: int, patch: di
     d = db.get(models.AssetDeliverable, item_id)
     a = get_asset(db, asset_id)
     if d and d.asset_id == asset_id:
+        # ADR-044：外链先归一（strip + 协议白名单 + 长度），放在任何 setattr 之前——
+        # 非法值直接 400，不产生"改一半"的脏会话。exclude_unset 语义不变：
+        # 未传 url = 不动；传 ""/null = 清空（统一归一为空串）。
+        if "url" in patch:
+            patch["url"] = _normalize_deliverable_url(patch["url"])
         file_change = ""
         if "file" in patch:
             # ADR-024：单文件附件——空串/null 归一为 NULL（清空附件）
@@ -2781,7 +3298,7 @@ def update_asset_deliverable(db: Session, asset_id: int, item_id: int, patch: di
                 # 与产品文件字段同格式：散列名 → 原始名（如「附件: → 说明书.pdf」）
                 file_change = f"附件: {_arrow(_file_display_name(db, d.file or ""), new_file or "")}"
                 d.file = new_file
-        for k in ("name", "category", "required", "note", "version", "meta", "status"):
+        for k in ("name", "category", "required", "note", "version", "meta", "status", "url"):
             if k in patch:
                 setattr(d, k, patch[k])
         d.updatedAt = today()
@@ -2890,8 +3407,25 @@ def _resolve_cart_rs_item_soft(db: Session, asset: models.Asset, item_id: int | 
     return rs if (rs is not None and rs.assetId == asset.id) else None
 
 
-def _cart_add_inner(db: Session, data: schemas.CartItemInput, user_id: str = DEFAULT_USER) -> models.CartItem:
-    """加购核心（**不提交**，供 add_to_cart / add_to_cart_batch 复用，批量可收敛为单一事务）"""
+# ADR-042 §1：同键行处理策略白名单
+# - accumulate（默认，加购口径零变化）：同键行 qty 累加；
+# - replace（回填/upsert 口径）：同键行 qty/amount/服务期限**覆盖**为本次值，不新增行、不累加。
+CART_EXISTING_POLICIES = ("accumulate", "replace")
+
+
+def _cart_add_inner(db: Session, data: schemas.CartItemInput, user_id: str = DEFAULT_USER, *,
+                    existing_policy: str = "accumulate") -> models.CartItem:
+    """加购核心（**不提交**，供 add_to_cart / add_to_cart_batch / 回填复用，批量可收敛为单一事务）。
+
+    `existing_policy`（ADR-042 §1，关键字参数）：
+    - `"accumulate"`（默认）：命中同键行 → **累加** qty（`POST /cart` 加购语义，零变化）；
+    - `"replace"`：命中同键行 → **覆盖** qty / amount / serviceStart / serviceEnd（`updatedAt`
+      刷新），不新增行、不累加——供 `_refill_cart_from_project` 使用，使回填/重试天然幂等。
+    非法取值 → 400（内部函数同样防御）。可售/区间/客户校验对两种策略**同等生效**
+    （replace 的净增按「本次值 − 原值」计，避免覆盖式回填被存量行误判超可售）。
+    """
+    if existing_policy not in CART_EXISTING_POLICIES:
+        raise HTTPException(400, "非法的购物车重复行处理策略")
     a = get_asset(db, data.assetId)
     if not a:
         raise HTTPException(404, "产品不存在")
@@ -2913,6 +3447,10 @@ def _cart_add_inner(db: Session, data: schemas.CartItemInput, user_id: str = DEF
     #  - 明细行重复加购幂等合并（恒 1，不累加），净增 = 0（原口径 double-count，
     #    可售恰为 1 时重复加购同一明细会被误判「可用数量不足」）。
     delta = 0 if (rs is not None and cur > 0) else qty
+    if existing_policy == "replace":
+        # ADR-042 §1：覆盖语义下同键行的净增 = 本次值 − 原值（覆盖后总量 = 合计 − cur + qty），
+        # 否则「购物车已有 1 行 qty=1 + 回填 1 行 qty=1」会被误判为 2 > 可售 1 而拒回填
+        delta = qty - cur
     if rs is None or not rs.repeatSale:
         total_in_cart = sum(c.qty for c in _cart_list(db, user_id) if c.assetId == data.assetId)
         if not a.repeatSale and total_in_cart + delta > _avail(a):
@@ -2931,9 +3469,8 @@ def _cart_add_inner(db: Session, data: schemas.CartItemInput, user_id: str = DEF
         amount = float(amt) if amt is not None else None
     # ADR-020（PRICING-20261020）：服务期限校验（YYYY-MM-DD + start ≤ end，否则 400）
     service_start, service_end = _validate_service_period(data.serviceStart, data.serviceEnd)
-    # DISCOUNT-20261021/ADR-023：折扣率校验（0 < rate ≤ 1 否则 400；null=清空/无折扣）。
-    # 后端只存不算：不做金额回填（前端回填 amount 后一起提交，金额权威原则）
-    discount_rate = _validate_discount_rate(data.discountRate)
+    # NO-DISCOUNT-20261022 / ADR-039：入参 `data.discountRate` **容忍但忽略**（不校验、不 400、不落库）；
+    # 新行 discountRate 落 null，已有行的历史值保持原值不动（历史快照可查）
     q = select(models.CartItem).where(
         models.CartItem.userId == user_id,
         models.CartItem.assetId == data.assetId,
@@ -2945,22 +3482,30 @@ def _cart_add_inner(db: Session, data: schemas.CartItemInput, user_id: str = DEF
         q = q.where(models.CartItem.itemId == data.itemId)
     existing = db.execute(q).scalar_one_or_none()
     if existing:
-        # 明细行 qty 恒 1：重复加购幂等合并（不累加）；普通行累加
-        existing.qty = 1 if rs is not None else cur + qty
-        if amount is not None:
+        if existing_policy == "replace":
+            # ADR-042 §1：同键覆盖——qty/amount/服务期限一律取本次值（含 amount=None 的原价成交），
+            # 不新增行、不累加（重试不再翻倍）
+            existing.qty = qty
             existing.amount = amount
-        # ADR-020：服务期限（本次传了才覆盖，未传保持原值）
-        if service_start is not None or service_end is not None:
             existing.serviceStart, existing.serviceEnd = service_start, service_end
-        # DISCOUNT-20261021/ADR-023：折扣率（null=清空，与契约「null 允许=清空」同口径）
-        existing.discountRate = discount_rate
+        else:
+            # 明细行 qty 恒 1：重复加购幂等合并（不累加）；普通行累加
+            existing.qty = 1 if rs is not None else cur + qty
+            if amount is not None:
+                existing.amount = amount
+            # ADR-020：服务期限（本次传了才覆盖，未传保持原值）
+            if service_start is not None or service_end is not None:
+                existing.serviceStart, existing.serviceEnd = service_start, service_end
+        # NO-DISCOUNT-20261022 / ADR-039：**不动** existing.discountRate
+        #（历史快照保留，既不清空也不覆盖）
         existing.updatedAt = now_str()
     else:
         existing = models.CartItem(
             userId=user_id, assetId=data.assetId, customer=customer, qty=qty,
             amount=amount, itemId=data.itemId,
             serviceStart=service_start, serviceEnd=service_end,  # ADR-020：服务期限
-            discountRate=discount_rate,  # DISCOUNT-20261021/ADR-023：折扣率（null=无折扣）
+            # NO-DISCOUNT-20261022 / ADR-039：折扣率已下线，新行恒 null
+            discountRate=None,
             createdAt=now_str(), updatedAt=now_str(),
         )
         db.add(existing)
@@ -2981,21 +3526,20 @@ def add_to_cart(db: Session, data: schemas.CartItemInput, user_id: str = DEFAULT
 def patch_cart_item(db: Session, cart_id: int, customer: str, user_id: str = DEFAULT_USER,
                     amount=UNSET,
                     service_start=UNSET, service_end=UNSET,
-                    discount_rate=UNSET, viewer: bool = False) -> models.CartItem:
-    """修改购物车行级客户（ADR-007）；可选携带合同金额（ADR-008）、服务期限（ADR-020）
-    与折扣率（DISCOUNT-20261021/ADR-023）。
+                    viewer: bool = False) -> models.CartItem:
+    """修改购物车行级客户（ADR-007）；可选携带合同金额（ADR-008）、服务期限（ADR-020）。
 
     ADR-037 §3（FORMS-20261022）：`viewer`（生态人员）行金额只校验参考区间**下限**
     （上限放开），与 PUT /cart/{id} / checkout 复用同一校验函数。
 
     **PATCH 语义（CART-PATCH-20261021）**：任一字段「未传（UNSET）= 保持原值不改」，
-    显式传 null = 清空。修复「改客户时金额/服务期限/折扣被清空」。
+    显式传 null = 清空。修复「改客户时金额/服务期限被清空」。
 
     金额语义（ADR-018 §3，PRICING-20261020）：
     - unit / 遥感明细行：amount 传入即采信（过参考区间校验，超限 400）；显式 null = 清空；
     - amount 模式行：整数元权威（不传保持原值，结算时必填兜底不变）。
-    折扣率语义（ADR-023）：0 < rate ≤ 1 否则 400「折扣率须为 0 到 1 之间的正数」；
-    null=清空（无折扣，与契约「null 允许=清空」同口径）。后端只存不算，amount 校验完全不变。
+    折扣率（NO-DISCOUNT-20261022 / ADR-039）：**已下线**——入参 `discountRate` 由路由层
+    直接丢弃（不入参本函数），`cart_items.discountRate` 保持原值不动（历史快照，不覆盖不清空）。
     目标 (userId, assetId, customer) 已存在其它行时 400（避免静默合并产生歧义，前端可先删除原行）。"""
     c = db.get(models.CartItem, cart_id)
     if not c or c.userId != user_id:
@@ -3025,11 +3569,8 @@ def patch_cart_item(db: Session, cart_id: int, customer: str, user_id: str = DEF
             service_start if service_start is not UNSET and service_start is not None else c.serviceStart,
             service_end if service_end is not UNSET and service_end is not None else c.serviceEnd)
         c.serviceStart, c.serviceEnd = new_start, new_end
-    # DISCOUNT-20261021/ADR-023：折扣率（0 < rate ≤ 1 否则 400；null=清空/无折扣；未传保持原值）
-    if discount_rate is not UNSET:
-        c.discountRate = _validate_discount_rate(discount_rate)
-    if amount is not UNSET or service_start is not UNSET or service_end is not UNSET \
-            or discount_rate is not UNSET:
+    # NO-DISCOUNT-20261022 / ADR-039：折扣率不再读写（c.discountRate 保持原值不动）
+    if amount is not UNSET or service_start is not UNSET or service_end is not UNSET:
         c.updatedAt = now_str()
     new_customer = (customer or "").strip()
     if new_customer != (c.customer or ""):
@@ -3087,9 +3628,9 @@ def add_to_cart_batch(db: Session, data: schemas.CartBatchInput, user_id: str = 
             continue
         # 原子性修复：走不提交的 _cart_add_inner，整批末尾统一 commit——
         # 任一行硬 400（如 amount 模式金额校验）整体回滚，不再「加一半」
+        # NO-DISCOUNT-20261022 / ADR-039：批量加购同样不读 `it.discountRate`（忽略）
         _cart_add_inner(db, schemas.CartItemInput(assetId=it.assetId, qty=qty, customer=customer,
-                                                  amount=it.amount, itemId=it.itemId,
-                                                  discountRate=it.discountRate), user_id)  # DISCOUNT-20261021/ADR-023
+                                                  amount=it.amount, itemId=it.itemId), user_id)
         added += 1
     db.commit()
     return {
@@ -3102,14 +3643,13 @@ def add_to_cart_batch(db: Session, data: schemas.CartBatchInput, user_id: str = 
 def set_cart_qty(db: Session, cart_id: int, qty: int, user_id: str = DEFAULT_USER,
                  amount=UNSET,
                  service_start=UNSET, service_end=UNSET,
-                 discount_rate=UNSET, viewer: bool = False) -> models.CartItem:
-    """PUT /cart/{id}：改数量；可选携带合同金额（ADR-008）、服务期限（ADR-020）
-    与折扣率（DISCOUNT-20261021/ADR-023）。
+                 viewer: bool = False) -> models.CartItem:
+    """PUT /cart/{id}：改数量；可选携带合同金额（ADR-008）、服务期限（ADR-020）。
 
     ADR-037 §3（FORMS-20261022）：`viewer`（生态人员）行金额只校验参考区间**下限**
     （上限放开），与 checkout 权威链复用同一校验函数（`_check_discount_range`）。
-    viewer 行携带的历史 discountRate 忽略（不 400、不参与计算——后端只存不算，
-    amount 恒为权威；`_validate_discount_rate` 仅校验 0 < rate ≤ 1 格式，无一致性校验）。
+    NO-DISCOUNT-20261022 / ADR-039：入参 `discountRate` **已下线**——路由层不读取、本函数
+    无该入参；`cart_items.discountRate` 列保留且**保持原值不动**（历史快照，不清空不覆盖）。
 
     **PATCH 语义（CART-PATCH-20261021）**：任一字段「未传（UNSET）= 保持原值不改」，
     显式传 null = 清空；只有 qty 必传。此前「未传 amount 即清空」导致填金额后
@@ -3118,8 +3658,8 @@ def set_cart_qty(db: Session, cart_id: int, qty: int, user_id: str = DEFAULT_USE
     金额语义（ADR-018 §3，PRICING-20261020）：
     - unit / 遥感明细行：amount 传入即采信（过参考区间校验，超限 400）；显式 null = 清空（原价成交）；
     - amount 模式行：整数元权威（不传保持原值）。
-    折扣率语义（ADR-023）：0 < rate ≤ 1 否则 400「折扣率须为 0 到 1 之间的正数」；
-    null=清空（无折扣）。后端只存不算，amount 校验完全不变。
+    折扣率语义（NO-DISCOUNT-20261022 / ADR-039）：**已下线**——入参 `discountRate` 容忍但忽略
+    （不校验、不 400、不落库），`cart_items.discountRate` 保持原值不动。
     删除行仅走 DELETE /cart/{id}——PUT 语义不再兼作删除（qty<=0 直接 400，
     修复：此前 PUT 漏传 qty 会默认 0 → 静默删行，调用方极易误触发）。"""
     c = db.get(models.CartItem, cart_id)
@@ -3164,13 +3704,13 @@ def set_cart_qty(db: Session, cart_id: int, qty: int, user_id: str = DEFAULT_USE
             service_start if service_start is not UNSET and service_start is not None else c.serviceStart,
             service_end if service_end is not UNSET and service_end is not None else c.serviceEnd)
         c.serviceStart, c.serviceEnd = new_start, new_end
-    # DISCOUNT-20261021/ADR-023：折扣率（0 < rate ≤ 1 否则 400；null=清空/无折扣；未传保持原值）
-    # ADR-037 §2：viewer 行历史 discountRate 忽略（不 400、不参与计算，金额权威不变）
-    if discount_rate is not UNSET:
-        c.discountRate = _validate_discount_rate(discount_rate)
+    # NO-DISCOUNT-20261022 / ADR-039：折扣率不再读写——路由层不读 `data.discountRate`，
+    # 本函数不写 `c.discountRate`（存量值保持原值不动，历史快照可查；不做数据清洗）
     # CART-PATCH-20261021：仅「数量真的变化」且未传 amount、该行无折扣率时，清空手工折扣金额
     # （旧总量对新数量已失真；有折扣率的行由前端按 rate 重算并显式提交 amount）。
     # 服务期限/客户等不改数量的部分更新不再触发清空（修复用户反馈的金额被抹掉问题）
+    # 注：此处的 `c.discountRate is None` 读的是**存量历史列**（非本次入参）——
+    # ADR-039 明确「不改金额口径」，故该分支语义保持原样（存量带 rate 的行仍不清空金额）。
     if amount is UNSET and is_discount_row and c.qty != old_qty and c.discountRate is None:
         c.amount = None
     c.updatedAt = now_str()
@@ -3332,8 +3872,9 @@ def checkout(db: Session, data: schemas.CheckoutInput, user_id: str = DEFAULT_US
     取代 ADR-018 §3「留空=挂牌价成交」兜底（viewer 免填金额口径同步作废）；
     遥感明细行（itemId 非空）服务期限仍豁免（ADR-020：期数即服务时间）。
     ADR-037 §3（FORMS-20261022）：区间校验分角色——viewer（`viewer=True`）行金额
-    只校验参考区间下限（上限放开，加价成交允许）；editor/admin 双向不变；
-    viewer 行历史 discountRate 忽略（不 400、不参与计算，金额权威不变）。
+    只校验参考区间下限（上限放开，加价成交允许）；editor/admin 双向不变。
+    NO-DISCOUNT-20261022 / ADR-039：折扣率已下线——购物车行的历史 `discountRate`
+    **不读、不校验、不落库**（新 `project_items.discountRate` 恒 null，存量单历史值不动）。
     ADR-013：不再校验同主体（记录粒度=单资产，天然单主体；同客户多主体=多条记录并列）。
 
     BUG-10 / ADR-033 §1：可选 `requestId` 幂等——
@@ -3384,19 +3925,20 @@ def checkout(db: Session, data: schemas.CheckoutInput, user_id: str = DEFAULT_US
                 _validate_service_period(c.serviceStart, c.serviceEnd)
     if missing:
         raise HTTPException(400, "购物车存在必填缺项，请补齐后再结算：" + "；".join(missing))
-    # 按 (产品, 客户) 分组（保持购物车行序）；八元组
-    # (产品, 数量, 权威/折扣 amount, itemId, 行级客户, serviceStart, serviceEnd, discountRate)
+    # 按 (产品, 客户) 分组（保持购物车行序）；七元组
+    # (产品, 数量, 权威金额, itemId, 行级客户, serviceStart, serviceEnd)
     # 明细行 qty 恒 1（ADR-011）；ADR-022 后 amount 恒非空且为合法整数元（上方必填校验保证）
     # ADR-037 §3（FORMS-20261022）：区间校验分角色——viewer 只校验下限（上限放开），
     # editor/admin 双向；角色取当前登录用户（路由层传 viewer），与改价入口同函数
     enforce_max = not viewer
-    # ADR-018 §3（PRICING-20261020）：unit/遥感行折扣金额 checkout 时再过一次区间校验
+    # ADR-018 §3（PRICING-20261020）：unit/遥感行金额 checkout 时再过一次区间校验
     #（行更新时已校验，此处防绕过行更新接口直接改库/旧客户端）
-    # DISCOUNT-20261021/ADR-023：discountRate 原样透传落 project_items 快照（只写不改）
+    # NO-DISCOUNT-20261022 / ADR-039：**不再带 discountRate**（购物车列的历史值也不再透传；
+    # 新生成明细由 `_create_project_core` 统一写 null）
     # ADR-016（FIX-20261020-#3）：分组键由 assetId 单键升级为 (assetId, customer)——
     # 同产品多客户行不再被静默合并为一条记录（客户归属/金额串账），与前端预览口径一致
     groups: dict[tuple[int, str], list[tuple[models.Asset, int, Decimal, int | None, str,
-                                            str | None, str | None, float | None]]] = {}
+                                            str | None, str | None]]] = {}
     for c in cart:
         a = get_asset(db, c.assetId)
         customer = (c.customer or "").strip()
@@ -3407,7 +3949,7 @@ def checkout(db: Session, data: schemas.CheckoutInput, user_id: str = DEFAULT_US
             amt = _check_discount_range(a, 1, c.amount, unit=a.unit, rs=rs,
                                         enforce_max=enforce_max)
             groups.setdefault((c.assetId, customer), []).append(
-                (a, 1, amt, c.itemId, customer, c.serviceStart, c.serviceEnd, c.discountRate))
+                (a, 1, amt, c.itemId, customer, c.serviceStart, c.serviceEnd))
             continue
         if _is_amount_mode(a):
             amt = _validate_amount_yuan(c.amount)  # 整数元校验（必填校验已过，幂等兜底）
@@ -3416,14 +3958,14 @@ def checkout(db: Session, data: schemas.CheckoutInput, user_id: str = DEFAULT_US
             amt = _check_discount_range(a, c.qty, c.amount, unit=a.unit,
                                         enforce_max=enforce_max)
         groups.setdefault((c.assetId, customer), []).append(
-            (a, c.qty, amt, None, customer, c.serviceStart, c.serviceEnd, c.discountRate))
+            (a, c.qty, amt, None, customer, c.serviceStart, c.serviceEnd))
     # 每组（产品×客户）→ 一条销售记录（ADR-016：一资产一客户一记录，customer 取分组键）
     # 计价（明细行=明细 price 权威 / amount 模式=权威金额 / unit 模式 price×qty）
     contracts_in: list[schemas.ContractInput] = []
     for (_asset_id, _customer), rows in groups.items():
         items: list[schemas.ProjectItemInput] = []
         total = Decimal("0")
-        for a, qty, amt, item_id, _cust, s_start, s_end, d_rate in rows:
+        for a, qty, amt, item_id, _cust, s_start, s_end in rows:
             # ADR-022（REQUIRED-20261024）：amt 经上方必填校验恒非空（> 0 整数元）——
             # 「留空=原价成交」兜底已删除（unit 行 salePrice×qty / 遥感行明细 price 分支作废）
             price = _derived_price(amt, qty)  # 派生展示值（遥感明细行 qty 恒 1）
@@ -3433,7 +3975,7 @@ def checkout(db: Session, data: schemas.CheckoutInput, user_id: str = DEFAULT_US
                 assetId=a.id, qty=qty, price=price, amount=float(amount),
                 deliveryReq=data.deliveryReq, itemId=item_id,
                 serviceStart=s_start, serviceEnd=s_end,  # ADR-020：服务期限透传
-                discountRate=d_rate,  # DISCOUNT-20261021/ADR-023：折扣率快照透传
+                # NO-DISCOUNT-20261022 / ADR-039：不传 discountRate（_create_project_core 写 null）
             ))
         contracts_in.append(schemas.ContractInput(
             customer=_customer, items=items, contractAmount=float(total.quantize(CENT)), remark="",
@@ -3587,9 +4129,11 @@ def bootstrap(db: Session, user_id: str, user: "models.User | None" = None) -> d
     # 前端抽屉「已售次数」不再回退产品级 asset.soldCount。soldCount 由 `_rs_item_sold_counts`
     # **一条聚合查询**批量算出（与 `GET /assets/{id}/rs-items` 同一实现，避免 N+1 / 两套口径）。
     rs_sold = _rs_item_sold_counts(db)  # item_ids=None → 全表明细一次 GROUP BY
+    # RS-STATUS-20261022：`occupied` 派生字段已删除（ADR-038 Decision 3 起「是否可售」只认
+    # `status` 一个口径，避免 occupied / status / availableCount 三套语义并存）。
     rs_items_out = []
     for r in rs_items:
-        d = schemas.RsItemOut.model_validate(r).model_dump()
+        d = schemas.RsItemOut.model_validate(r).model_dump()  # 含 status（in_stock/all_sold）
         d["soldCount"] = rs_sold.get(r.id, 0)
         rs_items_out.append(schemas.RsItemOutWithSold.model_validate(d).model_dump())
 
@@ -3597,8 +4141,21 @@ def bootstrap(db: Session, user_id: str, user: "models.User | None" = None) -> d
     # 前端删除 types.ts::ENTITIES 常量后由 db.entities 提供下拉/简称映射）
     entities = list_entities(db)
 
+    # RS-STATUS-20261022（ADR-038 Decision 3 修订）：容器「可售数量」= `COUNT(status='in_stock')`
+    # （明细状态 in_stock=可售 / all_sold=已售罄，与外层产品状态同构）。只对容器
+    # （type == RS_DATA_TYPE）派生，非容器保持 None（前端继续用 quantity-lockedQty-shippedQty，
+    # 双口径不混）；聚合为全量 1 条查询、与 viewer 可见性无关（见 _rs_container_available_counts）。
+    # 注：GET /assets 列表接口**不动**（契约范围仅 bootstrap.assets）。
+    rs_available = _rs_container_available_counts(db, rs_items)
+    assets_out = []
+    for a in assets:
+        d = schemas.AssetOut.model_validate(a).model_dump()
+        if a.type == RS_DATA_TYPE:
+            d["availableCount"] = rs_available.get(a.id, 0)  # 无明细容器 = 0 份可售
+        assets_out.append(d)
+
     return {
-        "assets": [schemas.AssetOut.model_validate(a).model_dump() for a in assets],
+        "assets": assets_out,
         "rsItems": rs_items_out,
         "entities": [schemas.EntityOut.model_validate(e).model_dump() for e in entities],
         "projects": [schemas.ProjectOut.model_validate(p).model_dump() for p in projects],

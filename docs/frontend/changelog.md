@@ -2,6 +2,323 @@
 
 > 记录 core-holdings 前端（Vue3 + TS + Element Plus + Vite）的页面/组件/接口封装变更。
 
+## 2026-10-22 ｜ ADR-044 / DELIV-20261022：交付物外链 + 删除入口
+
+> 范围：`src/types.ts`、`src/api/index.ts`（仅 `addAssetDeliverable` 入参类型）、`src/views/assets/detail.vue`、`src/views/assets/list.vue` + 本日志。**未改**后端（`url` 列/白名单校验由并行任务 `DELIV-20261022-B` 提供）；未改删除端点、未动交付物其它既有交互（状态切换/上传附件/预览）；未新增色值/token（链接一律 `var(--primary-color)` = `#1769D4`）。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-22 | 新增 | **新增 / 编辑交付物支持外部链接**：新增对话框加「外部链接（选填）」，placeholder `https://…` + 12px 灰字说明；提交前 `checkDeliverableUrl` 校验（不合法 `ElMessage.warning` 并中断，不发请求）；详情弹窗内可编辑 + 「保存」→ `PUT /assets/{id}/deliverables/{id}` body `{url}`，成功 `链接已保存`；**清空后保存显式传 `url: ''`**（非省略字段）→ 后端归一清空 | `views/assets/detail.vue` L360-403（表单/`confirmDel`）、L416-425（草稿）、L444-465（`saveDelUrl`）、L1481-1489（新增对话框）、L1532-1558（弹窗链接区） | DELIV-20261022-F / ADR-044 §1-3 | 前后端同规则：仅 `http/https`、≤512 字符、`strip()`；错误文案与后端 400 逐字一致 |
+| 2026-10-22 | 新增 | **交付物详情弹窗新增「删除交付物」**：仅 `canWrite`（商务/管理员）渲染，位于弹窗底部**左侧**（`type="danger" plain`，站内既有危险样式）；`ElMessageBox.confirm`「删除交付物」+ 副作用说明（附件文件不再被引用，文件本身保留在文件库可由管理员清理）+ 确认按钮「删除」（`confirmButtonClass: 'el-button--danger'`）→ `removeAssetDeliverable(asset.id, d.id)` → 成功后 `viewingId = null` + 关弹窗 → `afterWrite()` 自动刷新 → `交付物已删除` | `views/assets/detail.vue` L467-501（`removeDeliverable`）、L1560-1565（footer 左侧按钮）、样式 L2034-2045 | DELIV-20261022-F / ADR-044 §4 | `DELETE` 端点与 `removeAssetDeliverable()` 早已存在，本批只补 UI 入口；取消/关闭不调接口；viewer 后端 403 兜底 |
+| 2026-10-22 | 新增 | **卡片与列表抽屉展示外链**：详情页交付物卡片行（名称下方，`TopRight` 图标 + URL 超长省略、`title` 显示完整地址、`@click.stop` 不触发行点击）与产品列表快览抽屉交付物区（附件行下方，**只读**，无编辑/删除）；一律 `target="_blank" rel="noopener noreferrer"`，hover 下划线 | `views/assets/detail.vue` L1226-1236 / 样式 L1977-2007；`views/assets/list.vue` L706-710 / 样式 L1071-1093 | DELIV-20261022-F / ADR-044 §5 | `url` 为空/`undefined` → 整条不渲染（不留空行、不显示 `-`） |
+| 2026-10-22 | 新增 | **`AssetDeliverable.url?: string` 类型 + `checkDeliverableUrl()` 校验函数**（全站唯一一处，导出 `src/types.ts`；`addAssetDeliverable` 入参补 `url?: string`）。单测 12 条断言全通过（空串/纯空格/`http`/`https`/大小写不敏感 → 合法；`javascript:`/`data:`/`ftp:`/无协议/513 字符 → 报错；512 字符边界 → 合法） | `src/types.ts` L668-669（`url?: string`）、L672-680（`checkDeliverableUrl`）；`src/api/index.ts` L736-746 | DELIV-20261022-F / ADR-044 §3 | `url` 可选 → 后端未热载时前端自动降级；Pydantic 默认忽略多余字段，无需探测 |
+
+> **备注**：未改后端（并行任务）；`url` 缺失自动降级；未 build、未 commit。验收：`npx vue-tsc -p tsconfig.app.json --noEmit` 退出码 0 零输出。
+
+## 2026-10-22 ｜ ADR-042 / REFILL-20261022：重新提交动线改造
+
+> 范围：`src/types.ts`、`src/api/index.ts`、`src/composables/useResubmitProject.ts`（**新建**）、`src/views/sales/projects/index.vue`、`src/views/sales/projects/detail.vue`、`src/views/cart/index.vue` + 本日志。**未改**后端、未改状态机、未动 `ADR-041` 的 `projectOutcome` 逻辑；未新增色值/token（警告条复用 `--warning-bg`/`#a86514`，与「建设中」同配色）。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-22 | 新增 | **购物车非空 → 三选弹窗**（合并 / 清空后回填 / 取消）：`ElMessageBox` 只有双按钮，改用 `h()` 渲染 `el-dialog`（等价组件内 `el-dialog`，挂 body 后卸载）；「清空后回填」为 danger 实心按钮 + 文案「清空后回填（不可撤销）」+ 弹窗内橙色警示「将清空你购物车中现有的 N 项商品，且不可撤销」；取消（含 X / ESC / 遮罩外点击不关闭策略）→ 不调接口、不跳转 | `composables/useResubmitProject.ts` L115-198（`WARN_BOX` / `askRefillMode`） | REFILL-20261022-F / ADR-042 §2 | 仅在「车非空 **且** 回填对象是当前登录者」时弹（归属按 `creator` 优先 / 回退 `rep` 预判，见 L53-66） |
+| 2026-10-22 | 修复 | **全部失败不再跳空车**：`restored === 0` → 停留原页 + `ElMessageBox.alert`「无法回填到购物车」，逐行列出 `rows[].reason`（可售不足的库存/锁定/出库数值与「已被其他订单占用」原文完整展示，`word-break` 换行不省略）；`rows` 缺失（后端未热载）回退 `skippedReasons`；`mode=replace` 且有 `cleared` 时补一句「已清空原购物车 N 项，本次无任何明细回填成功」 | `composables/useResubmitProject.ts` L87-113（`decideRefillOutcome`）、L200-228（`alertAllFailed`） | REFILL-20261022-F / ADR-042 §3 | 幂等短路 `alreadyRefilled` 判定**先于**「全失败」——merge 命中幂等时 `restored` 恒 0，否则会把「已在购物车」误报成失败（后端 `services.py` 幂等分支实测同此形态） |
+| 2026-10-22 | 新增 | **部分失败跳转并带可关闭警告条**：`restored > 0 && skipped > 0` → `ElMessage.warning` + `router.push({ path:'/cart', state:{ refillSkips } })`；购物车页 setup 读取并**立即** `history.replaceState(…, refillSkips: null)` 清除（保留 `back/forward/position` 等 router 键），顶部渲染 `.info-bar` 警示橙条「以下明细未能回填：」+ 每条一行 + 「知道了」；无内容整条不渲染 | `composables/useResubmitProject.ts` L239-250（`gotoCart`）；`views/cart/index.vue` L23-42（读取/清除）、L510-525（模板）、L907-948（`.refill-skip-*` 样式） | REFILL-20261022-F / ADR-042 §3 | 读后即清 → 刷新/后退再前进不重复出现；未新增 token |
+| 2026-10-22 | 修复 | **归属提示**：`res.owner.username !== currentUser.username` → `ElMessage.success('明细已回填至下单人 X（账号）的购物车，请通知该账号前往购物车改单')` + **停留原页不跳转**，且**不弹**三选框（问的是别人的车）；`owner` 缺失（后端未热载）→ 跳过归属判断按本人处理 | `composables/useResubmitProject.ts` L53-62（`isOwnCartTarget`）、L87-105（归属分支）、L274-278 | REFILL-20261022-F / ADR-042 §5 | 语义不变（订单归属仍在下单人），只把「回填到谁那儿」讲清楚 |
+| 2026-10-22 | 修复 | 幂等短路（`alreadyRefilled`）但本人购物车为空时自动改走 `mode=replace` 重填一次 —— 修「提示明细已在购物车却跳空车」（真实项目 `SP-2026102217033828` 可复现） | `composables/useResubmitProject.ts` L71-93（`shouldSelfHealRefill`）、L298-319（`resubmit` 自愈段） | ADR-042 补遗5 / REFILL-20261022-F2 | 仅重试一次；依赖服务端 replace 双守卫（仅本人 + 可行行 0 不清空）；未 build、未 commit |
+| 2026-10-22 | 修改 | **「无法回填到购物车」由 `MessageBox.alert` 文本列表改为 `el-dialog` 卡片式**：自定义头部（⚠ `WarningFilled` #A86514 + 标题 17px/600/#1A2E4E + 副标题 13px/#71829A「订单 X 共 N 行明细，均未能回填」）、逐行「产品名 × 数量 + 状态胶囊（`insufficient`→可售不足 danger / `no_asset`→产品缺失 info / `other`→无法回填 warning）+ `库存 N · 已锁定 N · 已出库 N · 本次需 N`」（按 `rows[].assetId` 从 `db.assets` 直读，查不到 asset 则整行不渲染 meta）、**仅当存在 `insufficient` 行**时显示底部橙色提示条（#FFF5E7/#A86514，圆角 8）、行多时 `max-height:300px` 内部滚动且头/尾固定、footer 单「知道了」主按钮右对齐；三选框视觉同源（同一套 `.rf-*` 头部/提示条/选项命名空间，功能与文案不变）；样式落 `global.css`（h() 渲染无法命中 scoped） | `types.ts` L437-468（新增 `RefillRowCode` + `assetId`/`code`/`need` 可选字段）；`composables/useResubmitProject.ts` L169-269（`buildFailRows`/`inferCode`/`rowMeta` 纯函数）、L279-296（`dialogHeader`）、L299-357（`askRefillMode` 头部对齐）、L371-470（`showRefillFailed`）；`styles/global.css` L780-936（`.rf-*` 共 20 个类） | REFILL-20261022-F3 | 纯展示重构，`decideRefillOutcome` 分支优先级一字未动；`code/assetId/need` 缺失自动降级（reason 关键字仅作降级猜测）；未新增色值 token、未新增依赖、未用 `dangerouslyUseHTMLString`；未 build、未 commit |
+| 2026-10-22 | 重构 | **两处调用点收敛到 `useResubmitProject()`**（列表页 `handleResubmit` / 详情页 `handleResubmit` 的「提示文案 + `router.push('/cart')`」内联逻辑删除，页面只保留行级 loading 与入口判断）；`types.ts` 新增 `RefillMode`/`RefillResult`（新字段全部 optional），`refillProjectCart(id, mode='merge')` 带 `?mode=`，`RefillCartResult` 降级为 `RefillResult` 别名（保留旧引用） | `api/index.ts` L39（import）、L549-577；`types.ts` L432-475；`projects/index.vue` L31-34、L136-156；`projects/detail.vue` L27-32、L104-126 | REFILL-20261022-F / ADR-042 §1/§2 | **纯前端 + 依赖后端加性字段，缺失自动降级；未 build、未 commit** |
+| 2026-10-22 | 修复 | **「归属提示」不再掩盖失败**：分支顺序改为 幂等 → 全失败 → 部分/成功后再判归属（原顺序会把 `restored=0` 报成"已回填至他人购物车"）：`decideRefillOutcome` 先算 `isOthers`/`ownerName`，`alreadyRefilled` 短路后立刻判 `restored===0` → `alert-all-failed`（带 `ownerName` 供副标题注明「（回填目标：X）」），`restored>0` 才判归属；`push-already` 与 `alert-all-failed` 类型新增可选 `ownerName`，调用侧「他人车已在购物车」改为只提示**不跳转**（`/cart` 只会是自己的空车），`notify-owner` 部分成功时 message 追加「（另有 N 行未能回填）」 | `composables/useResubmitProject.ts` L56-63（`RefillOutcome` 类型）、L124-169（`decideRefillOutcome`）、L408-422（`showRefillFailed` 副标题）、L574-582（`push-already` 不跳转） | ADR-042 补遗6 / REFILL-20261022-F4 | 纯前端；未改 `shouldSelfHealRefill`；未 build、未 commit |
+| 2026-10-22 | 修改 | **「重新提交」入口按角色收敛为 `isAdmin \|\| isViewer`，商务（editor）不再渲染**（原 `canWrite \|\| isViewer` 对 editor 为真）：详情页头部按钮 + 列表页行内按钮的 `v-if` 同改，商务视角**完全无入口**（含禁用态，与站内"商务不可用功能直接不渲染"口径一致）；`canWrite` import 保留（两文件仍有 10/11 处其它用途）；页面注释「（或商务/管理员）」同步改为「（或管理员）」 | `views/sales/projects/detail.vue` L389-400；`views/sales/projects/index.vue` L554-566（`grep handleResubmit` 确认列表页仅此 1 处入口，抽屉底部无该按钮） | ADR-043 / REFILL-20261022-F4 | 纯前端；未改 `shouldSelfHealRefill`；未 build、未 commit（配合后端 403） |
+| 2026-10-22 | 重构 | 清理 4 条 TS6133 未使用绑定（`SalesOrderDialog.vue` 的 `ref`/`rsItemName`、`assets/detail.vue` 与 `assets/list.vue` 的 `refresh` import），`vue-tsc -p tsconfig.app.json` 基线归零 | `components/SalesOrderDialog.vue` L15/L22（import 行）；`views/assets/detail.vue` L71（import 行）；`views/assets/list.vue` L41（import 行） | LINT-20261022 | 纯清理，无逻辑变更；未 build、未 commit |
+
+**验证（实跑）**
+
+| 检查项 | 命令 | 结果 |
+|---|---|---|
+| 类型检查 | `npx vue-tsc --noEmit` | 退出码 **0**；另用 `-p tsconfig.app.json` 实查源码，仅 4 条既有 `TS6133`（`SalesOrderDialog.vue`、`assets/detail.vue`、`assets/list.vue`，均为他批次文件），本次 6 个文件 0 错误 |
+| 调用点收敛 | `grep -rn "refillProjectCart" frontend/src` | 定义 1 处（`api/index.ts:572`）+ 调用 1 处（`composables/useResubmitProject.ts:258`）；两个页面**无内联调用残留** |
+| 跨页传参 | `grep -rn "refillSkips" frontend/src` | 写入 1 处（composable L246）+ 购物车页读取/清除（L34/L36） |
+| 结果分支 | `node /tmp/refill-outcome.test.mjs` | 5 个必测用例 + 3 个降级用例 + 保真校验共 10 项全通过，退出码 0 |
+| 自愈判定（F2） | `node /tmp/refill-selfheal.test.mjs` | 6 个必测用例 + 4 个补充用例（含「自愈后 `restored===0` → 全失败」与源文件保真校验）全通过，退出码 0 |
+| 自愈调用点唯一（F2） | `grep -rn "shouldSelfHealRefill" frontend/src` | 定义 1 处（`composables/useResubmitProject.ts:87`）+ 调用 1 处（同文件 `:304`） |
+
+## 2026-10-22 ｜ ADR-041 / FLOW-20261022：终止态细分 + 抽屉流转过程
+
+> 范围：仅 `frontend/src/types.ts`、`frontend/src/views/sales/projects/index.vue`、`frontend/src/views/sales/projects/detail.vue` + 本日志。**未改**后端、`api/index.ts`、`PROJECT_STATUS` 枚举、筛选下拉、任何按钮可用性判据（`canEditProject`/`canDrawerDeliver`/`isUndeletable`/`canWithdrawRow` 等继续用真实 `status`）；未新增端点/字段（后端 `LogOut.projectId` 属并行任务 FLOW-20261022-B 的加性字段）；未新增色值/token（`.tl-reason` 复用 `--danger-color` + `--el-color-danger-light-9`）；未 `build`、未起/停 dev server、未 commit。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-22 | 修改 | **撤销 / 驳回 / 普通终止由统一「已终止」拆成「已撤销 / 已驳回 / 已终止」**（⚠️ 仅展示层，`Project.status` 仍只有 `terminated`）：判定链 ①项目日志 `action = 撤销订单 / 驳回订单`（按 `projectId` 精确匹配）→ ②无日志的存量单回退 `contracts.remark` 前缀（`撤销：` / `驳回：`）→ ③兜底「已终止」 | `types.ts` L300-330（`ProjectOutcome`/`PROJECT_OUTCOME`/`projectOutcome`）；`projects/index.vue` L455-459（列表「项目状态」列）、L600-604（快览抽屉头部 tag）；`projects/detail.vue` L323-332（详情页头部 tag） | FLOW-20261022-F / ADR-041 §1、§3 | 筛选下拉仍 `PROJECT_STATUS` 5 项（`terminated` = 含撤销/驳回），**未**把 `PROJECT_OUTCOME` 塞进筛选（否则筛「已撤销」会漏数据）；`tagInfo(PROJECT_STATUS, …)` 仍用于合同卡片状态与筛选选项 |
+| 2026-10-22 | 新增 | **快览抽屉新增「流转过程」时间线**（「销售记录清单」之后、抽屉最后一块）：数据源 `db.logs` 按 `projectId` 过滤（`time` + `id` 升序，先发生在前），每条 = `time · 操作人` + `action`（`el-timeline-item` 的 `type` 色点：撤销/驳回 `danger`、确认下单 `success`、新增项目/重新提交 `primary`、其余默认灰；`重新提交（回填购物车）` 按前缀匹配，见 `services.py:1497`）+ `detail`；撤销/驳回事件下方单独一行高亮「原因：…」（日志 detail 提取 → 合同 `remark` 兜底 → 「（未填写）」） | `projects/index.vue` L258-290（`dLogs` / `flowDotType` / `isOutcomeEvent`）、L676-697（模板）、L998-1023（`.dr-timeline` / `.tl-action` / `.tl-detail` / `.tl-reason`） | FLOW-20261022-F / ADR-041 §2 | 无日志 → `el-empty`「暂无流转记录（存量项目无日志）」；**未**给时间线加 `max-height`（抽屉自身可滚，避免双层滚动）；抽屉 `size="640px"` 不变；未新增端点/未加分页（`bootstrap.logs` 全量下发记为既有技术债） |
+| 2026-10-22 | 新增 | `OpLog.projectId?: number \| null`（后端 `LogOut` 加性字段，对齐 `assetId` 做法）+ 原因提取纯函数 `outcomeReason()`（撤销 `原因：X；` / 驳回 `订单已驳回：X（`，兜底合同 `remark` 的 `撤销：/驳回：` 后缀） | `types.ts` L547-548（`projectId`）、L332-360（`outcomeReason`） | FLOW-20261022-F | 不用 `l.projectId!` 断言；`projectId` 全缺失时自动降级（见下「验证」B 组） |
+
+> 实测调整（以库为准，非拍脑袋）：`outcomeReason` 的**取数范围**从「项目全部日志」收紧到「成因事件日志（`action ∈ 撤销订单/驳回订单`）」。原因：`curl /api/bootstrap` 实测 project 1 撤销时，各合同先落「销售记录状态变更」日志，detail 为 `…终止：释放锁定 1 项，撤销交付 0 条，原因：撤销：撤销测试`；若对项目全部日志 join 后匹配 `/原因：([^；\n]+)/`，会先命中这条并展示成 **「撤销：撤销测试」**（前缀重复）。收紧后得 **「撤销测试」**，与 ADR-041 §2「撤销事件 / 驳回事件」口径一致。正则本身未改（对库内真实文案全部命中，见验证表）。
+
+**验证（实跑）**
+
+| 检查项 | 命令 | 结果 |
+|---|---|---|
+| 类型检查 | `npx vue-tsc --noEmit` | 退出码 **0**，无错误 |
+| SFC 模板编译 | `@vue/compiler-sfc` parse + compileTemplate（2 文件） | 均 `template errors: none` |
+| 定义/消费收敛 | `grep -rn "projectOutcome\|PROJECT_OUTCOME" frontend/src` | 定义 1 处（`types.ts:317`）+ 3 处消费（列表 L457、抽屉 L602、详情页 L327） |
+| 筛选未被污染 | `grep -n "PROJECT_STATUS" projects/index.vue` | 仍有 L404 筛选下拉 + L651-652 合同卡片 tag |
+| 纯函数单测 | `node /tmp/adr041_outcome_test.mjs`（逻辑从 `types.ts` 原样摘出） | **12/12 passed**：active→进行中、撤销日志→已撤销、驳回日志→已驳回、remark「驳回：的」→已驳回、无日志无 remark→已终止、降级（projectId 全 undefined）→remark 兜底正确、两条真实文案分别提取「撤销测试」/「的」 |
+| 真实快照链路 | `node /tmp/adr041_pipeline_check.mjs`（`curl /api/bootstrap` 快照） | 正常态：project 1「已撤销(info)」5 条流转/原因「撤销测试」，project 2「已驳回(danger)」8 条流转/原因「的」；降级态（`projectId` 全置 undefined）：空态 + 仍正确区分「已撤销/已驳回」（走 remark） |
+
+### 2026-10-22 ｜ FLOW-20261022-F2：修 id 复用串台 + 存量日志兜底（ADR-041 补遗 1/2/3）
+
+> 范围：仅 `frontend/src/views/sales/projects/index.vue`（`dLogs` computed + 新增私有纯函数 `legacyMatch`）+ 本日志；**未动** `types.ts`（`projectOutcome`/`outcomeReason` 已定稿）、`detail.vue`、`api/index.ts`、后端；`legacyMatch` 只在 `dLogs` 内使用，**未**扩散到 `projectOutcome`（终止细分仍按 ADR §1 判定链，remark 兜底已在）。纯展示；后端 `delete_project` 置 NULL 由另一任务负责；未 build、未 commit、未起停 dev server。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-22 | 修复 | **流转过程混入已删除项目日志（SQLite id 复用）** → 加 **t0 守卫**：以本项目自身 `action='新增项目'` 日志的 `time` 为起点，丢弃更早的日志（存量单无该日志则不设起点）。实测 project id=2（`SP-2026102216581487`，16:58 创建）原混入旧 id=2（11:03/13:56）的 5 条日志（含「删除项目 SP-2026102115254537」），条目 **8 → 3** | `projects/index.vue` `dLogs`（L277-284） | FLOW-20261022-F2 / ADR-041 补遗1 | 前端兜底，不改表结构；后端 `delete_project` 把该项目日志 `projectId` 置 NULL 属另一任务 |
+| 2026-10-22 | 修改 | **流转过程取数限定 `target='project'`**（`add_log` 对 `target in ('project','outbound')` 都写 `projectId`）：交付单日志不并入，交付信息已由「销售记录状态变更」覆盖，并入会重复 | `projects/index.vue` `dLogs`（L277-278）、模板注释 L690 | FLOW-20261022-F2 / ADR-041 补遗2 | 可逆；若后续要「交付单级」明细另开条目 |
+| 2026-10-22 | 修复 | **存量项目日志 `projectId` 为 NULL → 时间线空态** → 按项目 `code`（`SP-` 全局唯一）兜底匹配：新增 `legacyMatch()`，**有 `projectId` 的日志绝不走文本兜底**，`p.code` 为空/异常直接 `false`（否则 `''.includes('')` 恒真）；**不按 `targetName`（项目名）匹配**（重名/改名会串台） | `projects/index.vue` `legacyMatch`（L259-265）、`dLogs`（L277-278） | FLOW-20261022-F2 / ADR-041 补遗3 | 实测快照 `projectId=null 且 target=project` 共 307 条，均不含现存 3 个项目 code → 真实数据下无双重计入 |
+
+## 2026-10-22 ｜ 修复：CLIPBOARD-20261022（「复制产品编号」在非安全上下文下降级）
+
+> 范围：仅 `frontend/src/views/assets/detail.vue`（`copyCode()` 重写 + 新增同文件私有 `copyByExecCommand()`）+ 本日志；**未新建工具模块**（`grep -rn "navigator.clipboard" frontend/src` 确认全仓仅本文件 1 处调用）；未改其它「复制」入口（`grep -rn "clipboard\|execCommand" frontend/src` 除本文件外 **0 命中**）；**未改后端**、未新增依赖、未改样式；未 `build`、未起/停 dev server、未 commit。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-22 | 修复 | **『复制产品编号』在 http+局域网（非安全上下文）下永远复制失败** → `copyCode()` 三级降级（Clipboard API → `execCommand('copy')` → 弹窗展示） | src/views/assets/detail.vue（L192-219 `copyCode()` 重写：`navigator.clipboard` 存在性判断 + `writeText` 失败继续降级；L221-256 新增 `copyByExecCommand()`：textarea 移出视口 + `select()` + `setSelectionRange` + `execCommand('copy')`，移除与焦点归还放 `finally`） | CLIPBOARD-20261022 / BUG-LAN-20261022 | 与 crypto.randomUUID 同类 secure-context 缺陷；非致命（不崩溃）但体验退化；未改后端，未 build、未 commit |
+
+## 2026-10-22 ｜ 修改：PROJNAME-20261022（购物车下单弹窗「项目名称」取消默认填充）
+
+> 范围：仅 `frontend/src/components/SalesOrderDialog.vue` + 本日志；**未改后端**（`services.py:3723` 已有 `name=data.projectName or f"销售项目-{today()}"` 兜底，`checkout` 链路 `ProjectInput.name = data.projectName`，L3549 无需改）；未改 `views/cart/index.vue`（**除 811 行过期注释同步外**）、未改 `views/sales/projects/create.vue`；未新增字段、未改布局/样式、未加 `autofocus`；未 `build`、未起/停 dev server、未 commit。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-22 | 修改 | 购物车下单弹窗「项目名称」取消默认填充「采购订单」→ **默认留空**、placeholder 改「请填写项目名称」，必填校验保留（防止项目名千篇一律） | src/components/SalesOrderDialog.vue（L91-92 注释+`form.projectName = ''`、L192 placeholder、L107 注释改为必填校验说明）、src/views/cart/index.vue:811（注释同步：删「默认采购订单」表述） | PROJNAME-20261022 | 前端单点改动；后端 `projectName or 销售项目-{date}` 兜底不变，未 build、未 commit |
+
+## 2026-10-22 ｜ 修复：BUG-LAN-20261022（`crypto.randomUUID is not a function` → 新增 `genRequestId()` 三级降级）
+
+> 范围：仅 `frontend/src/api/index.ts`（新增导出 `genRequestId()`）+ `frontend/src/views/cart/index.vue`（L16 import / L454-455 调用点）+ 本日志 + `docs/qa/bug-tracker.md`；**未改后端**（后端 `requestId` 仅校验 `len ≤ 64`，无格式要求，`services.py:3624-3626`）；未改幂等语义；未 `build`、未 commit、未起/停 dev server。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-22 | 修复 | **下单报错 `crypto.randomUUID is not a function`** —— secure-context-only API 在局域网 http 下不存在 → 新增 `genRequestId()` 三级降级（randomUUID → getRandomValues 手工 v4 → Math.random），购物车结算改用它 | src/api/index.ts（新增 990-1021 `genRequestId()`）、src/views/cart/index.vue（L16 import 追加 `genRequestId`、L454-455 调用点替换 `crypto.randomUUID()`） | BUG-LAN-20261022 / ADR-033 | **致命**：局域网访问时下单 100% 失败，localhost 不复现；未改后端幂等语义，未 build、未 commit |
+
+### 一、改动明细（行号级）
+
+| # | 文件:行 | 改前 | 改后 |
+|---|---|---|---|
+| 1 | src/api/index.ts:990-1022（新增） | 无 | `export function genRequestId(): string`（JSDoc 记录 secure-context-only 根因 + 三级降级链；`crypto.randomUUID` 调用包 `try/catch`，异常继续降级；`bytes[6] = (b & 0x0f) \| 0x40` 打 v4 版本位、`bytes[8] = (b & 0x3f) \| 0x80` 打 variant 10xx） |
+| 2 | src/views/cart/index.vue:16 | `import { checkoutCart, clearCart, db, getAsset, … } from '@/api'` | 同一 import 追加 `genRequestId`（保持原有字母序） |
+| 3 | src/views/cart/index.vue:454 | `if (!checkoutRequestId.value) checkoutRequestId.value = crypto.randomUUID()` | L454 新增注释 `BUG-LAN-20261022：改用 genRequestId()——crypto.randomUUID 在局域网 http 下不存在，会导致下单 TypeError`；L455 `… = genRequestId()` |
+
+### 二、验证结果（实跑，非静态走查）
+
+| 检查项 | 命令 | 结果 |
+|---|---|---|
+| 降级链正确性 | `node /tmp/verify-genrequestid.mjs`（临时脚本，算法从 `api/index.ts` 原样复制，带分支命中计数探针） | 场景 0（randomUUID 可用）/ A（仅 getRandomValues）/ B（无 crypto→Math.random）/ C（randomUUID 抛错）**各 1000 次**：全部匹配 UUIDv4 正则、长度 36、1000 内零重复、`len ≤ 64`，分支命中计数与预期逐项一致，退出码 0 |
+| 类型检查 | `npx vue-tsc --noEmit` | 退出码 **0**，无错误 |
+| 调用点收敛 | `grep -rn "randomUUID" frontend/src` | 仅 `api/index.ts`（JSDoc 2 处 + `genRequestId` 内 1 处）与 `cart/index.vue:454` 注释；**无任何直接调用点残留** |
+| 定义/调用 | `grep -n "genRequestId" …` | 定义 1 处（api/index.ts:1002）+ import 1 处 + 调用 1 处（cart/index.vue:455） |
+| dev server | `curl -s -o /dev/null -w '%{http_code}' http://localhost:5173/` | **200**；`/src/views/cart/index.vue` 编译产物已含 `genRequestId()` 且 import 带 `?t=1792659209338` 时间戳（HMR 已热更，进程自 9 天前未重启） |
+
+## 2026-10-22 ｜ FT-20261022-F：购物车小计金额遮挡修复 + 表头统一居中
+
+> 范围：仅 `frontend/src/views/cart/index.vue` + 本日志；未改后端、`api/`、`types.ts`、`global.css`，未新增色值/token，未改任何交互与提交链路（金额/数量/期限一律未碰），未 `build`、未起 dev server、未 commit。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-22 | 修复 | **小计列金额被裁切/压边**：小计列 `width` 110 → **150**；`.cart-subtotal` 补 `white-space: nowrap`（字号、`formatMoney` 均未改）。量化依据：`formatMoney` 最长输出 17 字符（`¥1,000,000,000.00`），13px `tabular-nums` 下内容宽 ≈119px，EP `.el-table .cell` 左右 padding 12×2 → 需 ≈143px；原 110px 可用仅 ≈86px（110−24），右对齐时左侧被 `.cell` 的 `overflow:hidden` 裁掉。150px 可用 126px，余量 ≈7px | src/views/cart/index.vue（小计列 743-754，`.cart-subtotal` 1114-1121） | FT-20261022-F | 纯展示；列宽合计 1376 → **1416px**（+40），超 1440 屏宽内容区（≈1150px）本就横滚，未新增横滚场景 |
+| 2026-10-22 | 修改 | **购物车表格表头统一水平居中**：8 列全部显式 `header-align="center"`（产品名称/客户/销售单价/数量/销售金额（元）/服务期限/小计/操作），删除原销售单价、小计两列的 `header-align="right"`；**数据单元格 `align` 全部不变**（单价/小计仍 right，产品名称/客户仍 left）。自定义 `#header` 插槽（客户/销售金额红星、服务期限 tooltip）为内联 span，`th.is-center` 的 `text-align:center` 已生效，**未使用兜底 CSS** | src/views/cart/index.vue（527/558/586/616/659/703/754/768） | FT-20261022-F | 纯展示，未改逻辑/接口，未 build、未 commit |
+
+## 2026-10-22 ｜ UI-CLEANUP-20261022：移除各页面浅蓝说明条
+
+> 来源：用户要求「每个页面的这个文案描述都去除，包括抽屉页的」。范围：仅 `frontend/src` 的 7 个 `.vue`（`views/assets/list.vue`、`views/assets/compute.vue`、`views/assets/detail.vue`、`views/sales/projects/index.vue`、`views/sales/outbound/index.vue`、`views/settings/entities.vue`、`views/settings/users.vue`）+ 本日志；**未改**后端、`api/`、`types.ts`、`styles/global.css`；未新增样式/token；未 `build`、未起 dev server、未 commit。页面骨架由「page-head → info-bar → 白卡」变为「page-head → 白卡」，未补 padding/margin。
+
+### 一、删除清单（9 处，纯展示删除）
+
+| # | 文件 | 原行号 | 删除内容摘要 | 是否为整块（含注释行） |
+|---|---|---|---|---|
+| 1 | src/views/assets/list.vue | 394-398（含 394 注释「业务规则提示条」） | `{{ boardMeta.rule }}`（产品台账四板块业务规则条） | 是 |
+| 2 | src/views/assets/compute.vue | 29-33（含 29 注释） | 算力服务板块「功能建设中…后续将支持资源池/可售算力/交付开通」长说明 | 是 |
+| 3 | src/views/sales/projects/index.vue | 352-356（含 352 注释） | 「下单→待审核→交付→终止」全流程说明 | 是 |
+| 4 | src/views/sales/outbound/index.vue | 266-270（含 266 注释） | 「撤销交付必须填写原因…审计记录不可删除」 | 是 |
+| 5 | src/views/settings/entities.vue | 129-134（含 129 注释「权限/行为说明」） | 「主体改名不回写存量产品、被引用不可删」 | 是 |
+| 6 | src/views/settings/users.vue | 276-281（含 276 注释「权限说明」） | 三角色（管理员/商务/生态）权限说明 | 是 |
+| 7 | src/views/assets/detail.vue | 807-810 | `v-if="isWipBoard()"` 算力板块建设中（居中提示条） | 是 |
+| 8 | src/views/assets/list.vue | 572-576（含 572 注释「可重复售卖说明」） | 抽屉 `.dr-notice`「可重复售卖：重复售卖不扣减原始数据量，按售卖次数与金额累计。」 | 是 |
+| 9 | src/views/assets/list.vue | 663-666 | 抽屉 `.dr-rule` `{{ boardMeta.rule }}`（与页面级同一 rule 重复出现） | 是 |
+
+### 二、连带清理（死代码）
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-22 | 删除 | **`boardMeta` computed 移除 `rule` 字段**（4 板块各 1 处 + default `rule: ''`），`desc` 保留（仍被 page-head `.desc` 消费）；注释「各板块的说明文案与业务规则提示」→「各板块的说明文案」 | src/views/assets/list.vue（原 344-370 → 现 339-360） | UI-CLEANUP-20261022 | 删除后 `grep -rn "boardMeta.rule" frontend/src` = 0 命中 |
+| 2026-10-22 | 删除 | **抽屉样式块 `.asset-drawer .dr-notice`（含子选择器 `.el-icon`）+ 注释「可重复售卖说明条」**（原 953-970） | src/views/assets/list.vue | UI-CLEANUP-20261022 | 有独立定义，已删；`grep dr-notice` = 0 |
+| 2026-10-22 | 删除 | **抽屉样式块 `.asset-drawer .dr-rule`（含子选择器 `.el-icon`）+ 注释「该类产品业务规则提示」**（原 1021-1036） | src/views/assets/list.vue | UI-CLEANUP-20261022 | 有独立定义，已删；`grep dr-rule` = 0 |
+| 2026-10-22 | 删除 | **失效 `InfoFilled` import（4 文件）**：list.vue（唯一使用点 396/574/664 全删 → 归零）、compute.vue（仅 31 一处）、users.vue（仅 278 一处）、entities.vue（仅 131 一处）、projects/index.vue（仅 354 一处） | src/views/assets/list.vue:10、assets/compute.vue:8、settings/users.vue:11、settings/entities.vue:15、sales/projects/index.vue:16 | UI-CLEANUP-20261022 | 逐个文件 grep 确认后删除，未批量；`InfoFilled` import 共删 5 文件 |
+| 2026-10-22 | 保留 | **`InfoFilled` import 保留 2 文件**：outbound/index.vue（L375 补录对话框仍用）、assets/detail.vue（L886 `info-bar soft` + L1370 版本不可覆盖提示仍用） | — | UI-CLEANUP-20261022 | — |
+| 2026-10-22 | 保留 | **`isWipBoard()` 函数保留**：删 L807 后仍有 2 处调用（L779 顶部操作区 `v-if="!isWipBoard()"`、L1059 表单禁用），属业务语义，不删 | src/views/assets/detail.vue:173 | UI-CLEANUP-20261022 | — |
+| 2026-10-22 | 保留 | **`styles/global.css` 的 `.info-bar` / `.info-bar .el-icon`（L254-270）保留** | src/styles/global.css | UI-CLEANUP-20261022 | 仍有弹窗/表单/空态在用，见下表 |
+| 2026-10-22 | 删除 | 产品详情页『基础信息』页签内说明条（产品基础信息登记后生成；修改关键字段将记录操作日志） | src/views/assets/detail.vue（原 885-888） | UI-CLEANUP-20261022 / FT-20261022-E | 纯展示删除；同批确认保留 create.vue 包量计价指引与 projects/detail.vue 撤销留痕条，未 build、未 commit；`detail.vue` 内 `.info-bar.soft` 唯一使用点随删 → 死样式同步移除（现 `grep info-bar` 仅剩 L1366 版本「被引用不可覆盖」，`InfoFilled` import 因 L1367 仍在用而保留） |
+
+### 三、保留的 6 处弹窗/表单提示及理由（一处未动）
+
+| # | 文件:行 | 内容 | 保留理由 |
+|---|---|---|---|
+| 1 | src/views/sales/outbound/index.vue:374 | 补录对话框内 `.info-bar` | 弹窗内操作说明，缺失会让补录口径不明 |
+| 2 | src/views/assets/create.vue:303 | 遥感容器「保存后请维护明细」 | 表单内填写指引，删了会漏维护可售明细 |
+| 3 | src/views/assets/detail.vue:1369 | 版本「被引用不可覆盖」 | 弹窗内**破坏性操作**警告 |
+| 4 | src/components/RsItemPicker.vue:163 | 空态「请先维护明细」 | 空态引导，删了选择器空屏无解释 |
+| 5 | src/components/RsItemPicker.vue:170 | 勾选规则 + 售罄置灰 | 选择规则，删了无法理解为何置灰 |
+| 6 | src/components/WithdrawProjectDialog.vue:65 | 撤销后果（终止/释放/回填购物车） | **破坏性操作**后果告知 |
+
+> 备注：纯展示删除，未改逻辑/权限/接口，未 build、未 commit。每个删除点留 1 行 `ADR-041/UI-CLEANUP-20261022` 注释（list.vue 内 4 处删除只留 1 行总注于模板处，样式删除不另注）。同批次另发现 3 处未在删除/保留清单内的 `.info-bar`（`assets/create.vue:366` `.info-bar.soft`、`assets/detail.vue:885` `.info-bar.soft`、`sales/projects/detail.vue:411` `.revoked-bar`），按「只删清单内 9 处」的约束**未动**，待确认。
+
+## 2026-10-22 ｜ 删除/修改：ADR-040 销售项目删除入口收敛至「更多▾」（仅 admin）+ 产品列表移除「编辑」
+
+> 来源：`docs/adr/ADR-040.md`（Accepted 2026-10-22，方案 B）。
+> 范围：仅 `frontend/src`（`views/assets/list.vue`、`views/sales/projects/index.vue`）+ 本日志；未改后端、未改 `api/index.ts`、未改 `types.ts`、未改其它页面，未 `npm run build`、未起 dev server、未 commit、未新增依赖、未新增任何样式 token。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-22 | 删除 | **产品列表移除操作列「编辑」按钮**：删除 `el-tooltip(NO_PERM_TIP)` + `span.op-tip` + `el-button`「编辑」整块，操作列 `width` 160 → **110**；`goEdit()` 保留（快览抽屉「去上传」L600 与抽屉底部「编辑」L735 仍在调用），`canWrite` / `NO_PERM_TIP` 因仍有 3 处引用（登记产品 / 去上传 / 抽屉底部）保留不动。编辑入口 3 → 2（抽屉底部 / 详情页「编辑产品」），三种角色操作列均只剩「加入购物车」 | src/views/assets/list.vue（511-523；`goEdit` 110-115、`NO_PERM_TIP` import 46 未改） | ADR-040 / FT-20261022 | 未改逻辑、未改后端、未 build、未 commit；`fixed="right"` 保留，110px 单按钮（实测按钮+内距约 92px）不换行 |
+| 2026-10-22 | 修改 | **销售项目「删除」从常驻按钮收进「更多▾」，且仅 admin 渲染**：删除常驻 `el-tooltip` + 「删除」按钮块，改为行尾 `el-dropdown`（`v-if="isAdmin"`，视觉照抄 `assets/detail.vue` 的 `.more-btn` / `danger-item` 定义，未自创）；菜单唯一项「删除项目」（`Delete` 图标 + `danger-item`），`isUndeletable(row)` 时 `:disabled` 且文案改「删除项目（撤销单不可删）」；触发与菜单项均 `@click.stop`，避免触发行点击开快览抽屉；操作列 `width` 220 → **190**；`handleDelete()` / `isUndeletable()` 逐字未改，菜单项直接复用；`ArrowDown` / `Delete` 从既有 `@element-plus/icons-vue` 补入 | src/views/sales/projects/index.vue（操作列 448、删除块原 526-544 → 现 528-550、图标 import 16、样式 `.more-btn` / `danger-item` 717-735；`handleDelete` 314-335、`isUndeletable` 310-312 未改） | ADR-040 / FT-20261022 | 未改逻辑、未改后端、未 build、未 commit；editor / viewer 完全看不到「更多▾」（下拉整体 `v-if="isAdmin"`），后端权限改为 `require_admin` 属另一任务（本前端改动不改后端） |
+| 2026-10-22 | 修复 | **el-dropdown 危险项红色不生效**（scoped `:deep(.el-dropdown-menu .danger-item)` 编译为 `[data-v-x] .el-dropdown-menu .danger-item`，而 dropdown popper `teleported: true` 挂到 `body`，祖先链无本组件 `data-v` 属性 → 规则从未命中）→ 统一到 `global.css` 的 `.el-dropdown-menu__item.danger-item`（禁用态 `.is-disabled` 淡红 `#f5a9a5`），同时修复详情页「删除产品」与列表「删除项目」两处；两处失效 scoped 规则删除并留 `ADR-040` 注释，`.more-btn` 及其 `:hover` 保留在组件内（模板内 scoped 正常生效） | src/styles/global.css（755-768，规则 763-768）、src/views/assets/detail.vue（删除原 1547-1549，现 1547-1550 为留痕注释）、src/views/sales/projects/index.vue（删除原 733-735，现 733-737 为留痕注释） | ADR-040 / FT-20261022-B | 纯样式，无逻辑/无依赖变更，未 build、未 commit |
+| 2026-10-22 | 修复 | **el-dropdown 危险项 hover/focus 态被 EP (0,3,0) 规则覆盖变蓝** → 补 `.danger-item:not(.is-disabled):hover/:focus` (0,4,0) 保持红，禁用态不受影响 | src/styles/global.css（755-778，新增规则 771-778） | ADR-040 / FT-20261022-C | 纯样式，未用 !important，未 build、未 commit |
+
+## 2026-10-22 ｜ 删除：NO-DISCOUNT-20261022（购物车折扣功能整体下线 ⚠️ 功能下线）
+
+> 来源：`docs/adr/ADR-039.md`（Deprecates ADR-023）+ `docs/api-contracts.md`「NO-DISCOUNT-20261022 批次」。
+> 范围：仅 `frontend/src`（`views/cart/index.vue` 主、`views/sales/projects/review.vue`、`api/index.ts`、`types.ts`）+ 本日志；未改后端、未改 `docs/architecture.md`，未 `npm run build`、未起 dev server、未 commit、未新增依赖、未新增任何样式 token。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-22 | 删除 ⚠️ | **购物车「折扣率」输入框整体移除**：模板删除 `el-input.cart-discount-input`（原金额输入右侧 68px 窄输入，`v-if="!row.isAmount && !isViewer"`），金额输入独占主内容区 | src/views/cart/index.vue（原 828-837 → 现 661-679） | NO-DISCOUNT-20261022 §1.1 | 用户可见：销售金额列只剩一个输入框，占满整列；列宽仍 200px（未改列宽总量） |
+| 2026-10-22 | 删除 ⚠️ | **脚本层折扣逻辑清零**：删 `discountDrafts`（原 215）、`discountDraft`／`discountInvalid`／`rateToText`／`discountPreviewRate`／`discountSummary`／`onDiscountInput`／`onDiscountChange`（原 204-301）、`amountPlaceholder`（原 277-283，折扣预计金额预览）、以及仅为「手改金额 → 折扣作废」服务的 `amountManualDrafts`（原 134）；所有对 `row.cart.discountRate` 的读写在购物车彻底消失 | src/views/cart/index.vue（现 131-137、195-197，删去约 110 行） | NO-DISCOUNT-20261022 §1.2 | 净减少 1 个响应式草稿对象 + 8 个函数；「逐字输入只写草稿」的既有性能约定不变 |
+| 2026-10-22 | 修改 | **`onAmountInput` / `onAmountChange` 联动分支清理**：`onAmountInput` 只保留整数位过滤 + 写草稿（删「清折扣草稿 + 置手改标记」）；`onAmountChange` 删 `manualEdit` 标记消费与 `rate` 计算（原「包量行/手改清 rate，否则回传 rate」两分支），提交只传 `qty + amount` | src/views/cart/index.vue（134-137、173-188） | NO-DISCOUNT-20261022 §1.3 | 金额是唯一权威：填多少提交多少，不再有第二套真相 |
+| 2026-10-22 | 修改 ⚠️ | **`stepQty` 删除「按折扣重算金额」分支**（原 361-375：`if (row.cart.discountRate != null && !isViewer)` → 按新数量重算并 `PUT`）；改数量后金额保持用户填的值不动，仅保留 BUG-27 的防御分支：后端改数量时若清空了 `amount`，提示「请重新填写销售金额」+ 删草稿让输入框值驱动标红 | src/views/cart/index.vue（340-365） | NO-DISCOUNT-20261022 §1.3 | 不再用推算值覆盖人工金额；`onQtyChange` 返回值语义未变（仅用于是否提示重填） |
+| 2026-10-22 | 修改 | **金额列文案与提示行收敛**：placeholder 统一固定「必填，整数元」（删 `isViewer ? … : amountPlaceholder(row)`）；副提示区删「折扣摘要优先」分支（`el-tooltip + span.cart-amount-range`），只保留「参考区间 X 元/单位」；顶部提示条本就不含折扣句（ADR-037 已删），保留「客户/销售金额/服务期限必填 + 金额整数元 > 0 + 参考区间口径」表述 | src/views/cart/index.vue（503-506 提示条未改、669-688 金额列） | NO-DISCOUNT-20261022 §1.4 | 用户可见：不再出现「预计 27400」类灰色预览，也不再出现「原价 X · 折后 Y」摘要行 |
+| 2026-10-22 | 修改 | **金额列布局重排**：删除 `.cart-amount-row`（flex 行容器）与 `.cart-discount-input`（68px）两条样式；`.cart-amount-input` 保持 `flex:1; min-width:0`，因 `.cell-main` 本身即 flex 容器，输入框直接自适应占满整列（200px 列宽扣除单元格内边距后的全部宽度）；`.cart-cell` 的「40px 主区 + 18px 提示区」结构/行高不变，无空洞、无错位 | src/views/cart/index.vue（1108-1127 样式，删 15 行 → 5 行） | NO-DISCOUNT-20261022 §1.5 | 未新增任何样式/色值；`--primary-color` 等既有 token 未触碰 |
+| 2026-10-22 | 删除 ⚠️ | **审核页「折扣」只读列移除**：删模板 `div.rv-c-disc`（含 `rv-discount-lbl` tooltip + `discountRateText(l.discountRate)`）、`discountRateText()` 函数、`ReviewLine.discountRate` 字段与其映射（`it.discountRate ?? null`） | src/views/sales/projects/review.vue（删 52-56、73-75、103-104、382-391；现 362-372） | NO-DISCOUNT-20261022 §2.1 | 该列自本批起必然恒为「-」，删除后信息无损（历史快照仍可查库） |
+| 2026-10-22 | 修改 | **审核页网格列重排（6 列 → 5 列）**：`.rv-line-main-row` 的 `grid-template-columns: minmax(150px,1fr) 78px **92px** 176px 280px minmax(132px,auto)` → `minmax(150px,1fr) 78px 176px 280px minmax(132px,auto)`；释放的 92px 由第 1 列（1fr）自动吸收 → 产品名列变宽（可省略的仍是它），三价列（原价 176 / 可编辑价 280 / 金额 auto）宽度原样 → 各行输入框左边缘、金额右边缘仍严格对齐；≤1360px 媒体查询同步 5 列（`minmax(0,1fr) 72px 170px 268px minmax(132px,auto)`）；删 `.rv-discount-lbl`、`.rv-c-disc` 选择器 | src/views/sales/projects/review.vue（557-563、594-601、700-706） | NO-DISCOUNT-20261022 §2.2/§2.3 | 列数与 DOM 子节点数一致（5:5），不会出现错位/空列 |
+| 2026-10-22 | 修改 | **`setCartAmount` 去掉 `discountRate` 形参**：签名 `(id, qty, amount, discountRate?)` → `(id, qty, amount)`，请求体固定 `{ qty, amount }`（原 `if (discountRate !== undefined) body.discountRate = …` 删除）；`CheckoutInput` 本就不含该字段（后端 `CheckoutInput` 无 items/折扣），无需改动，结算 payload 自然不带 | src/api/index.ts（900-910） | NO-DISCOUNT-20261022 §1.3 | 加性兼容：后端自本批起忽略该字段（传了不报错），旧客户端 400 风险由后端侧兜底 |
+| 2026-10-22 | 修改 | **类型注释标注下线**：`CartItem.discountRate` 注释改「折算率：已下线（ADR-039），仅历史数据存在——购物车已无录入入口，后端也不再读取/校验/写入该字段；保留字段仅为存量行类型兼容，前端不展示、不提交」；`ProjectItem.discountRate` 同口径标注（审核页已不读该字段）；`CartItem.amount` 注释「折扣金额」→「行内成交金额」 | src/types.ts（183、188-190、325-327） | NO-DISCOUNT-20261022 §1.6 | 字段保留（存量数据/类型兼容），**不再有运行时读写点** |
+| 2026-10-22 | 修改 | 参考区间说明文案**未改动**（非折扣功能）：`views/assets/create.vue`（65、351-353、362）与 `views/assets/detail.vue`（1449-1458）中的「下单折扣区间校验用」等表述原样保留（→ 已由下一行覆盖） | 无（仅核对） | NO-DISCOUNT-20261022 §三 | 这两处是「参考价格区间」的业务说明，不属本次下线范围 |
+| 2026-10-22 | 修改 | **参考区间说明文案去「折扣」字样**（文案收口，覆盖上一条「未改动」）：①`create.vue` 351-352 模板注释「下单时行折扣单价（销售金额÷数量）须落在区间内，超区间后端 400」→「下单时单价（销售金额 ÷ 数量）须落在区间内，超区间后端 400」；②`create.vue` 362 可见小字「元/{unit}，选填（可只填一边）；下单折扣区间校验用，未设置则不限制」→「…；下单时单价校验用，未设置则不限制」；③`detail.vue` 1449-1450 模板注释「下单时行折扣单价须落在区间内，超区间后端 400」→「下单时单价须落在区间内，超区间后端 400」；④`detail.vue` 1458 可见小字「元/份，选填（可只填一边）；下单折扣区间校验用，未设置则不限制」→「…；下单时单价校验用，未设置则不限制」；ADR-018/ADR-021 标签与日期原样保留 | src/views/assets/create.vue（352、362）、src/views/assets/detail.vue（1450、1458） | NO-DISCOUNT-20261022 §三（文案收口） | 纯文案：未改逻辑/样式/布局/依赖；两处小字仍 `font-size: 12px`，字数变化不影响换行（单行内） |
+
+**用户可见变化（改动 → 文件:行 → 变化）**
+
+1. 购物车 · 销售金额列：`cart/index.vue:661-679` —— 折扣小输入框消失，金额输入框单行占满整列（列宽 200px 不变）。
+2. 购物车 · 金额输入提示：`cart/index.vue:672` —— 任何角色（含商务/管理员）都恒显示「必填，整数元」，不再有「预计 27400」灰色预览。
+3. 购物车 · 金额下方提示行：`cart/index.vue:680-689` —— 只剩「参考区间 5100000~5100000 元/套」一类说明，「原价 ¥X · 折后 ¥Y」摘要消失。
+4. 购物车 · 步进器改数量：`cart/index.vue:340-365` —— 金额不再被折扣率重算，用户填的值保持不动；若后端因数量变更清了金额，仅提示重填并标红。
+5. 审核页 · 明细行：`review.vue:361-368` —— 「折扣」列消失，产品名更宽，原价/可编辑价/金额三列右对齐关系不变。
+
+**grep 证据**
+
+- `grep -c "discount" src/views/cart/index.vue` → **0**（小写标识符全部清零：无 `discountDrafts`/`discountDraft`/`discountInvalid`/`discountSummary`/`discountPreviewRate`/`onDiscountInput`/`onDiscountChange`/`amountPlaceholder`/`rateToText`，也无 `cart-discount-input`/`cart-amount-row`/`row.cart.discountRate`）；`grep -ci "discount"` → **10**，全部为注释里的 `ADR-039（NO-DISCOUNT-20261022）` 下线留痕（script 132/171/195/355，模板 652/662/669/685，样式 1111/1121），`grep -c "折扣"` → **4**（同属这 4 条注释正文）；`grep -n "discount" … | grep -v "注释起始符"` → **0 行**（无一行落在代码/模板属性/样式声明上）。
+- `grep -c "discount" src/views/sales/projects/review.vue` → **0**；`grep -ci` → **2**，仅 `ADR-039（NO-DISCOUNT-20261022）` 注释（364 模板注释、557 网格注释）；`rv-c-disc` / `rv-discount-lbl` / `discountRateText` / `l.discountRate` / `it.discountRate` → **0 命中**。
+- 全仓 `grep -rn "discountRate" frontend/src` → 仅 `types.ts:190`、`types.ts:327`（字段定义 + 已下注释）与 `api/index.ts:905`（JSDoc 说明「入参不再带 discountRate」），**无运行时读写**。
+- 全仓 `grep -rn "折扣" frontend/src` → 仅注释性文字与 `assets/create.vue`、`assets/detail.vue` 的「参考区间」说明文案（本批未动）。
+
+**布局说明（金额列 1280 视口）**
+
+- 列内：`.cart-cell`（flex 列）=「.cell-main 40px（金额输入 flex:1 占满）」+「.cell-hint 18px（参考区间小字，超长 ellipsis）」，行结构/行高与改造前完全一致，删除 68px 输入后无留白空洞。
+- 列间：表格列宽集合未变（产品 240min / 客户 180 / 单价 150 / 数量 120 / 金额 200 / 服务期限 300 / 小计 110 / 操作 76），合计 ≈ 1376px，属**既有**事实（原注释已记录「1440 屏宽会溢出横滚」）；本批不改列宽总量，也不新增横向滚动来源。1280 视口下表格整体仍按既有行为横向滚动（内容区 ≈ 1012px），金额列自身在滚动后完整可见、无错位。
+
+**验证**
+
+- `npx vue-tsc --noEmit` → **0 错误**；`npx vue-tsc -p tsconfig.app.json --noEmit` → 仅 4 条**既有**历史告警（`SalesOrderDialog.vue` 2×TS6133、`views/assets/detail.vue` 与 `views/assets/list.vue` 各 1×`refresh` TS6133），**无新增**；原 `review.vue` 那条 `ContractItem` 无 `discountRate` 的 TS2339 **已随字段删除消失**（历史 5 条 → 现 4 条）。
+- `@vue/compiler-sfc` 全量 `parse + compileScript + compileTemplate`：**22 个 .vue / 0 失败**。
+- 模板注释均在元素之间，未置于开标签内部；未新增依赖/色值/圆角/间距（§6）。
+
+**联调注意**
+
+1. 后端自本批起忽略 `discountRate`（`PUT /api/cart/{id}`、`POST /api/cart/checkout`、`POST /api/projects/{id}/review`）：前端已不再发送，若浏览器缓存着旧版静态资源，旧代码仍会传该字段——不报错（后端容忍），无需前端做版本兼容。
+2. 响应体可继续带 `discountRate`（存量行非 null、新单恒为 null）：前端 `types.ts` 仍保留该可选字段，**不读不展示**，不会因多字段报错。
+3. 改数量的语义变更需与后端确认口径：本批前端**不再**用任何比率回填金额；若后端在「改 qty」时清空 `amount`（BUG-27 历史行为），前端提示「数量已变更，请重新填写销售金额」并要求人工重填——这与 ADR-039「金额是唯一权威」一致，但会让「改数量」多一步操作，属预期。
+4. 历史数据：既有项目 `project_items.discountRate` 仍有值，审核页已不展示；如需追溯请走数据库/旧快照，前端不提供入口（不做「只读回显」的兼容层）。
+
+## 2026-10-22 ｜ 修改/新增：RS-STATUS-20261022（明细自带 `status`（可售/已售罄）+ 状态列 + 选择器置灰）
+
+> 来源：`docs/backend/api.md`「2026-10-22 变更（RS-STATUS-20261022）」+ ADR-038 Decision 3。
+> 范围：仅 `frontend/src`（`types.ts` / `api/index.ts` / `views/assets/detail.vue` / `components/RsItemPicker.vue`）+ 本日志；未改后端、未改 `docs/architecture.md`，未 `npm run build`、未起 dev server、未 commit、未新增依赖。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-22 | 修改 ⚠️ | **`RsItem` 新增 `status: AssetStatus`**（`in_stock`=可售 / `all_sold`=已售罄，**与 `assets.status` 同枚举**，不另造枚举）；`RsItemWithSold extends RsItem` 自动继承（注释注明「无需重复声明」）。原后端派生字段 `occupied` 的前端消费点：`grep -rn "occupied" frontend/src` → **0 命中**（本就未消费，无需删除） | src/types.ts（124 `RsItem.status`、137-140 `RsItemWithSold` 注释） | RS-STATUS-20261022 §1 | 只读字段，**不进入 `RsItemInput`**（PUT/POST 不提交，状态由后端按真值维护）；缺失 `status` 的旧快照按「可售」降级，不误伤 |
+| 2026-10-22 | 新增 | **状态展示单一来源**：`RS_ITEM_STATUS`（`in_stock`→「可售」`success` / `all_sold`→「已售罄」`info`）+ `isRsItemSoldOut(r)`（`status === 'all_sold' && !repeatSale`）。表格与选择器共用，避免两处口径漂移 | src/types.ts（146-159） | RS-STATUS-20261022 §1/§4 | 颜色走既有 tag 类型（success/info），**不新增色值**（§6） |
+| 2026-10-22 | 修改 ⚠️ | **`updateRsItem` 返回值 `Promise<void>` → `Promise<RsItem>`**：`PUT /rs-items/{id}` 的响应体（`RsItemOut`）已含后端重算后的最新 `status`，调用方可直接用它更新该行，无需多等一次镜像刷新 | src/api/index.ts（772-782） | RS-STATUS-20261022 §2 | 加性变更：既有调用方忽略返回值仍可编译；`afterWrite()` 全量刷新链路保持不变 |
+| 2026-10-22 | 新增 | **可售明细表新增「状态」列（90px，只读）**：位于「单价」之后、「可重复售卖」之前，`el-tag size="small" effect="light"` + `tagInfo(RS_ITEM_STATUS, …)`（可售绿 / 已售罄灰），**不承载操作**（切换仍是右侧开关） | src/views/assets/detail.vue（931-939） | RS-STATUS-20261022 §2 | `el-tag--small` 高 20px < 单元格 22px → **表格行高不变**；「已售次数」「操作」列宽（100/120）与开关逻辑零改动 |
+| 2026-10-22 | 修改 | **列宽重新配平（仅本表）**：省/市 `min-width` 180→**170**（−10）、单价 150→**140**（−10），新增状态列 **90**；精度 90 / 月份 110 / 可重复售卖 130 / 已售次数 100 / 操作 120 不变 → **合计 950px** | src/views/assets/detail.vue（916-917 注释、918、925、933） | RS-STATUS-20261022 §2 | 1280 视口可用宽 ≈ 961px（1280 − 侧栏 220 − 滚动条 15 − 页边距 24×2 − 卡片内距 18×2），余量 11px，**无横向滚动条、操作列不被挤压** |
+| 2026-10-22 | 新增 | **行内状态随开关自动更新**：新增局部副本 `rsStatusDraft[id]`（与 `rsDraft` 同模式），显示值 `rsStatusValue(row)` = 副本 → 行快照 → `'in_stock'` 降级；`toggleRsRepeat` 成功后按 **PUT 响应 `status` 优先**回写（镜像 `db.rsItems` 与点击前值依次兜底），失败与开关一起回滚；`loadRsItems` 每次加载按服务端值重播种 | src/views/assets/detail.vue（455-461、470-475、640-644、675-696） | RS-STATUS-20261022 §2 | 用户可见：切「重复售卖」→ 状态即时变「可售」；切回且仍被有效合同占用 → 即时变「已售罄」；不新增请求、不重拉分页 |
+| 2026-10-22 | 修改 | **页签顶部说明文案补口径**：追加「**可售数量 = 状态为「可售」的明细条数**」（与原「默认为单次售卖…」同段，`<b>` 加粗，不新增颜色/token） | src/views/assets/detail.vue（905） | RS-STATUS-20261022 §2 | 用户可见：与后端 `bootstrap.assets[].availableCount = COUNT(status='in_stock')` 口径对齐 |
+| 2026-10-22 | 修改 | **新增/编辑明细弹窗**：「可重复售卖」开关下方小字改为「开启后该明细不会被标为「已售罄」（只计次）；关闭时售出/锁定即置为「已售罄」」；弹窗内**不提供**手工选状态 | src/views/assets/detail.vue（1462-1467） | RS-STATUS-20261022 §3 | 用户可见：状态由系统维护，避免误以为可手改 |
+| 2026-10-22 | 新增 | **选择器置灰（RsItemPicker）**：`status === 'all_sold' && !repeatSale` 的叶子节点 `disabled`（el-tree `props.disabled` 绑定节点字段）+ 行尾灰色小字「已售罄」+ hover 提示「该期已售出，不可再选」；`repeatSale === true` 的明细即使已售出照常可选；省/精度树结构与既有勾选逻辑不变（disabled 叶子不被父级全选连带、点击文本也不切换）；info-bar 补「已售罄的单次售卖明细已置灰，不可再选」 | src/components/RsItemPicker.vue（25-31、49 `treeProps`、82-93、184-193 插槽、224-241 样式） | RS-STATUS-20261022 §4 | 置灰只影响 leaf 可点性，父子缩进/展开态/`@check` 计数链路零改动 |
+| 2026-10-22 | 修复 | **选择器选中集合改为本地事实来源**：el-tree 在 `data` 引用变化时会**重建全部节点并清空勾选态**，故新增 `pickedIds`（叶子 id 集合，`checkedCount` 由其派生，`onConfirm` 按它取 `db.rsItems` 行）；`treeData` 变化后 `nextTick` 里 ① 按剩余 id `setCheckedKeys` 回填（其余选中不丢）② 已选中但被标记已售罄的剔除并 `ElMessage.warning` 提示一次 | src/components/RsItemPicker.vue（52-57、101-107、109-130、137、143-149） | RS-STATUS-20261022 §4 | 修掉「先勾选、后被卖掉」的竞态：会话内不再出现「已售罄明细仍被加购」；`nextTick` 是必须的——本组件 watcher 先于子组件注册，同步执行会读到重建前的旧节点 |
+
+**展示矩阵（表格列 / 选择器）**
+
+| 明细状态组合 | 后端 `status` | 表格「状态」列 | 表格「可重复售卖」 | 选择器 | 可售数量（容器） |
+|---|---|---|---|---|---|
+| `in_stock` + `repeatSale=false` | `in_stock` | 绿「可售」 | 关（单次） | 正常可选 | 计入（+1） |
+| `all_sold` + `repeatSale=false`（被有效合同引用） | `all_sold` | 灰「已售罄」 | 关（单次） | **置灰禁选** + 行尾灰字「已售罄」+ hover「该期已售出，不可再选」 | 不计入 |
+| `all_sold` + `repeatSale=true` | 切开关后由后端回 `in_stock`；`repeatSale=true` 时后端恒 `in_stock` | 绿「可售」（开关保存后即时切换） | 开（重复售卖） | 照常可选（不置灰） | 计入（+1） |
+
+**自查**：`npx vue-tsc --noEmit` → **0 错误**；`npx vue-tsc -p tsconfig.app.json --noEmit` 仍只有 5 条**既有**历史告警（`SalesOrderDialog.vue` 2×TS6133、`detail.vue`/`list.vue` 各 1×`refresh` TS6133、`review.vue` 1×TS2339 `discountRate`），**无新增**；`@vue/compiler-sfc` 全量 `parse + compileScript + compileTemplate` → **22 文件 / 0 失败**（临时脚本已删除）；IDE 诊断 4 个改动文件 → 0 条；`grep -rn "occupied" frontend/src` → **0 命中**；模板注释均在元素之间，**未置于开标签内部**；§6 自查：无新增颜色/圆角/间距/依赖，状态标签沿用 `type="success"/"info"` + `effect="light"`（同行内既有资产状态列口径），置灰文字用既有 `--text-secondary`，行高维持不变。
+
+**联调已实测（本机 `:8000`，`admin` 登录后只读 GET）**：`GET /api/assets/29/rs-items?page=1&pageSize=2` → `total=60`，items 字段为 `[assetId, city, createdAt, id, price, priceMax, priceMin, province, repeatSale, resolution, saleMonth, soldCount, status, updatedAt]`（**有 `status`、无 `occupied`**，`status=in_stock`）；`GET /api/bootstrap` → `rsItems[]` 同构（`status` 在、`occupied` 无），`assets#29`：`quantity=60`、`availableCount=60`、`status=in_stock`，与「可售数量 = `status='in_stock'` 条数」口径一致。
+
+**联调注意**：① 后端 400 文案已从「已被占用」改为「该可售明细已售罄，请选择其他明细」，前端 `showError` 原样透出，无需改文案映射；② `availableCount` 与明细 `status` 同批变化，但两者是**两次读**（bootstrap 与分页接口），极端并发下可能短暂不一致——页面在 `afterWrite()` 后重拉分页，不做跨接口补偿；③ 切 `repeatSale=true` 后该明细恒为 `in_stock`，前端的状态副本仅以 PUT 响应为准，**不做本地推导**（避免与后端真值漂移）；④ `PUT /rs-items/{id}` 若某环境仍返回旧格式（无 `status`），`rsStatusValue` 会降级到行快照 / 「可售」，不崩不误判。
+
+---
+
+## 2026-10-22 ｜ 修改/新增：RS-REPEAT-20261022（明细级「可重复售卖」开关 + 默认值语义反转 ⚠️）
+
+> 来源：`docs/adr/ADR-038.md` + `docs/api-contracts.md` 末尾「RS-REPEAT-20261022 批次」§1–§3 + `docs/architecture.md` §6。
+> 范围：仅 `frontend/`（`views/assets/detail.vue` / `api/index.ts` / `types.ts`）+ 本日志；未改后端、未改 `docs/architecture.md`，未 `npm run build`、未起 dev server、未 commit、未新增依赖。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-22 | 修改 ⚠️ | **列表「可重复售卖」列：只读胶囊 → `el-switch`（`size="small"`）行内开关，切换即提交**。列宽 110 → **130px**（+20，避免挤压「已售次数/操作」列）；单元格 = 开关 + 12px 状态文字（重复售卖/单次，信息密度与旧胶囊等价）；`.rs-toggle-cell { min-height: 22px }` 与旧胶囊等高 → **表格行高不变**；删除随之变死代码的 `.rs-pill.repeat/.once` 样式（`grep -rn rs-pill frontend/src` → 0 命中） | src/views/assets/detail.vue（模板 901-918、样式 `.rs-toggle-cell`/`.rs-toggle-text`） | RS-REPEAT-20261022 §3 | **用户可见**：该列由静态标签变成可直接点的开关（admin/editor 可点，viewer 禁用 + 既有 `NO_PERM_TIP` tooltip）；点一次就落库，不再需要进弹窗 |
+| 2026-10-22 | 新增 | **开关的提交/回滚链路**：① 显示值读局部副本 `rsDraft[id]`（`rsRepeatValue(row)`，缺省回退行值），**从不直接改 `row.repeatSale`**；② 提交 `updateRsItem(id, rsRowInput(row, next))` = **整行覆盖**（province/city/resolution/saleMonth/price/priceMin/priceMax/repeatSale，`priceMin/Max` 未设 → null），与契约 §1 一致；③ 行级互斥 `rsBusy[id]`（同购物车 `qtyBusy`，BUG-25）：请求在飞期间该行 `disabled` + `loading`；④ 失败 → 副本回滚为「点击前显示值」（= 上一次成功落库值，**不拿 `row.repeatSale` 当回滚源**：行对象是首次 GET 快照、永不回写，否则第二次反向切换会被误判为「无变化」而点不动）+ `showError(e, '保存失败')`；⑤ 成功 → 以 `db.rsItems`（`updateRsItem` 内部 `afterWrite()` 已刷新镜像）回写副本值；⑥ `loadRsItems()` 每次加载按服务端值**重播种**副本，消除「弹窗编辑后副本残留旧值」漂移 | src/views/assets/detail.vue（451-454 `rsBusy`/`rsDraft`、465 重播种、`rsRepeatValue`/`rsRowInput`/`toggleRsRepeat`） | RS-REPEAT-20261022 §3 | 连续切换两次：第二次在飞期间被 `rsBusy` 直接忽略（开关同时置灰），**最终状态 = 第一次请求的结果**，不会出现「回滚到旧值」的乱序 |
+| 2026-10-22 | 新增 ⚠️ | **新增/编辑明细弹窗加「可重复售卖」开关**：`rsForm.repeatSale: boolean` 默认 `false`（`openRsCreate` 重置 false）、`openRsEdit` 回显 `it.repeatSale`、提交随整行下发 `repeatSale: rsForm.repeatSale`（**删除原逻辑**「编辑沿用既有值；新增默认 `true`」）；UI = `.dlg-form` 内一行「可重复售卖」+ `el-switch` + `.dlg-hint` 小字「开启后该明细售出不占用可售数量（只计次）；默认关闭 = 单次售卖」 | src/views/assets/detail.vue（`rsForm` 544-545、`openRsCreate` 557、`openRsEdit` 572-573、`saveRsItem` 603-604、模板 1422-1428） | RS-REPEAT-20261022 §3 / ADR-038 §2 | **语义反转（⚠️ 默认值）**：新增明细默认由「重复售卖（只计次不扣量）」改为「**单次售卖（售出即占用）**」；需要重复售卖的月份必须显式打开开关 |
+| 2026-10-22 | 修改 | **页签顶部说明文案**：「默认可重复售卖（只计次不扣量）」→「**默认为单次售卖**（售出即占用），开启「可重复售卖」后只计次不扣量」（`<b>` 加粗「默认为单次售卖」，不新增颜色/token） | src/views/assets/detail.vue（可售明细卡 `card-desc`，876-877） | RS-REPEAT-20261022 §3 | 用户可见：与新默认值口径一致，避免"默认重复售卖"的误导 |
+| 2026-10-22 | 修改 | **类型与注释对齐契约**：`api/index.ts::RsItemInput.repeatSale?: boolean` 注释「默认 true」→「**后端缺省 false** = 单次售卖；true = 只计次不扣量；PUT 为整行覆盖须随整行提交」；`types.ts::RsItem.repeatSale` 已存在（核对无缺失），注释同步为「ADR-038 起默认 false」；顺带把 `Asset.availableCount` 注释口径改为「明细总数 − 被占用**且 repeatSale=false** 的明细数」（纯注释，逻辑零改动） | src/api/index.ts（282-284）、src/types.ts（86-89、117-118） | RS-REPEAT-20261022 §1 / ADR-038 §3 | `RsItemOut` 未变（`repeatSale` 照常返回），`RsItemWithSold extends RsItem` 自动继承，分页接口无需改类型 |
+| 2026-10-22 | 修改 | **统计口径核对（未改代码）**：「已售次数」列仍读后端 `soldCount`（PAGE-20261021 口径，`detail.vue:919-922` 未动）；本页无「可售 N 份」自算汇总，容器「可售数量」走 `availableQty(asset)` → `asset.availableCount`（后端派生），开关保存后 `afterWrite()` 刷新 bootstrap 即同步；页签标题 `可售明细（${rs.total}）` 为明细条数，与 `availableCount` 无关 | src/views/assets/detail.vue（919-922、776 未动） | RS-REPEAT-20261022 §2/§5 | 本期存量全部 `repeatSale=false`，`availableCount` = 未被占用明细数（#29 = 60），与旧值同源，无前端副作用 |
+
+**开关异常路径（自查清单）**：① **请求中禁用**——`rsBusy[id]` 为 true 时该行 `:disabled` + `:loading`，同行再点无反应（`toggleRsRepeat` 首行 guard 双保险）；② **失败回滚**——catch 里 `rsDraft[id] = committed`（点击前显示值 = 上一次成功落库值）+ `showError(e, '保存失败')`，后端 400/403/422 文案经拦截器原样弹出；③ **成功镜像同步**——`updateRsItem` → `afterWrite()` → `refresh(true)` 刷新 `db.rsItems`，再回写副本值，故"请求成功但响应乱序"也不会把旧值写回；④ **连续切换两次**——第二次在飞期间被丢弃，最终状态 = 第一次的结果；如第一次失败，开关回滚原值且第二次点击早已被忽略（不会出现"显示已开、库里 false"）。
+
+**自查**：`npx vue-tsc --noEmit` → **0 错误**（无新增）；`@vue/compiler-sfc` 对 `frontend/src/**/*.vue` 全量 `parse` + `compileTemplate` → **22 文件 / 0 失败**（临时脚本已删除）；IDE 诊断 3 个改动文件 → 0 条；`grep -rn "rs-pill"` → 0 命中（死样式删净）；模板注释均在元素之间，**未置于开标签内部**（HOTFIX-20261022 教训）；§6 自查：未新增颜色/圆角/间距，开关沿用 `--el-color-primary` #1769D4，说明文字用 `.dlg-hint` + 既有 `--text-secondary`，行高维持 22px。
+
+**联调已实测（本机 `:8000` 后端）**：`GET /api/assets/29/rs-items?page=1&pageSize=100` → `total=60`，items 含 `repeatSale` + `soldCount`（字段名/类型与 `RsItemWithSold` 一致）；`PUT /api/rs-items/1`（整行 + `repeatSale:false`）→ **200**，响应即更新后的 `RsItemOut`（`repeatSale:false`），再 `GET` 复核一致；测试值已复原。`GET /api/bootstrap` → `#29`：`type=遥感数据, quantity=1, repeatSale=false, availableCount=60`（60 条明细全 `false`、0 占用），与契约 §2 一致。
+
+**联调注意 / 遗留**：① **存量归一脚本已生效**（60 条全 `repeatSale=false`），故列表开关首屏全部为「单次」——若在某环境看到全部为「重复售卖」，说明 ADR-038 §4 的 `backend/scripts/` 归一未执行；② 本页开关仅为 admin/editor 可用（`canWrite` + 后端 `require_editor`），viewer 看到禁用开关 + 权限 tooltip，与「编辑/删除」一致；③ 开关保存会写一条明细级 OpLog 并刷新 bootstrap，明细页签**未做行级本地打补丁**（对比购物车 `patchCartRow`：`PUT /rs-items/{id}` 已返回完整 `RsItemOut`，若后续觉得开关操作卡顿，可改为按 id 替换 `db.rsItems` 行 + 跳过全量刷新；本次按契约要求保留 `afterWrite()`）；④ 开关成功后不重拉明细分页（`soldCount` 与排序不受影响），仅 `availableCount` 随 bootstrap 刷新——容器「可售数量」即时反映按明细占用的新口径。
+
+---
+
+## 2026-10-22 ｜ 修改/删除：UI-OPT-20261022（容器可售口径 + 登记页状态块 + 站点标题）
+
+> 来源：`docs/api-contracts.md`「UI-OPT-20261022 批次」§1–§3 + `docs/architecture.md` §6。
+> 范围：仅 `frontend/`（`types.ts` / `views/assets/create.vue` / `views/assets/list.vue` / `index.html`）+ 本日志；未改后端、未新增依赖、未执行 `npm run build`、未起 dev server、未 commit。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-22 | 删除 | **登记/编辑页去掉「产品状态」展示块**：删除整个 `el-form-item label="产品状态"`（`el-tag` 可售/售罄 + 文案「状态由数量自动判定，无需手动修改」），卡片标题「状态与备注」→「**备注**」，卡片内仅剩备注 textarea（新建/编辑同页同时生效）；连带清理因此变死代码的 `stockState` computed、本文件 `ASSET_STOCK_STATE` / `AssetStockState` 两个 import 与 `.status-line` / `.status-tip` scoped 样式。**`ASSET_STOCK_STATE` / `assetStockState` 常量与函数本身保留**（`list.vue` / `detail.vue` / `compute.vue` 仍在用，未改） | src/views/assets/create.vue（头部注释 12、import 37-42、删除原 131-143 `stockState`、模板 437-446、样式原 560-570） | UI-OPT-20261022 §2（契约）/ §6 | **用户可见**：登记/编辑页少一个只读状态标签与说明；备注卡变矮（`.form-card` 内仅 1 个 form-item，末项 `margin-bottom:0` 生效，无空白塌陷）。纯删减，未引入新样式 token |
+| 2026-10-22 | 修改 | **`Asset` 新增派生字段 `availableCount?: number \| null`**（注释写清：容器=未被非 terminated 销售记录占用的明细数，后端派生；非容器恒 null；缺失=旧快照）。`api/index.ts` 的 `db.assets = data.assets` 为整对象透传，无需改动即自动带上该字段 | src/types.ts（Asset 定义，`soldAmount` 之前） | UI-OPT-20261022 §1 | 加性字段，前端不提交（`AssetInput` 不含），后端契约外零影响 |
+| 2026-10-22 | 修改 ⚠️ | **`availableQty(asset)` 容器口径**：`repeatSale` 判断保持第一优先级（返回 null 语义不变）→ 若为容器（新增 `isRemoteContainer(a)` = `type === '遥感数据'`）且 `typeof availableCount === 'number'` → 返回 `availableCount`；否则（非容器 / `undefined` / `null` / 旧快照）回退旧口径 `quantity − lockedQty − shippedQty`。**非容器与 repeatSale 逻辑逐字未变** | src/types.ts（`availableQty` + 新增 `isRemoteContainer` 导出函数） | UI-OPT-20261022 §2 | **用户可见**：`assets#29 遥感数据-2026`（97 明细 / 0 占用）「可售数量」由 `1` 变 `97`，「状态」由数量派生仍为「可售」；全部明细被占用（`availableCount=0`）→「已售罄」 |
+| 2026-10-22 | 修改 | **三处消费点逐一核对（均调用 `availableQty`，无人另算）**：① 产品列表「可用数量」列 `formatAssetQty(row, availableQty(row))`（list.vue 499）；② 抽屉「可售 N / 总数量 M」图例 `availableQty(drawerAsset)`（568，底行「总数量」仍为父产品 `quantity` 口径，未动）；③ 状态派生 `assetStockState → noSellableStock → availableQty`（list.vue 504/540、detail.vue 687、compute.vue 65、`noSellableStock` 守卫）。仅补注释，逻辑零改动；单位文案不变（容器单位仍是 `份（可售明细）`，只有数字变） | src/views/assets/list.vue（496-501、568-569 注释） | UI-OPT-20261022 §2 | 「产品总数」列对容器已显示「N 期」（`rsCount`），无需改 |
+| 2026-10-22 | 修改 | **浏览器标签标题**：`<title>` `Core Holdings 产品及服务平台` → **蜂云产品及服务平台**（顶栏/登录页文案本就一致，未动） | frontend/index.html（7） | UI-OPT-20261022 §3 | 仅标签标题，路由/文档标题逻辑（如有）未改 |
+
+**容器可售口径推导（前端逻辑级）**：`availableQty(a)` → `a.repeatSale`(容器恒 false，后端 400 兜底) → `isRemoteContainer(a) && typeof a.availableCount === 'number'` → 返回 `Math.max(0, availableCount)`。故 97 明细 / 0 占用 → 列表「可用数量」97、抽屉「可售 97」、状态「可售」；占用 1（锁定或已交付，同一明细多合同只计 1）→ 96；97 条全被非 terminated 合同占用 → `0` → `noSellableStock` 命中 → 状态「已售罄」且编辑入口弹「无可用数量」提示（仍可编辑）。
+
+**其它 `availableQty` 消费点清单（因改用同一函数而自动对齐，未逐处改代码）**：`sales/outbound/index.vue:154`（新交付数量上限校验）、`sales/projects/create.vue:153/228/468/937`（明细数量上限、可选产品过滤、加行校验、明细行「可售 N ${unit}」）、`cart/index.vue:70`（行数量上限 = 可售 − 同产品其他行）、`assets/detail.vue:776`（详情「可售数量」）、`api/index.ts:404/456`（`getDashboard().availableQty` 合计）。
+
+**自查**：`npx vue-tsc --noEmit` → 0 错误；严格工程检查 `npx vue-tsc -p tsconfig.app.json --noEmit` → 5 条**既有**诊断（`SalesOrderDialog.vue` 未用 `ref`/`rsItemName`、`detail.vue`+`list.vue` 未用 `refresh`、`review.vue` `discountRate` 类型），经 `git show HEAD` 逐个核对 **HEAD 同样存在，本次 0 新增**；`grep -rn "status-line|status-tip"` → 0 命中（死样式删净）；§6 自查：仅删减 + 既有 token/共享类，无新颜色/圆角/间距/组件；备注卡 `block-head`（padding-bottom 12 + margin-bottom 16）→ 表单末项 `margin-bottom:0`，无双线/双倍留白。
+
+**联调已实测（本机 `:8000` 现跑后端）**：`GET /api/bootstrap`（admin）→ 容器 `id=29 遥感数据-2026`：`quantity=1, lockedQty=0, shippedQty=0, repeatSale=false, availableCount=97`；`rsItems` 共 97 行且全属 assetId=29；非容器 `availableCount=null` —— 与契约 §1 一致，前端字段名/类型匹配（camelCase `availableCount`，number|null）。
+
+**待后端确认 / 遗留口径**：① 契约写明 `GET /assets` 列表接口本批不动（仅 bootstrap 派生）；前端列表页读 bootstrap 镜像，故无影响——若后续列表改服务端分页直读 `/assets`，需同步补 `availableCount`，否则回退成父 `quantity=1`；② `getDashboard()` 的 `availableQty` 合计把容器按明细数计入、而 `inQty` 仍是父 `quantity`（1），二者口径不一致——该字段当前**无任何视图渲染**（grep 0 命中），本次不改，仅记录待决；③ 详情页「产品总数」对容器仍显示父 `quantity`（1 份（可售明细）），与列表「N 期」口径不一致（明显误导），按任务要求先汇报未改；④ 手动交付（`/sales/outbound`）对容器的数量上限由 1 放宽到 97（同走 `availableQty`）——容器交付应走明细，此处仅校验上限，若后端对容器手动交付有额外限制请告知；⑤ 登记页「备注」卡头部图标仍是 `CircleCheck`（原状态卡的勾选图标），任务未要求改，保持零新增 import。
+
+---
+
 ## 2026-10-22 ｜ 修复：HOTFIX-20261022（购物车模板语法错误 + dev server 域名代理拦截）
 
 > 来源：FORMS-20261022 批次引入的两处阻塞问题（① `cart/index.vue` 编译失败 → 整页白屏；② 域名反代访问 dev server 被 Vite 拦）。

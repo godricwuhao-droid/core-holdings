@@ -40,6 +40,11 @@ class AssetOut(_ORM):
     # 计价模式（ADR-008）：'unit'（单价×数量）| 'amount'（包量金额整数元权威）。
     # 后端按类型权威决定（卫星Token → 'amount'），不接受前端入参。
     pricingMode: str = "unit"
+    # 容器「可售数量」= 可售期数（加性可选字段，追加在末尾）。
+    # 仅 type == '遥感数据' 的容器由 bootstrap 派生（RS-STATUS-20261022 口径：
+    # `rs_items.status = 'in_stock'` 的明细条数，in_stock=可售 / all_sold=已售罄）；
+    # 非容器恒 None —— 前端对非容器继续用 quantity-lockedQty-shippedQty，双口径不混。
+    availableCount: int | None = None
     # 注：ADR-010 的 province/city/resolution/imageDate 出参已移除（ADR-011，列保留不删）；
     # 遥感数据售卖粒度见 bootstrap.rsItems（RsItemOutWithSold[]，FIX-20261022-FOLLOWUP 起含派生 soldCount）
 
@@ -163,7 +168,10 @@ class RsItemInput(BaseModel):
     # 两者都有时 min ≤ max，否则 400「参考区间下限不能大于上限」（与产品区间同口径）
     priceMin: float | None = Field(default=None, ge=0)
     priceMax: float | None = Field(default=None, ge=0)
-    repeatSale: bool = True  # 可重复售卖（默认 true，可关闭）
+    # 可重复售卖（ADR-038，RS-REPEAT-20261022）：缺省 **false** = 单次售卖——
+    # 该明细一旦被非 terminated 合同占用即从容器 availableCount 中扣除（一期通常只卖一次）。
+    # true = 只计次不扣量（售出后仍计入可售）。与 models.RsItem.repeatSale 默认值保持一致。
+    repeatSale: bool = False
 
 
 class RsItemOut(_ORM):
@@ -178,6 +186,11 @@ class RsItemOut(_ORM):
     priceMin: float | None
     priceMax: float | None
     repeatSale: bool
+    # 明细状态（RS-STATUS-20261022，ADR-038 Decision 3 修订）：'in_stock'（可售）/
+    # 'all_sold'（已售罄）。由 services._sync_rs_item_status 按真值维护；
+    # 前端选择器的置灰判断与「已售罄」文案统一用本字段（原 `occupied` 派生字段已删除，
+    # 避免 occupied / status 两套语义并存）。
+    status: str
     createdAt: str
     updatedAt: str
 
@@ -188,6 +201,9 @@ class RsItemOutWithSold(RsItemOut):
     soldCount 口径：该明细被 delivered 状态合同的项目明细计数
     （project_items.itemId == rs_item.id 且所属合同 status='delivered'），
     由路由层聚合查询后回填（ORM 对象无此属性，故不设默认值依赖 from_attributes）。
+
+    RS-STATUS-20261022：`occupied`（被非 terminated 合同引用）派生字段**已删除**——
+    「该明细还能不能卖」只认 `status`（in_stock/all_sold），不再保留第二套语义。
     """
 
     soldCount: int
@@ -219,9 +235,8 @@ class ProjectItemInput(BaseModel):
     # 遥感行不填期限（期数即服务时间）
     serviceStart: str | None = None
     serviceEnd: str | None = None
-    # 折扣率（DISCOUNT-20261021/ADR-023，可选）：0-1 小数（0.9=九折），商务手填场景；
-    # 0 < rate ≤ 1 否则 400「折扣率须为 0 到 1 之间的正数」（_create_project_core 统一校验）；
-    # 落 project_items 为快照（只写不改）；null=无折扣
+    # 折扣率：**已下线（ADR-039），后端忽略**——字段定义仅为兼容旧客户端（传了不 422、不 400），
+    # 后端不读取、不校验、不落库（新明细 discountRate 恒 null；原 DISCOUNT-20261021/ADR-023）
     discountRate: float | None = None
 
 
@@ -240,8 +255,8 @@ class ProjectItemOut(_ORM):
     # 服务期限（ADR-020，PRICING-20261020）：YYYY-MM-DD；存量/遥感行为 null
     serviceStart: str | None = None
     serviceEnd: str | None = None
-    # 折扣率快照（DISCOUNT-20261021/ADR-023）：下单时快照（只写不改，与 origPrice 同级口径）；
-    # 存量订单为 null（展示端不显示「折扣」列值）
+    # 折扣率快照：**已下线（ADR-039），后端不再写入**——新单恒 null；
+    # 存量单/历史项目的历史值原样返回（只读追溯用，前端不再展示）
     discountRate: float | None = None
     status: str
     deliveryReq: str
@@ -430,6 +445,7 @@ class AssetDeliverableInput(BaseModel):
     category: str
     required: bool
     note: str = ""
+    url: str = ""  # ADR-044：外部链接（仅 http/https，服务层校验；""=无链接）
 
 
 class AssetDeliverableUpdate(BaseModel):
@@ -437,6 +453,7 @@ class AssetDeliverableUpdate(BaseModel):
 
     全部字段可选，语义为**部分更新**：未传 = 保持原值（路由层按 `model_fields_set` 取 patch）。
     非法类型 422（此前裸 dict + setattr 可写脏值）。`file`：散列文件名；`""`/null = 清空附件。
+    `url`：外部链接，`""`/null = 清空（ADR-044，仅 http/https，服务层校验）。
     """
     name: str | None = None
     category: str | None = None
@@ -446,6 +463,7 @@ class AssetDeliverableUpdate(BaseModel):
     meta: str | None = None
     status: str | None = None
     file: str | None = None
+    url: str | None = None
 
 
 class AssetDeliverableOut(_ORM):
@@ -458,6 +476,7 @@ class AssetDeliverableOut(_ORM):
     meta: str
     status: str
     file: str | None = None  # ADR-024：单文件附件散列名（空/NULL=无附件）
+    url: str = ""  # ADR-044：外部链接（空串=无链接；仅 http/https）
     updatedAt: str
 
 
@@ -509,6 +528,10 @@ class LogOut(_ORM):
     assetId: int | None = None  # 仅 target='asset' 有值；前端 types.ts 未声明，属可选附加字段
     changes: str = ""  # 字段级变更描述（仅 update_asset 有实际变更时非空），如「销售单价: 330,000 元 → 3,200,000 元」
     contractId: int | None = None  # 关联合同（ADR-007）；合同级状态变更日志非空
+    # ADR-041（FLOW-20261022）：target='project'/'outbound' 的结构化外键，
+    # 前端「流转过程」按 id 精确过滤（对齐 assetId 既有做法）；非项目级日志显式 null。
+    # 注：Visibility.log_visible 早已按该字段过滤，本字段纯属出参补齐，无行为变更。
+    projectId: int | None = None
 
 
 # ============================================================
@@ -527,7 +550,7 @@ class CartItemOut(_ORM):
     # 服务期限（ADR-020，PRICING-20261020）：YYYY-MM-DD；遥感行不填；存量行为 null
     serviceStart: str | None = None
     serviceEnd: str | None = None
-    # 折扣率（DISCOUNT-20261021/ADR-023）：0-1 小数（0.9=九折）；null=无折扣；存量行为 null
+    # 折扣率：**已下线（ADR-039）**——出参保留该字段（历史行原值可追溯），新行恒 null
     discountRate: float | None = None
     createdAt: str
     updatedAt: str
@@ -547,25 +570,24 @@ class CartItemInput(BaseModel):
     # 服务期限（ADR-020，PRICING-20261020）：YYYY-MM-DD，start ≤ end 否则 400；遥感行不填
     serviceStart: str | None = None
     serviceEnd: str | None = None
-    # 折扣率（DISCOUNT-20261021/ADR-023）：0-1 小数（0.9=九折），选填；
-    # 0 < rate ≤ 1 否则 400「折扣率须为 0 到 1 之间的正数」（服务层校验）；
-    # null 允许=清空（无折扣）。后端只存不算，amount 校验完全不变
+    # 折扣率：**已下线（ADR-039），后端忽略**——字段保留以兼容旧客户端（不 422、不 400）；
+    # 后端不读取、不校验、不落库
     discountRate: float | None = None
 
 
 class CartPatchInput(BaseModel):
     """PATCH /cart/{id}：修改购物车行级客户（ADR-007）；可选携带 amount（ADR-008）
-    与服务期限（ADR-020，PRICING-20261020）、折扣率（DISCOUNT-20261021/ADR-023）。
+    与服务期限（ADR-020，PRICING-20261020）。
 
-    amount 语义（ADR-018 §3）：unit/遥感明细行=折扣金额（传入即采信并过参考区间校验，
-    不传保持 NULL=原价成交）；amount 模式行=权威合同金额（整数元，不传保持原值）。
-    discountRate 语义（ADR-023）：0 < rate ≤ 1 否则 400；null=清空（无折扣）。
+    amount 语义（ADR-018 §3）：unit/遥感明细行=销售金额（传入即采信并过参考区间校验，
+    不传保持原值）；amount 模式行=权威合同金额（整数元，不传保持原值）。
+    discountRate：**已下线（ADR-039），后端忽略**——容忍旧客户端传值，不校验、不落库。
     """
     customer: str
     amount: float | None = None
     serviceStart: str | None = None  # YYYY-MM-DD；start ≤ end 否则 400
     serviceEnd: str | None = None
-    discountRate: float | None = None  # 0-1 小数；null=清空（无折扣）
+    discountRate: float | None = None  # 已下线（ADR-039），后端忽略
 
 
 class CartQtyUpdate(BaseModel):
@@ -579,7 +601,7 @@ class CartQtyUpdate(BaseModel):
     amount: float | None = None
     serviceStart: str | None = None
     serviceEnd: str | None = None
-    discountRate: float | None = None
+    discountRate: float | None = None  # 已下线（ADR-039），后端忽略（容忍旧客户端传值）
 
 
 class OutboundRevertInput(BaseModel):

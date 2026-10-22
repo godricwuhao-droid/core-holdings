@@ -6,6 +6,137 @@
 
 ---
 
+## 2026-10-22 变更（DELIV-20261022-B：`asset_deliverables.url` 交付物外部链接，ADR-044）
+
+### 1. 新增列
+
+| 表.列 | 类型 | 可空 | 默认 | 说明 |
+|---|---|---|---|---|
+| `asset_deliverables.url` | VARCHAR(512) | 是（SQLite `ADD COLUMN` 语义） | `''` | 交付物外部链接（文档/网盘/在线手册/GitHub Release 等）。**仅允许 `http://` / `https://`**（服务层白名单校验，伪协议 = 存储型 XSS 入口）；`''` = 无链接。与 `file`（附件）**可并存**、均非必填，不做互斥也不做「至少填一个」 |
+
+### 2. 迁移语句（`main.py::_ensure_migration`，纯结构、幂等、**零数据操作**）
+
+```sql
+-- 幂等：deliv_cols = inspect(engine).get_columns('asset_deliverables')，无 url 才执行（复用 ADR-024 的 deliv_cols，不重复 inspect）
+ALTER TABLE asset_deliverables ADD COLUMN url VARCHAR(512) DEFAULT '';
+```
+
+- 存量行由列 `DEFAULT ''` 填充（=无链接），**无数据回填、不写 `_run_once` 标记**（纯结构变更，ADR-031 口径）；
+- 实测（生产库 `core_holdings.db`，dev `--reload` 触发）：补列前后 `asset_deliverables` 均 **3 行**，逐行 `id/name/file` 完全一致 `[(1,'产品手册',NULL),(2,'交付材料','f3ffd157…png'),(3,'交付才来哦',NULL)]`，仅多出 `url=''`；`PRAGMA table_info` → `url VARCHAR(512) dflt_value=''`；
+- 幂等实测（副本库 `/tmp/adr044.db`）：连续两次执行迁移函数，第 1 次 `print("[migration] asset_deliverables.url 列已补充（ADR-044 交付物外链）")`，第 2 次**无任何动作/输出**。
+
+### 3. 约束与不变式
+
+- 长度 ≤ 512（与列宽一致，服务层 `DELIVERABLE_URL_MAX` 同值，超长 400 而非截断）；
+- 协议白名单唯一入口 `services._normalize_deliverable_url`（新增/更新共用）：`strip` → 空则 `''` → 非 `http(s)://` 前缀 400 → 超长 400；
+- 写入路径只有 `add_asset_deliverable` / `update_asset_deliverable` 两处，均先归一后写库；
+- 删除端点（`DELETE /assets/{id}/deliverables/{item_id}`）**未改动**，`delete_asset` 的级联清理不受影响。
+
+---
+
+## 2026-10-22 变更（RS-STATUS-20261022：`rs_items.status`（in_stock / all_sold）+ 1 索引，ADR-038 Decision 3 修订）
+
+### 1. 新增列
+
+| 表.列 | 类型 | 可空 | 默认 | 说明 |
+|---|---|---|---|---|
+| `rs_items.status` | VARCHAR(32) | 是（SQLite `ADD COLUMN` 语义） | `'in_stock'` | 明细状态标识：`in_stock`（可售）/ `all_sold`（已售罄），与 `assets.status` **同枚举**。容器「可售数量」= `COUNT(status='in_stock')`。写入唯一入口 `services._sync_rs_item_status`（按真值重算，幂等），**禁止各处手写赋值**：`repeatSale=true` 或未被非 terminated 合同引用 → `in_stock`；否则 → `all_sold` |
+
+### 2. 新增索引
+
+| 索引 | 定义 | 说明 |
+|---|---|---|
+| `ix_rs_items_status` | `INDEX(status)` | 支撑容器可售数聚合 `WHERE status='in_stock' GROUP BY assetId`（`_rs_container_available_counts`，1 条聚合） |
+
+### 3. 迁移语句（`main.py::_ensure_migration`，纯结构、幂等、**零数据操作**）
+
+```sql
+-- 幂等：inspect(engine).get_columns('rs_items') 无 status 才执行
+ALTER TABLE rs_items ADD COLUMN status VARCHAR(32) DEFAULT 'in_stock';
+CREATE INDEX IF NOT EXISTS ix_rs_items_status ON rs_items (status);
+```
+
+- 存量 60 行由列 `DEFAULT 'in_stock'` 填充（SQLite `ADD COLUMN` 对既有行填默认值）；**不做**任何 `DELETE/UPDATE`（ADR-031 启动期禁止无标记数据动作）。
+- 真值归一/漂移修复走脚本：`python3 backend/scripts/sync_rs_item_status.py --asset-id 29 --yes`（`--asset-id` 可选=全表；`--dry-run` 预览；SQLite 在线备份 API + 单事务 + OpLog `action='明细状态归一'`；幂等 → 0 变更不备份不写库）。
+- 真实库实测（2026-10-22）：补列后 `status` 分布 `in_stock=60 / all_sold=0`，`PRAGMA index_list(rs_items)` = `ix_rs_items_status`、`uq_rs_items_dim`、`ix_rs_items_assetId`；脚本预检「需要变更 0 条」→ 跳过（0 变更）。
+- 脚本写入路径实测（副本库）：人为把 `#5` 写歪为 `all_sold` → `--yes` 纠正 1 条，备份 `/tmp/rs-status-backup-<ts>.db`（integrity_check=ok）、OpLog「1 条明细 status 按真值归一（in_stock=59、all_sold=1；RS-STATUS-20261022）」；重跑 0 变更。金额 `10354297`、明细 60 条、容器 `quantity` 60 均未变。
+
+### 4. 口径与不变式
+
+- `bootstrap.assets[].availableCount`（仅容器）= `COUNT(rs_items.status='in_stock')`；
+- 锁 1 条明细 ⇒ `assets.lockedQty +1` **且** 该明细 `all_sold`（可售 −1）；交付 ⇒ `lockedQty −1 / shippedQty +1`，明细保持 `all_sold`；撤销交付 / 释放 / 终止 / 驳回 / 删项目 ⇒ 明细回 `in_stock`；
+- 因此 `quantity − lockedQty − shippedQty == COUNT(status='in_stock')`（`quantity` = 明细总条数）。**已知边界**：明细由 `repeatSale=false` 切到 `true` 时不释放既有锁定，该步骤上两侧差 1（更保守、不超卖），切回 `false` 自动对齐（详见 changelog 同任务条目）。
+
+---
+
+## 2026-10-22 变更（RS-REPEAT-20261022-FIX：遥感容器 `assets.quantity` = 可售明细条数，存量 1 → 60）
+
+**无表结构变更**（无新表/新列/新索引，`_ensure_migration()` 不需改动）：只修正**数据口径**与写入侧同步逻辑。
+
+### 1. 口径规则（`services._sync_container_quantity`，唯一实现）
+
+| 条件 | 行为 |
+|---|---|
+| 产品 `type != '遥感数据'` | 不处理（非容器仍用登记数量） |
+| 容器 `lockedQty == 0 and shippedQty == 0`（无任何真实锁定/已交付） | `quantity = COUNT(rs_items WHERE assetId = :id)`（新建明细 +1、删除明细 −1，同事务） |
+| 容器存在锁定或已交付 | **不改数量**（避免冲掉在售统计）；仅校验 `quantity >= lockedQty + shippedQty`，不满足 → `_invariant_violation`（HTTP 500 + `logs` 审计告警） |
+
+调用点：`create_rs_item`、`delete_rs_item`（提交前同事务；`delete` 先显式 `flush()` 再 COUNT——session `autoflush=False`）；
+脚本侧等价实现：`scripts/sync_container_quantity.py`、`scripts/import_rs_items.py`、`scripts/reset_rs_items.py`（脚本不 import 业务包，口径须同步修改）。
+
+### 2. 存量修正（一次性，脚本，**不放启动迁移**，ADR-031）
+
+```sql
+-- 预检（只读）：assets#29 quantity=1、lockedQty=0、shippedQty=0、rs_items 60 条
+SELECT a.id, a.quantity, a.lockedQty, a.shippedQty,
+       (SELECT COUNT(*) FROM rs_items r WHERE r.assetId = a.id) AS itemCount
+FROM assets a WHERE a.id = 29;
+
+-- 执行（BEGIN IMMEDIATE 单事务；事务内二次复核 type/quantity/locked/shipped/明细条数）
+UPDATE assets SET quantity = 60, updatedAt = '2026-10-22' WHERE id = 29;   -- 实测 1 行
+INSERT INTO logs (target, targetName, action, detail, operator, time, assetId, changes)
+VALUES ('asset', '遥感数据-2026', '同步容器数量',
+        '容器数量按可售明细条数同步：1 → 60（明细 60 条）', 'admin', '2026-10-22 15:40', 29, '');  -- OpLog #700
+```
+
+- 命令：`python3 backend/scripts/sync_container_quantity.py --asset-id 29 --yes`（`--dry-run` 只预览；缺省不带 `--yes` 也不写库）
+- **备份：`/tmp/container-quantity-backup-20261022-154000.db`（在线备份 API，integrity_check=ok，18 表，保留不删）**
+- 回读：`assets#29.quantity = 60` = 明细 60 条；其它表行数不变（仅 `logs` +1）；幂等重跑 0 变更。
+- 影响：`quantity - lockedQty - shippedQty` 与 `bootstrap.assets[].availableCount`（明细总数 − 占用且 `repeatSale=false`）**口径一致**；修复前 `quantity=1` 使 `rs_items` 明细只能卖出 1 条（`lockedQty` 条件更新 `quantity-lockedQty-shippedQty>=1` 第 2 条起失败）。
+
+### 3. 无索引/无外键变更
+
+`project_items.itemId` / `rs_items.assetId` 仍为普通整型列（无 FK），`occupied` 派生字段走 `idx_project_items_itemId` + `idx_contracts_status`（既有索引），未新增索引。
+
+---
+
+## 2026-10-22 变更（RS-REPEAT-20261022 / ADR-038：`rs_items.repeatSale` 默认值语义改为单次售卖）
+
+**无表结构变更**（无新表/新列/新索引，`_ensure_migration()` 不需改动，SQLite 不重建表）：默认值只存在于 ORM 层（`models.RsItem.repeatSale default=False`），DDL 里该列为 `BOOLEAN NOT NULL`，无 `DEFAULT`。
+
+| 表.列 | 变更 | 说明 |
+|---|---|---|
+| `rs_items.repeatSale` | 修改（ORM 默认值 `True → False`） | `false`（默认）= **单次售卖**：被非 terminated 合同占用即从容器可售数扣除；`true` = 可重复售卖（只计次不扣量）。历史章节中「默认 1」的描述为 ADR-011 时期口径，已被本节覆盖 |
+
+数据归一（一次性，脚本 `backend/scripts/normalize_rs_repeat_sale.py`，**不放启动迁移**，ADR-031）：
+
+```sql
+-- 预检（只读）：60 条 / 合计 10354297 元 / 其中 repeatSale=1 60 条（1m 6、1.5m 54）
+SELECT COUNT(*), SUM(price), SUM(CASE WHEN repeatSale = 1 THEN 1 ELSE 0 END)
+FROM rs_items WHERE assetId = 29;
+
+-- 执行（BEGIN IMMEDIATE 单事务；transaction 内二次复核条数/金额）
+UPDATE rs_items SET repeatSale = 0 WHERE assetId = :assetId AND repeatSale != 0;  -- 实测 60 行
+INSERT INTO logs (target, targetName, action, detail, operator, time, assetId, changes)
+VALUES ('asset', '遥感数据-2026', '明细重复售卖归一',
+        '60 条明细 repeatSale 置为 false（ADR-038）；明细总数 60 条、合计金额 10354297 元不变',
+        'admin', '2026-10-22 15:27', 29, '');                                        -- OpLog #695
+```
+
+回读：`repeatSale=1` **0** 条、明细总数 **60**、`sum(price)` **10354297** 不变；备份 `/tmp/rs-repeat-backup-20261022-152740.db`（在线备份 API，保留）。
+
+---
+
 ## 2026-10-22 变更（ENTITIES-20261022 / ADR-035：资产主体表 `entities` + 存量回填）
 
 ### 1. 新增表
@@ -48,7 +179,7 @@ SELECT DISTINCT subject, subject, :now, :now FROM assets WHERE subject <> '';
 | 表.列 | 类型 | 可空 | 默认 | 说明 |
 |---|---|---|---|---|
 | `users.tokenVersion` | INTEGER | 是 | 0 | 凭据版本（BUG-11 / ADR-034 §2）：写入 JWT payload `ver`，`get_current_user` 每请求比对，不一致 401。改密 / 禁用 / 改角色时 +1。存量账号补列置 0（旧 token 无 `ver` 按 0 处理，仍然有效直至自然过期） |
-| `logs.projectId` | INTEGER | 是 | NULL | 项目级操作日志的结构化归属外键（BUG-13 / ADR-030 §4）：viewer 日志可见性只看外键（`projectId`/`contractId`），不再用 detail 文本里的 `SP-` 正则。新建日志由 `add_log(..., project_id=...)` 写入；**存量 project 日志保持 NULL → 对 viewer 一律过滤**（宁可保守） |
+| `logs.projectId` | INTEGER | 是 | NULL | 项目级操作日志的结构化归属外键（BUG-13 / ADR-030 §4）：viewer 日志可见性只看外键（`projectId`/`contractId`），不再用 detail 文本里的 `SP-` 正则。新建日志由 `add_log(..., project_id=...)` 写入；**存量 project 日志保持 NULL → 对 viewer 一律过滤**（宁可保守）；**项目删除后其日志 `projectId` 置 NULL（ADR-041 补遗1），日志行保留**（表结构/外键未变，SQLite `INTEGER PRIMARY KEY` 无 `AUTOINCREMENT` 会复用已删项目 id） |
 
 ### 3. 新增唯一索引
 
@@ -616,10 +747,12 @@ ALTER TABLE logs   ADD COLUMN changes    VARCHAR(512) DEFAULT '';
 | resolution | FLOAT | 精度（米），> 0 |
 | saleMonth | VARCHAR(7) | 售卖月份 `YYYY-MM` |
 | price | FLOAT | 单价，整数元/份（元口径） |
-| repeatSale | BOOLEAN | 默认 1（true=只计次不扣量；false=锁父产品数量） |
+| priceMin/priceMax | FLOAT NULL | 参考区间（ADR-021，NULL=不限制） |
+| repeatSale | BOOLEAN | **默认 0**（ADR-038：false=单次售卖，售出即占用；true=只计次不扣量）。历史章节「默认 1」为 ADR-011 时期口径，已废弃 |
+| status | VARCHAR(32) INDEX | **2026-10-22 新增（RS-STATUS-20261022）**：`in_stock`（可售，默认）/ `all_sold`（已售罄）；容器可售数 = `COUNT(status='in_stock')`；写入唯一入口 `services._sync_rs_item_status` |
 | createdAt/updatedAt | VARCHAR(32) | `YYYY-MM-DD HH:MM` |
 
-唯一性 `(assetId, province, city, resolution, saleMonth)` 服务层判重（无 DB 约束）。引用完整性：`project_items.itemId` / `cart_items.itemId` 有引用时禁止删除（400「该明细存在销售关联，无法删除」）；父产品删除时级联清理（delete_asset 通过引用校验后才可达）。
+唯一性 `(assetId, province, city, resolution, saleMonth)` 服务层判重（DB 兜底 `uq_rs_items_dim`）。引用完整性：`project_items.itemId` / `cart_items.itemId` 有引用时禁止删除（400「该明细存在销售关联，无法删除」）；父产品删除时级联清理（delete_asset 通过引用校验后才可达）。
 
 ### outbounds（交付）
 

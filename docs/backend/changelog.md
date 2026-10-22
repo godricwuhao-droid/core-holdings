@@ -2,6 +2,330 @@
 
 > 记录 core-holdings 后端（FastAPI + SQLAlchemy + SQLite）的接口与行为变更。
 
+## 2026-10-22 ｜ ADR-044：`asset_deliverables.url`（外部链接）+ 协议白名单校验
+
+> **依据 ADR-044（Accepted，2026-10-22，业务方要求「交付物支持填入 URL 链接」）**。删除端点（`api.py:836`，`DELETE /assets/{id}/deliverables/{item_id}`）**已存在，本任务未改**。
+> `url` 会被渲染为可点击 `<a>`，`javascript:` / `data:` 伪协议 = 存储型 XSS 入口 → 后端白名单校验（400），不接受「只在前端校验」。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-22 | 新增 | `asset_deliverables.url`（外部链接）+ 协议白名单校验（仅 http/https，否则 400）+ schema 三处同步 | `backend/src/models.py`、`backend/main.py`、`backend/src/schemas.py`、`backend/src/services.py`；`docs/backend/{database,api,changelog}.md` | ADR-044 / DELIV-20261022-B | 结构迁移幂等（`deliv_cols` 复用，未重复 inspect）；存量行 `url=''`；删除端点未改；**未 commit** |
+
+改动明细：
+- `models.AssetDeliverable`：`file` 之后新增 `url: Mapped[str] = mapped_column(String(512), default="")`（`''` = 无链接；与 `file` 可并存、均非必填）。
+- `main.py::_ensure_migration`：在 `asset_deliverables.file` 补列段之后追加第 18 段幂等补列——`if "url" not in deliv_cols: ALTER TABLE asset_deliverables ADD COLUMN url VARCHAR(512) DEFAULT ''`（**纯结构迁移**，不写 `_run_once`、不做数据回填，ADR-031）。
+- `schemas.py`：`AssetDeliverableInput.url: str = ""`、`AssetDeliverableUpdate.url: str | None = None`（docstring 补「`url`：外部链接，`""`/null = 清空」）、`AssetDeliverableOut.url: str`。
+- `services.py`：新增模块级 `DELIVERABLE_URL_MAX = 512` + `_normalize_deliverable_url`（**唯一出口**：`strip` → 空=`''` → 非 `http(s)://` 前缀 400「链接地址必须以 http:// 或 https:// 开头」→ 超长 400「链接地址过长（最多 512 字符）」）；`add_asset_deliverable` 写入归一值；`update_asset_deliverable` 在**任何 setattr 之前**归一 patch 里的 `url`，并把 `url` 加入 setattr 白名单元组，`exclude_unset` 语义保持不变（未传=不动 / `""`/null=清空）。
+- `api.py` **未改**（`Input/Update/Out` 变更自动生效）；删除端点、权限、`file` 附件逻辑、`updatedAt` 刷新逻辑均未动。
+
+实测（副本库 `/tmp/adr044.db`，独立进程 uvicorn :8013，真实 HTTP；生产库 `core_holdings.db` 仅只读核对 + dev `--reload` 触发的补列）：
+- **迁移幂等**：副本库（预置删掉 `url` 列）连续两次执行迁移函数——第 1 次 `[migration] asset_deliverables.url 列已补充（ADR-044 交付物外链）`，第 2 次无输出/无动作；`PRAGMA table_info` → `url VARCHAR(512) dflt_value=''`。
+- **新增带链接**：`POST /api/assets/1/deliverables` `{"name":"交付说明书",…,"url":"https://example.com/doc"}` → **200** `{"ok":true}`；bootstrap `assetDeliverables["1"]` 含 `"url":"https://example.com/doc"`。
+- **协议白名单**：`javascript:alert(1)` / `data:text/html,<script>` / `ftp://x` → 均 **400**「链接地址必须以 http:// 或 https:// 开头」，行数不变、id 无跳号；`https://`（形似合法边界）→ **200**（只做前缀白名单，不做深度校验，已知边界）。
+- **首尾空格**：`"  https://a.com/x  "` → 落库 `https://a.com/x`（`length=15`）。
+- **更新语义**：`{"url":"  http://b.com  "}` → 落库 `http://b.com`；`{"status":"todo"}`（不传 url）→ `url` 保持 `http://b.com`（`exclude_unset` 未破坏）；`{"url":""}` 与 `{"url":null}` → 均落库 `''`；非法/超长 PUT → 400 且原值不变。
+- **超长**：513 字符 https URL → **400**「链接地址过长（最多 512 字符）」，未落库；512 字符 → **200**（边界值可入库）。
+- **删除端点回归**：`DELETE /api/assets/1/deliverables/8` → **200** `{"ok":true}`，行 8→7，审计 `删除交付物` 1→2（`detail="删除交付物「512边界」"`）。
+- **生产库**：补列前后均 3 行，逐行 `id/name/file` 完全一致，仅多出 `url=''`；审计 `删除交付物` 仍为 1（本任务测试全部跑在副本库）。
+
+## 2026-10-22 ｜ ADR-043：`refill-cart` 拒绝商务（editor）角色
+
+> **依据 ADR-043（Accepted，2026-10-22，业务方要求「商务人员不能重新提交」）**。
+> 回填目标**恒为下单人**（`_withdraw_owner`），商务点完自己购物车无任何变化，只是「提示成功但什么也没发生」；
+> 合法路径 = 通知下单人本人重新提交，或由 admin 代操作。**无新表、无迁移**，`mode` 语义 / `replace` 双守卫 / 返回结构 / 撤销路径全部未变。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-22 | 修改 | `refill-cart` 拒绝商务（editor）角色（403），权限收敛为 viewer 本人 + admin | `backend/src/services.py`（`refill_project_cart` 守卫链 + docstring 权限段）；`docs/backend/api.md` | ADR-043 / REFILL-20261022-B4 | **Breaking（行为变更）**：editor 由 200 变 403；撤销权限未变；未 commit |
+
+改动明细：
+- `services.refill_project_cart`：守卫链在 `viewer` 权限判定之后、`owner` 解析之前追加 `if user.role == "editor": raise HTTPException(403, "商务人员不可使用「重新提交」，请通知下单人本人操作")`——**位于任何写操作之前**（购物车 / `projects.cartRefilled` / OpLog 一行未动）；docstring 权限段改写为「viewer 仅本人项目 / admin 放行 / **editor 403**」，注明**部分取代 ADR-027 的 editor 放行**。
+- 路由 `POST /projects/{id}/refill-cart` 的 `require_order` **未动**（三角色都能进端点，由业务级守卫拒绝，错误信息更准确）；`withdraw_project` **未动**（商务仍可撤销）。
+- 未改 `mode` 语义、未改 `_refill_cart_from_project`、未改返回值结构；未 commit、未重启 8000。
+
+实测（副本库 `/tmp/adr043.db`，独立进程 uvicorn :8013，真实 HTTP；生产库 `core_holdings.db` 只读核对计数不变）：
+- **editor 被拒**：`lshangkun`（副本库内置为 editor、且为项目 creator）本人项目 `mode=merge` → **403** `{"detail":"商务人员不可使用「重新提交」，请通知下单人本人操作"}`；调用前后该用户 `cart_items`（0 行）、`projects.cartRefilled`（0）、`logs`（669）、`audit_logs`（1118）**逐项未变**；
+- **editor 对他人项目**（`creator=zyajie`）→ 同样 **403** 同文案（业务级拒绝优先于 viewer 归属判定）；另一真实 editor `wuhao` 对 `lshangkun` 项目 → 也 403；
+- **viewer 不受影响**：`zyajie` 对自己项目 → **200**（`restored=1`）；对他人项目 → **403**「生态人员仅可重新提交自己下单的项目」（原文案）；
+- **admin 不受影响**：admin 对 `lshangkun` 项目 `mode=merge` → **200**（`owner={id:2,username:lshangkun}`，2 行 `insufficient` 跳过）；同项目 `mode=replace` → **400**「只能对本人购物车执行『清空后回填』，他人项目请使用合并」（ADR-042 补遗2 未破坏）；
+- **撤销不回归**：editor `lshangkun` 对 pending 项目 `withdraw` → **200** `{"ok":true,"restored":2,"amountFallback":0,"skipped":0,"skippedReasons":[]}`。
+
+## 2026-10-22 ｜ ADR-042：重新提交回填购物车 —— 替换语义 + `mode` 参数 + 逐行结果 + 可售不足说明
+
+> **依据 ADR-042（Accepted，2026-10-22，业务方确认「弹窗让用户选」+「合并=替换不累加」+「补可售不足说明」）**。
+> 实测病灶：被驳回项目 `SP-2026102216581487`（`cartRefilled=0`）2 行明细，产品 27/32 库存 1、`lockedQty=1`（被 pending 项目 4 锁走）→ 可售 0 → 全部跳过 → 购物车空，前端仍跳 `/cart`；
+> 另有两缺陷：同键累加导致**重试翻倍**、回填目标恒为**下单人**导致代操作者看到空车（本次只补后端 `owner` 归属信息，动线由前端改）。
+> **无新表、无迁移、不改 `cartRefilled` 布尔含义、不改 `POST /cart`（加购仍累加）、不改 `cart/checkout`、不改撤销的日志文案与流转事件。**
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-22 | 修改 | 重新提交回填购物车：①同键由累加改替换（修重试翻倍）②新增 `mode=merge\|replace`（replace 清空后回填且跳过幂等）③响应增 `rows/owner/mode/forced/cleared` ④可售不足原因带库存数值与占用提示 | `backend/src/services.py`（`_cart_add_inner` / `_refill_cart_from_project` / `refill_project_cart` / `withdraw_project` 调用点）；`backend/src/routers/api.py`（`POST /projects/{project_id}/refill-cart` 增 `mode` 查询参数） | ADR-042 / REFILL-20261022-B | 旧字段全保留（非 Breaking）；`POST /cart` 累加语义未变；撤销日志文案未变；未 commit |
+| 2026-10-22 | 修复 | replace 预检前移（全失败不清空，修数据破坏）+ replace 仅限本人购物车（防跨用户清空） | `backend/src/services.py`（`_refill_cart_from_project` 两阶段重构 / `refill_project_cart` owner 解析提前 + 新模式守卫） | ADR-042 补遗1/2 / REFILL-20261022-B2 | 非 Breaking（新参数内部加固）；未改 merge 语义、未改撤销路径；未 commit |
+| 2026-10-22 | 修改 | `rows[]` 增补 `assetId/code/need`（供前端结构化渲染失败原因），`reason` 文案与 `skippedReasons` 均未变 | `backend/src/services.py`（`_refill_cart_from_project` 的 `_row` / `planned` 预检 / 写阶段跳过分支；新增常量 `REFILL_ROW_CODES`）；`docs/backend/api.md` | REFILL-20261022-B3 | 纯加性，非 Breaking；未 commit |
+
+改动明细：
+- `_cart_add_inner(..., *, existing_policy: str = "accumulate")`：新增关键字参数，取值 `accumulate`（默认，加购零变化）/ `replace`（命中同键行 → **覆盖** `qty/amount/serviceStart/serviceEnd` + `updatedAt` 刷新，不新增行、不累加）；非法取值 → 400；可售/区间/客户校验两条路径同等生效（`replace` 的净增按「本次值 − 原值」计，避免覆盖式回填被存量行误判超可售）。
+- `_refill_cart_from_project(db, p, target_user_id, *, mode="merge")`：`replace` 先 `_clear_cart` + `db.flush()`（同事务、不 commit）并记 `cleared`；逐行**预检可售**（复用唯一实现 `_avail`）不足则不进 `_cart_add_inner`，直接产出带库存数值的原因；回填统一走 `existing_policy="replace"`；返回值扩展 `mode/cleared/rows`（旧 4 字段保留）。
+- `refill_project_cart(db, project_id, user, mode="merge")`：`mode ∉ {merge,replace}` → 400「非法的回填模式」（写操作前校验，单事务）；幂等短路**仅对 merge 生效**（`replace` 返回 `forced=true`）；响应加 `owner/mode/forced/cleared/rows`；OpLog `replace` 追加「（mode=replace，清空原有 C 行）」、`merge` 保持原文案。
+- `withdraw_project`：调用点改 `mode="merge"`（撤销**不清空**购物车），自动获得替换语义（撤销同键不再翻倍）；**返回结构与 OpLog 文案逐字未改**。
+- 路由 `POST /api/projects/{project_id}/refill-cart`：增 `mode: str = Query("merge")` 透传，权限 `require_order` 不变；`replace` 时 `audit_logs.detail` 追加 `, mode=replace, cleared=C`。
+
+实测（副本库 `/tmp/adr042.db`，进程内 TestClient；生产库 `core_holdings.db` 全程只读，未起 8000、未 build、未 commit）：
+- **替换语义**：购物车预置 `(assetId=33, 客户X) qty=1 / amount=500 / 2026-01-01~01-31`（`updatedAt` 人为拨旧）→ 明细同键 qty=1/amount=800/2026-02-01~02-28 → `mode=merge` 回填后该键**仍 1 行**、`qty=1`（非 2）、`amount` 500→**800**、服务期限覆盖为 02-01~02-28、`updatedAt` 刷新；
+- **重试不翻倍**：同上项目含一行被锁满明细（可售 0）→ 第 1 次 `restored=1/skipped=1`、`cartRefilled=0`；第 2 次（`merge`）→ 成功行 `qty` 仍为 **1**（未变 2）；
+- **`mode=replace`**：购物车预置 3 行无关商品 → `cleared=3`、`restored=1`、`forced=true`、`alreadyRefilled=false`，无关行全清、仅剩本项目明细；`cartRefilled=1` 后再传 `replace` → `cleared=1/restored=1/forced=true`（**未被短路**）；同状态传 `merge` → `alreadyRefilled=true/mode=merge/rows=[]`，`cart_items`+`logs` 逐字节未变（672 → 672）；`mode=bogus` → 400「非法的回填模式」；
+- **可售不足文案**：真实项目 `SP-2026102216581487` → `restored=0`、`skipped=2`，`rows` 两行 `ok=false`，reason 含「可售数量不足 / 库存 1 / 已锁定 1 / 已被其他订单占用」，**不含**「折扣」字样；`owner={id:2, username:lshangkun, name:刘尚坤}`；
+- **撤销不回归**：pending 项目 `withdraw` → 返回键集合仍为 `{ok, restored, amountFallback, skipped, skippedReasons}`；OpLog detail 逐字等于改动前模板「待审核订单已撤销，1 行明细回填购物车（原价回填 0 行，跳过 0 行），原因：…」；回填成功、`cartRefilled=1`；另测撤销同键（购物车已有 qty=2）→ 回填后 **qty=1**（覆盖，非 3）；
+- **加购不回归**：`POST /cart` 两次同产品同客户 → 单行 `qty=2`；
+- **可重复售卖不误伤**：`repeatSale=1` 且可售 0 的产品回填 → `restored=1/skipped=0`（预检按既有 `_check_stock` 口径对 repeatSale 豁免）；
+- `python3 -m compileall src main.py` 通过；副本库与临时脚本已清理。
+
+补遗1/2 实测（REFILL-20261022-B2，副本库 `/tmp/adr042b2.db` + 进程内 TestClient；生产库 `core_holdings.db` 全程只读）：
+- **A-1 全失败不清空**：真实项目 `SP-2026102216581487` + 下单人购物车预置 2 行 → `mode=replace` → `cleared=0`、`restored=0`、`skipped=2`、`rows` 两行 `ok=false`，**该用户 `cart_items` 仍为原来那 2 行（id 8/9 一条未删）**；
+- **A-2 部分可行仍清空**：造场景 1 行可行（asset 26）+ 1 行可售 0（asset 27，库存 1/锁定 1）→ 预置 2 行无关 cart → `replace` → `cleared=2`、`restored=1`、`skipped=1`，购物车只剩可行那一行；
+- **A-3 merge 不受影响**：同场景 `merge` → `cleared=0`、原有无关行仍在、同键行 `qty` 仍为 1（未累加）；
+- **B 跨用户拒绝**：admin 对 creator=`lshangkun` 的项目调 `replace` → **400**「只能对本人购物车执行『清空后回填』，他人项目请使用合并」，且下单人购物车 2 行**一行未删**（守卫在写之前）；同项目 admin `merge` → 200，回填目标仍为下单人；
+- **幂等优先级**：`cartRefilled=1` + `merge` → `alreadyRefilled=true/rows=[]` 且 `cart_items`/`logs` 计数不变；`replace` 由本人调用 → 跳过幂等、`cleared=4/restored=2`；
+- **生产库**：`projects/cart_items/logs` = 4/4/658，改动前后一致；`compileall` 通过；副本库与临时脚本已清理。
+
+B3 实测（REFILL-20261022-B3，副本库 `/tmp/adr042b3.db` + 进程内 TestClient；生产库 `core_holdings.db` 全程只读）：
+- **insufficient**：真实项目 `SP-2026102216581487`（`mode=merge`）→ `rows` 两行 `ok=false, code="insufficient", assetId=32/27, need=1`；`mode=replace`（可行行 0 → 走阶段 2a 分支）同样两行带 `code/assetId/need`；
+- **reason 逐字未变**：用「改动前基线模块」（对当前文件反向打补丁 10 处还原的旧实现）产出的 `rows` 做逐字节比对——`reason` 列表相等、旧 4 键（`assetName/qty/ok/reason`）整行相等、`skippedReasons` 相等；
+- **no_asset**：`assetId=999999`（产品已不存在）→ `code="no_asset", assetId=999999`；`assetId=None`（未关联产品）→ `code="no_asset", assetId=null`；
+- **other**：产品 26 明细 `amount=5000000`（非空）+ 服务期限 `2026-12-31 ~ 2026-01-01` → 首次与降级 `amount=None` 均 400 → `code="other"`（纯「金额超区间上限」降级后会成功，属 `amountFallback`/`ok`，故用降级后仍失败的期限校验构造）；
+- **ok**：产品 26 明细 `qty=3`（副本库库存临时调为 5）→ `code="ok", need=3, assetId=26, reason=""`；
+- **生产库**：`projects/contracts/project_items/cart_items/logs/audit_logs/flows/assets/users` 计数前后完全一致；`compileall` 通过；副本库与临时脚本已清理。
+
+## 2026-10-22 ｜ USERS-20261022：新增 13 个生态人员账号（纯数据操作）
+
+> 纯数据操作任务：**无代码改动**，走既有 `POST /api/users`（`require_admin` + `hash_password`（PBKDF2）+ `record_audit`），未手工 INSERT。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-22 | 新增 | 新增 13 个生态人员账号（viewer，随机初始密码单独交付，未入库文档） | `users` 表（纯数据，11 → 24 行；id 12–24）+ 无代码改动 | USERS-20261022 | 走真实 `POST /api/users`（PBKDF2 + 审计）；未改代码、未 build、未 commit |
+
+实测（进程内 TestClient + 线上 8000 真实 HTTP）：
+- 13 条均 HTTP 200 / `role=viewer` / `enabled=1` / `name` 与名单逐字一致；响应体不含 `passwordHash`；
+- `passwordHash` 13/13 匹配 `^pbkdf2\$[0-9a-f]{32}\$[0-9a-f]{64}$` 且两两不同（salt 随机）；
+- 13/13 真登录 200 + `GET /api/bootstrap` 200；抽查 `zyajie`：`POST /api/assets` 403、`GET /api/users/options` 403（ADR-030 §5）；
+- `audit_logs`：`actionType='user_mgmt'`、`action='新增用户'`、`detail='role=viewer'` +13 条（操作者快照 `username='admin'`）；
+- 存量 11 个账号 `passwordHash`/`tokenVersion` 逐字未变，`projects/contracts/cart_items` 计数不变（4/8/4）。
+
+## 2026-10-22 ｜ ADR-041 补遗1：`delete_project` 删除后置空本项目日志 `projectId`
+
+> **依据 ADR-041「补遗 1」（Accepted，2026-10-22）**：SQLite `INTEGER PRIMARY KEY` 无 `AUTOINCREMENT` → 删除项目后 id 被复用，
+> 旧日志的 `projectId` 仍指向那个数字，新项目「流转过程」会混入已删除项目的日志（线上已发生）。
+> 本次只在 `services.delete_project` 内做一处改动，**不改** `logs` 表结构 / 不加外键 / 不改 `add_log` / 不改 `Visibility.log_visible` / 不改前端。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-22 | 修改 | `delete_project` 删除前将本项目日志 `projectId` 置 NULL（保留日志文本），消除 SQLite id 复用导致的『旧项目日志挂到新项目流转过程』：新增 `db.execute(update(models.OpLog).where(models.OpLog.projectId == project_id).values(projectId=None))`，并补 `update` 到 `from sqlalchemy import func, select, update`。**执行时机在「删除」日志 INSERT + `db.flush()` 之后、`db.commit()` 之前**——按任务书的「`db.delete(p)` 之前」实测会**残留 1 条**（那条「删除」日志在 UPDATE 之后 INSERT，仍带旧 id，新项目复用同 id 时时间线里出现「删除项目 SP-…」），故按任务备注给出的修正路径下移 | `backend/src/services.py`（`delete_project`，L2722-2742；import L14） | ADR-041 补遗1 / FLOW-20261022-B2 | 存量已串台行**未清理**（前端 t0 守卫已覆盖展示）；审计日志不删；单事务性质不变（UPDATE 与删除同事务，任一步失败整体回滚）；未 commit。⚠️ 附带观察：8000 为 `--reload` 开发实例，改文件后 uvicorn 于 17:18:50 自动热重载 1 次（非人工重启），生产库数据零改动 |
+
+实测（副本库 `/tmp/adr041b2.db`，独立 8123 实例 + curl；生产库全程只读）：
+- 场景：建项目 A（id=**4**，日志 716 新增项目 / 717 接手订单 / 718 驳回订单，`projectId` 均=4）→ `DELETE /api/projects/4` 200 → 再建项目 B **id 仍为 4**（SQLite 复用 id 已复现）；
+- 删除后 `logs WHERE projectId=4` = **0 条**；A 的 3 条日志 `projectId` 全部 NULL、`detail`/`targetName` 原样（日志总数 653 → 654，仅 +1 = 新增那条「删除」日志，无文本丢失）；
+- 那条「删除」日志（id=719）也被置 NULL —— 与「`projectId` 仍有值」的预期不同，理由见上：保留旧 id 会让它在 B 的流转过程里重新串台（第一版位置实测确实如此）；
+- B 的时间线 1 条 = 自己的「新增项目」，A 独有的 action（接手订单/驳回订单/删除）出现 **0** 次、`targetName` 非 B 的日志 **0** 条；
+- 回归：`projects/contracts/project_items` 无残留（0/0/0）；删除仍锁定的项目 C 后 `assets#1.lockedQty` 2 → **0**（`shippedQty/soldCount/soldAmount` 不变）；`audit_logs` 删除前 1061 → 1062（仅路由层「删除销售项目」+1，旧行全部保留，服务层不碰审计表）；
+- SQL 顺序（engine echo 抓取）：`INSERT INTO logs(…, projectId=4, '删除')` → `DELETE FROM project_items/contracts/projects` → `UPDATE logs SET projectId=NULL WHERE projectId=4` → `COMMIT`（`session` 为 `autoflush=False`，UPDATE 前无隐式 autoflush；`synchronize_session` 默认 evaluate 同步内存实例，commit 未重复发 UPDATE）；
+- 副本库 / 临时脚本 / 8123 实例已清理；生产库 `logs` 650 条、`projectId` 非空 14 条（与改动前一致）。
+
+## 2026-10-22 ｜ ADR-041：`LogOut` 增补 `projectId`（纯加性出参字段）
+
+> **依据 ADR-041 Decision 2（Accepted，2026-10-22）**：前端抽屉「流转过程」需按项目 id 精确过滤日志。
+> `logs.projectId` 列早已存在、`add_log` 全项目级动作早已写入、`Visibility.log_visible` 早已按它过滤——**唯一缺口是出参没吐**。
+> 本次只补出参字段，**不动** `add_log` / `log_visible` / 任何写日志调用点 / `AuditLogOut` / 前端。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-22 | 修改 | `LogOut` 增补 `projectId: int \| None = None`（加性，响应结构不变，仅多一个可空键）：位置在 `contractId` 之后，注释风格对齐 `assetId`。`GET /api/bootstrap` 的 `logs[]` 与 `GET /api/assets/{id}/logs` 的 `items[]`（同一 `LogOut`）均随之多出该键；`target='asset'/'setting'/'contract'` 及 ADR-030 上线前存量 project 日志为**显式 `null`**（键始终存在） | `backend/src/schemas.py`（`LogOut`，L516-530） | ADR-041 / FLOW-20261022-B | **非 Breaking**：纯加性字段；visibility 过滤逻辑未动，viewer 可见性实测不回归；未重启 8000、未 commit |
+
+实测（副本库 `/tmp/adr041-verify.db` + 进程内 TestClient；线上 8000 只读 curl 复核，均 200）：
+- `logs` 650 条（`target='project'` 321 条）**全部含 `projectId` 键**；全量逐条与 `logs` 表比对**不一致 0 条**；
+- `id=711`（撤销订单）→ `projectId=1`；`id=714`（驳回订单）→ `projectId=2`（与库值相等，非空）；
+- `target='asset'`（308 条）/ `'setting'`（17 条）→ `projectId` 键存在且为显式 `null`；
+- viewer（`lshangkun`）可见 project 日志 **33 条**（admin 322 条，差 289 条被过滤），`projectId` 集合 `[1,2,3]` = 其名下 3 个项目；自己项目撤销日志 `id=711` **可见**；副本库另造 `creator='yaoyuan'` 项目（id=4）+ 撤销日志 → `lshangkun` **不可见**、`yaoyuan` **可见**；
+- 体积：`bootstrap` 255,878 → **266,886** 字节（**+11,008 字节 / +4.30%**，每行固定 +17 字节 `"projectId":null,`），可忽略；
+- 副本库与临时脚本已删除，无残留进程。
+
+## 2026-10-22 ｜ ADR-040：`DELETE /projects/{id}` 权限收紧至 admin + 一次性清理 2 条测试遗留项目
+
+> **依据 ADR-040（Accepted，2026-10-22，业务方在 A 全删 / B 收敛 / C 软删除 三案中选定 B）**。
+> ① ⚠️ **Breaking**：`DELETE /api/projects/{id}` 权限 `require_editor → require_admin`——**editor（商务）直调由 200 变 403**，
+> 服务端与前端「删除项目仅 admin 可见」同口径收口（前端隐藏 ≠ 禁止删除）；
+> ② 一次性运维清理 2 条测试遗留项目（`SP-2026102110215709` 云从项目、`SP-2026102120020331` QA034-UI验收单），
+> 走「备份 → 前置断言 → 单事务删除 → 后置断言」流程，**脚本不入库**；
+> ③ **ADR-028 §3 护栏（`terminated && cartRefilled` → 403）与 `services.delete_project` 的回滚逻辑逐字零改动**。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-22 | 修改 | ⚠️ **Breaking（权限面收窄）**：`DELETE /api/projects/{project_id}` 依赖 `Depends(security.require_editor)` → **`Depends(security.require_admin)`**。admin → 200；**editor（商务）→ 403 `{"detail":"无权限执行此操作"}`**（此前 200 可删）；viewer 403 不变。docstring/注释补 ADR-040 §2 说明（前端「更多▾ → 删除项目」仅 admin 可见，服务端必须同口径收口，防止 editor 持 token 直调）。路由层仅换依赖，**未新增任何业务判断** | `backend/src/routers/api.py:513-518`（`delete_project`） | ADR-040 §2 / ADR-028 §3 | 全局自查：`services.delete_project` 全仓**唯一调用点** = 本路由（grep `delete_project` 仅命中 `services.py` 定义 + `api.py:523` 调用 + 注释），无脚本/定时任务/其它端点调用 |
+| 2026-10-22 | 删除 | **一次性清理 2 条测试遗留项目**（运维动作，非产品行为，脚本施后即删、未入仓库）：删除 `projects` **2 行**、`contracts` **4 行**、`project_items` **4 行**。<br>目标：`id=1 / SP-2026102110215709 / 云从项目`、`id=3 / SP-2026102120020331 / QA034-UI验收单`（均 `terminated` + `cartRefilled=1`）。<br>合同 4 条：`HT-2026102110215779`（客户「的」）、`HT-2026102110215742`（「33」）、`HT-2026102110215797`（「大」）、`HT-2026102120020335`（QA034-UI客户）。明细 4 条（id 1/2/3/7，资产 26/25/24/1）全 `released`。<br>**未动**：`audit_logs`（审计不可删）、`cart_items`、`outbounds`（唯一 1 条属 `projectId=8` / `status=reverted`）、`logs`/`flows`/`assets` 行内容 | 生产库 `backend/core_holdings.db` | ADR-040 附录 / §5 | 备份：`backend/core_holdings.db.bak-20261022-before-cleanup`（**516096 字节 / 504K**，`PRAGMA integrity_check=ok`，删除前 `projects/contracts/project_items/audit_logs/cart_items = 2/4/4/1035/4`）；见下方前后对照表 |
+| 2026-10-22 | 修改 | **断言与结果留痕（同一批次，便于回溯）**：前端断言 → 事务内二次断言 → 删除 → 后置断言全部通过：三表归零、`project_items→projects` / `contracts→projects` / `project_items→contracts` 孤儿均为 **0**；资产 1/24/25/26 的 `lockedQty/shippedQty/soldCount/soldAmount` 删除前后**逐字相同**（全 0）；`cart_items` 4→4、`outbounds` 1→1 内容未变；`audit_logs` 备份中 1035 条 id **全部仍在**（零丢失） | `backend/core_holdings.db` | ADR-040 附录 | 执行期间有**真实用户同时在 8000 端口操作**（16:30 新建产品 `CH-SW-032`）：`audit_logs` 另 +1~3 条、`assets` +1、`logs` +3、`flows` +1，均为该用户写入，与本批删除无关（审计日志只增不减，无 id 缺失） |
+| 2026-10-22 | 修改 | **权限变更真实验证（非静态检查）**：在库副本 `/tmp/adr040-verify.db` 上以 TestClient 实测三连——① `terminated && cartRefilled=0` 项目 + **editor** token → **403**（且项目未被删）；② 同一 id + **admin** token → **200 `{"ok":true}`** 且行已删；③ 另造 `terminated && cartRefilled=1` + admin → **403**「该订单已撤销（或已回填购物车）并将保留历史记录，不可删除」（护栏未破）。另在干净副本上 `GET /api/bootstrap` → `projects=[] / contracts=[]` | 临时副本库（已删） | ADR-040 §2 / ADR-028 §3 | 生产库未参与验证；临时库与临时进程已清理 |
+
+**删除前后对照（生产库 `backend/core_holdings.db`）**
+
+| 表 | 删除前 | 删除后（后置断言当时） | 说明 |
+|---|---|---|---|
+| `projects` | 2 | **0** | 目标项目即全表 |
+| `contracts` | 4 | **0** | 全部属目标项目 |
+| `project_items` | 4 | **0** | id 1/2/3/7 |
+| `assets` | 25 | 25 | 行数不变（后为外部用户新增 +1，见上表） |
+| `audit_logs` | 1035 | 1035 | **不删**，id 零丢失（后为外部用户 +N） |
+| `cart_items` | 4 | 4 | 不动（与项目无外键） |
+| `outbounds` | 1 | 1 | 不动（`projectId=8` / `reverted`） |
+| `logs` / `flows` | 637 / 194 | 637 / 194 | 本批**未写** OpLog（纯运维直改库） |
+
+资产四值对照（`lockedQty / shippedQty / soldCount / soldAmount`，删除前后逐字相同）：
+
+| asset | 名称 | 删除前 | 删除后 |
+|---|---|---|---|
+| 1 | 智元机器人-G1 | 0 / 0 / 0 / 0.0 | 0 / 0 / 0 / 0.0 |
+| 24 | 大语言知识模型服务系统 | 0 / 0 / 0 / 0.0 | 0 / 0 / 0 / 0.0 |
+| 25 | 青牛企业大数据分析平台V1.0 | 0 / 0 / 0 / 0.0 | 0 / 0 / 0 / 0.0 |
+| 26 | 电磁数据处理软件 | 0 / 0 / 0 / 0.0 | 0 / 0 / 0 / 0.0 |
+
+## 2026-10-22 ｜ RS-STATUS-20261022：明细状态标识（in_stock / all_sold）+ 可售口径改为按状态计数 + DEFECT-1 修复
+
+> **业务方指定方案（ADR-038 Decision 3 修订，2026-10-22）**：明细自带状态，与外层产品逻辑同构——
+> `rs_items.status ∈ {in_stock(可售), all_sold(已售罄)}`，容器「可售数量」= **状态为可售的明细条数**。
+> 上一版「明细总数 − 被非 terminated 合同占用且 `repeatSale=false` 的明细数」的 join 推导**整体替换**。
+> **⚠️ 行为变更**：① 新增表列 `rs_items.status`（幂等启动迁移补列 + 索引，不做数据清除）；
+> ② `availableCount` 口径改为 `COUNT(status='in_stock')`；③ 下单护栏 400 文案改为「该可售明细已售罄，请选择其他明细」；
+> ④ **删除出参派生字段 `occupied`**（前端改用 `status`，避免两套语义并存）；⑤ 撤销交付的 shippedQty/soldCount/soldAmount 回退修复（DEFECT-1）。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-22 | 新增 | **表列 `rs_items.status VARCHAR(32) default 'in_stock'` + `ix_rs_items_status` 索引**：`in_stock`=可售 / `all_sold`=已售罄（与 `assets.status` 同枚举）。启动期幂等结构迁移（`ALTER TABLE ... ADD COLUMN`，已存在则跳过），存量 60 行由列 DEFAULT 填充为 `in_stock`；**不做任何 DELETE/UPDATE 类数据动作**（真值归一走脚本，ADR-031） | `backend/src/models.py`（`RsItem.status`）、`backend/main.py`（`_ensure_migration`） | RS-STATUS-20261022 §1 / ADR-038 D3 | 索引 `ix_rs_items_status` 已建；`PRAGMA index_list(rs_items)` 可验 |
+| 2026-10-22 | 新增 | **唯一状态维护入口 `services._sync_rs_item_status(db, item_id)`**（+ 批量版 `_sync_rs_item_statuses`）：按**真值**重算单条明细状态并落库——`repeatSale=true` → `in_stock`；否则被非 terminated 合同引用 → `all_sold`；未引用 → `in_stock`。幂等（无变化不写库）、无一处分处手写赋值；不回写 OpLog（派生字段，避免每单 N 条噪声日志）。调用点：`_create_project_core`（下单锁定后，**必须在明细行 flush 之后**，否则真值查询看不到本行）、`_apply_item_delivery`、`_apply_item_release`、`_revert_outbound_inner`、`update_rs_item`（repeatSale 切换）、`review_project`（驳回批量兜底）、`change_project_status`（批量兜底）、`delete_project`（删除后兜底） | `backend/src/services.py` | §2 | 冗余调用即自愈：任何遗漏点在后续动作/批量兜底中纠正 |
+| 2026-10-22 | 修改 | ⚠️ **容器 `availableCount` 口径改为 `COUNT(status='in_stock') GROUP BY assetId`**（1 条聚合，替换原 2 条 join 推导）；`_rs_item_occupied_ids`（派生 `occupied` 的实现）已删除 | `backend/src/services.py`（`_rs_container_available_counts`、`bootstrap`） | §3.1 | 与产品口径同构：锁 1 条明细 ⇒ `lockedQty +1` 且该明细 `all_sold`（可售 −1） |
+| 2026-10-22 | 修改 | ⚠️ **下单售罄护栏改为读明细状态**：`_validate_rs_item_ref` 中 `repeatSale=false 且 status='all_sold'` → **400「该可售明细已售罄，请选择其他明细」**（替换上一版基于 join 的占用检查）；同请求内重复选同一条单次售卖明细 → 400「同一条单次售卖明细不可在同一订单中重复下单，请选择其他明细」（`seen` 集合下沉进同一函数，仍是唯一实现） | `backend/src/services.py`（`_validate_rs_item_ref`、`_create_project_core`） | §3.2 | 三个下单入口（手动建单 / 购物车结算）自动同步 |
+| 2026-10-22 | 修改 | ⚠️ **出参新增 `status`、删除派生 `occupied`**：`RsItemOut` / `RsItemOutWithSold` 增加 `status`（`in_stock`/`all_sold`），`occupied` 字段移除（`GET /assets/{id}/rs-items` 与 `bootstrap.rsItems` 同步） | `backend/src/schemas.py`、`backend/src/routers/api.py`、`backend/src/services.py` | §3.3 | 前端改用 `item.status === 'all_sold'` 置灰/文案（原 `occupied` 判断改为状态判断） |
+| 2026-10-22 | 修复 | **DEFECT-1（P0）撤销交付不回退销量**：`_revert_outbound_inner` 先改 `a.shippedQty/soldCount/soldAmount`（session `autoflush=False`，尚未落库），随后 `apply_item_lock(add=True)` 内部 `db.refresh(a)` 把挂起修改**永久丢弃** → 撤销交付后 shippedQty 残留、soldCount/soldAmount 不回退。修法：在 `apply_item_lock(add=True)` 之前显式 `db.flush()`（同一事务，不改变原子性），并附 WHY 注释 | `backend/src/services.py`（`_revert_outbound_inner`） | RS-STATUS-20261022 §4 | 验证：撤销后 shippedQty=0 / soldCount=0 / soldAmount=0 / lockedQty 复原 |
+| 2026-10-22 | 新增 | **存量/修复脚本 `backend/scripts/sync_rs_item_status.py`**：`--asset-id`（可选，缺省全表）、`--dry-run`、`--yes`、`--db`；按真值重算并落库（SQLite 在线备份 API + 单事务 + OpLog `action='明细状态归一'` + 回读校验）；**幂等**：0 变更直接退出（不备份、不写库）。真实库执行：60 条已全为 `in_stock`、0 变更 | `backend/scripts/sync_rs_item_status.py` | §1.3 | 同时作为「状态与真值漂移」的人工修复出口 |
+
+**已知边界（非缺陷，业务方可决定是否收紧）**：把某条明细 `repeatSale` 由 `false` 切到 `true` 时，
+该明细此前以「单次售卖」身份下的锁（`assets.lockedQty`）**不会自动释放**（`apply_item_lock` 对
+repeatSale 明细短路，交付/终止都不再触碰它）。此时 `availableCount`（按状态，+1）与
+`quantity − lockedQty − shippedQty`（不减）会差 1 条，方向是**更保守**（不会超卖），且把 `repeatSale`
+切回 `false` 后两者自动重新对齐（状态按真值重算 ⇒ 缺口归零）。若要求严格恒等，需要「切到 true 时
+释放该明细历史锁定并把对应 `project_items.locked` 置 0」（与 `update_asset` 对产品 repeatSale 的
+幽灵锁清零同思路，属业务语义变更，需另行确认后实施）。
+
+## 2026-10-22 ｜ RS-REPEAT-20261022-FIX：⚠️ 修复「明细默认单次售卖后容器只能卖出 1 条」
+
+> **缺陷（P0）**：ADR-038 把 `rs_items.repeatSale` 默认改为 `false` 后，明细行下单改走真实扣量分支
+> `apply_item_lock(asset_id=父容器, qty=1)`，而容器 `assets.quantity` 一直是登记占位值 **1**
+> （实际 60 条明细）。于是 `UPDATE assets SET lockedQty=lockedQty+1 WHERE quantity-lockedQty-shippedQty>=1`
+> 只有第 1 条能成功，第 2 条起 `rowcount=0` → 400「可用数量不足」；同一单两条明细
+> `_validate_item_stock(asset, 2, repeat_override=False)` → 2 > 1 → 400；交付侧
+> `shippedQty + qty > quantity` → `_invariant_violation`（500）。**结论：60 条单次售卖明细实际只能卖出 1 条。**
+> 此前全部 `repeatSale=true` 时走「跳过扣量」分支，缺陷被掩盖。
+> **无表结构变更、无新端点、无 Migration 上启动期**（存量数据走 `backend/scripts/`）；**非 Breaking**（仅新增 `occupied` 字段）。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-22 | 修复 | ⚠️ **容器 `quantity` 与可售明细条数自动同步**（新增 `_sync_container_quantity`）：产品 `type == RS_DATA_TYPE` 且 `lockedQty == 0 and shippedQty == 0` → `quantity = COUNT(rs_items)`；否则**不改数量**（避免冲掉在售统计）但校验 `quantity >= lockedQty + shippedQty`，不满足 → `_invariant_violation`（500 + 审计告警）。调用点：`create_rs_item` / `delete_rs_item`（提交前同事务；delete 先显式 `flush` 再 COUNT，因 session `autoflush=False`） | `backend/src/services.py`（`_sync_container_quantity`、`_rs_container_item_count`、`create_rs_item`、`delete_rs_item`） | RS-REPEAT-20261022-FIX §1 | 同步后 `availableCount`（明细总数 − 占用且 false）与 `quantity − lockedQty − shippedQty` 两个口径**天然一致** |
+| 2026-10-22 | 修复 | **明细级占用护栏**：`_validate_rs_item_ref`（三个下单入口共用）在 `rs.repeatSale == False` 时，若已存在 `project_items.itemId == rs.id` 且所属 `contracts.status != 'terminated'` → 400「该可售明细已被占用（已售出或锁定），请选择其他明细」；`repeatSale == True` 不校验。检查与写入同一事务（checkout 单事务 + `apply_item_lock` 条件更新，SQLite 单写者），不新增读-改-写竞态 | `backend/src/services.py`（`_validate_rs_item_ref`） | §2 | 防「同一条明细卖两次」（lockedQty +2 而 availableCount 只扣 1 条） |
+| 2026-10-22 | 修复 | **同一请求内重复选用单次售卖明细**同样 400（`_create_project_core`）：跨销售记录选同一条 `repeatSale=false` 明细时，占用检查查的是**已落库**的 `project_items`，本请求行尚未 flush → 会绕过，故补 `single_sale_seen` 集合，命中 → 400「同一条单次售卖明细不可在同一订单中重复下单，请选择其他明细」 | `backend/src/services.py`（`_create_project_core`） | §2 补充 | 与既有「同一销售记录内 (assetId,itemId) 不可重复」互补（后者只在合同内判重） |
+| 2026-10-22 | 新增 | **`RsItemOutWithSold.occupied: bool = False`**（派生：被非 terminated 合同引用，**与 `repeatSale` 无关**，供前端置灰；扣减口径仍是 `_rs_container_available_counts`）。实现 `_rs_item_occupied_ids`（一条 `SELECT DISTINCT project_items.itemId`，全表或按页 id 批量），`bootstrap.rsItems` 与 `GET /assets/{id}/rs-items` 共用，**无 N+1** | `backend/src/schemas.py`、`backend/src/services.py`（`_rs_item_occupied_ids`、`bootstrap`）、`backend/src/routers/api.py`（`list_rs_items`） | §4 | 加性字段，非 Breaking；前端暂不消费 |
+| 2026-10-22 | 新增 | **存量修正脚本 `backend/scripts/sync_container_quantity.py`**：`--asset-id`（缺省=全部遥感容器）/`--dry-run`/`--yes`（互斥，缺省只预览）；在线备份 `sqlite3.Connection.backup()` → `/tmp/container-quantity-backup-<ts>.db`；`BEGIN IMMEDIATE` 单事务 + 事务内二次复核（type/quantity/明细数/锁定交付）+ 逐容器 OpLog（`action='同步容器数量'`）+ 回读校验；幂等（无差异不写库、不写 OpLog） | `backend/scripts/sync_container_quantity.py`（新增） | §1 / ADR-031 | 在售容器（locked/shipped 非 0）只校验不改数量 |
+| 2026-10-22 | 修改 | `import_rs_items.py` / `reset_rs_items.py` 写入/删除后同事务同步容器数量（脚本独立 `sync_container_quantity()`，与 `services._sync_container_quantity` 同口径；脚本不 import 业务包），OpLog detail 追加「容器数量 x → y」；reset 清空后 `quantity` 归 0 | `backend/scripts/import_rs_items.py`、`backend/scripts/reset_rs_items.py` | §1 | reset 文档口径更正：产品本体不再「完全不变」（quantity 随明细条数） |
+
+### 存量执行（真实库，不重启服务）
+
+- 命令：`python3 backend/scripts/sync_container_quantity.py --asset-id 29 --yes`（先 `--dry-run` 复核计划）
+- **备份：`/tmp/container-quantity-backup-20261022-154000.db`（保留，integrity_check=ok，18 表）**
+- 执行：`assets#29 遥感数据-2026` **`quantity 1 → 60`**（明细 60 条，`lockedQty=0`/`shippedQty=0`）；OpLog **#700**（`target='asset'`、`action='同步容器数量'`、`detail='容器数量按可售明细条数同步：1 → 60（明细 60 条）'`）。
+- 回读：`quantity=60` = 明细 60 条；其它表行数不变（仅 `logs` +1）；`bootstrap.assets#29.availableCount` = **60**。
+- 幂等：再次执行 → 「全部容器数量已与明细条数一致（重跑 0 变更）」，未写库。
+
+### 验证（副本库逐条断言 + 真实服务 curl；`compileall` 通过）
+
+**① 复现（修复前副本，`quantity=1`）**：同一单两条明细 → **400 可用数量不足：… 可售 1，本单需 2**；订单A 卖 item#1 → 200（`lockedQty=1`、`availableCount=59`）；订单B 卖 item#2 → **400 可用数量不足：… 可售 0，本单需 1**（核心缺陷）。
+
+**② 修复后（副本 + TestClient，11/11 断言通过）**：`quantity=60`、`availableCount=60`；A 卖 item#1 → 200（`availableCount=59`/`lockedQty=1`）；**B 卖 item#2 → 200（`availableCount=58`/`lockedQty=2`）**；C 再卖 item#1 → **400「该可售明细已被占用（已售出或锁定），请选择其他明细」**；`/assets/29/rs-items` 与 `bootstrap.rsItems` 的 `occupied`（1/2=true、3=false）；删除被占用 item#2 → 400；同一请求内两条记录选同一条 false 明细 → 400。
+
+**③ `repeatSale=true` 放行（副本，8/8）**：A+B 后 58；C 400；item#1 置 `repeatSale=true` → `availableCount=59`（该条不再扣减）；C 重试 → **200** 且 `availableCount` 仍 59、`lockedQty` 仍 2（true 不锁不扣）。
+
+**④ 交付/撤销/终止（副本，17/17；含 1 条遗留缺陷记录）**：A 交付 → `shippedQty=1`、`lockedQty=1`（B 仍锁定）、`soldCount=1`、`soldAmount=27400`、`availableCount=58`；撤销交付 → 锁定恢复 2、`availableCount` 仍 58；终止 A → `lockedQty=1`（B）、item#1 `occupied=false`、`availableCount=59`、`quantity` 仍 60。
+> ⚠️ **遗留缺陷 DEFECT-1（既有，非本次引入，未改）**：撤销交付后 `shippedQty` 应回 0，实际仍为 1（`soldCount`/`soldAmount` 同样未回退）。根因：`_revert_outbound_inner` 先改 ORM 属性（`a.shippedQty -= 1` 等）**未 flush**，随后 `apply_item_lock` 内部 `db.refresh(a)` 把未 flush 的挂起修改丢弃（session `autoflush=False`，已用最小复现验证）。修复前该路径还会直接 400「可用数量不足」（重新加锁无容量）；`quantity` 修正后表现为「静默残留」。建议最小修法：`_revert_outbound_inner` 重新加锁前 `db.flush()`（按指示未改动回滚路径，待确认）。
+
+**⑤ 删除明细（副本，7/7）**：无在售数据时删 item#3 → 200 且 `quantity` 同步 **59**、`availableCount=59`；删后再卖 item#1 → 200；删已被下单的 item#1 → 400「该明细存在销售关联」；脚本重跑 0 变更。
+
+**⑥ 真实服务 curl（只读，生产库）**：`GET /api/assets/29/rs-items?page=1&pageSize=3` → `total=60`、`items[].occupied=false`；`GET /api/bootstrap` → `assets#29.quantity=60`、`availableCount=60`、`lockedQty=0`、`rsItems[].occupied`。
+
+**⑦ 真实 HTTP 写链路（临时 uvicorn :8011 + 副本，不动生产数据）**：`quantity=1` 缺陷态 `POST /api/projects`（两条明细）→ **400**；执行同步脚本后同一请求 → **200**（`SP-2026102215402824`，`contractAmount=59100`）；随后 `bootstrap` → `quantity=60`/`lockedQty=2`/`availableCount=58`、item#1/#2 `occupied=true`；再卖 item#1 → **400 该可售明细已被占用**。
+
+## 2026-10-22 ｜ RS-REPEAT-20261022：明细级「可重复售卖」默认关闭 + 可售口径修订 + 存量归一（ADR-038）
+
+> 契约见 `docs/api-contracts.md`「RS-REPEAT-20261022 批次」。**⚠️ 行为变更（默认值 `true → false`）**：出参结构、端点、错误码均不变，故非 Breaking；但「不传 `repeatSale` 新建明细」的落库结果由 `true` 变为 `false`，「容器 `availableCount`」不再扣减可重复售卖的明细。无表结构变更（默认值只在 ORM 层，SQLite 不重建表）、无 Migration 放启动期（数据类动作走 `backend/scripts/`）。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-22 | 修改 | ⚠️ **`models.RsItem.repeatSale` 默认值 `True → False`**（ORM 层默认，SQLite 无 DDL 变更）| `backend/src/models.py`（`RsItem`） | RS-REPEAT-20261022 / ADR-038 §1 | 同步更新类注释：明细默认**单次售卖**（一期通常只卖一次）|
+| 2026-10-22 | 修改 | ⚠️ **`schemas.RsItemInput.repeatSale` 默认值 `True → False`**（`POST /assets/{id}/rs-items`、`PUT /rs-items/{id}` 入参）| `backend/src/schemas.py`（`RsItemInput`） | ADR-038 §1 | 字段仍在 `priceMax` 之后，与模型默认一致；`PUT` 整行覆盖，缺省即按 `false` 落库 |
+| 2026-10-22 | 修改 | **可售口径修订**：`availableCount = 明细总数 − \|{ 被占用 且 repeatSale = false 的明细 }\|`；占用定义不变（`project_items.itemId` 命中 + 所属 `contracts.status != 'terminated'`），`repeatSale = true` 的明细**即使被引用也不扣减** | `backend/src/services.py`（`_rs_container_available_counts`） | ADR-038 §3（覆盖 UI-OPT-20261022 §1）| 实现改为 `rs_items JOIN project_items JOIN contracts` 单条聚合 `count(DISTINCT rs_items.id) GROUP BY rs_items.assetId`（不依赖调用方传入的 `rs_items`，防漏扣）；仍与 `Visibility` 无关，viewer 同值 |
+| 2026-10-22 | 修改 | **`create_rs_item` / `update_rs_item` 落库显式取 `data.repeatSale`**，OpLog detail 追加售卖模式（「单次售卖 / 可重复售卖」）；`update` 在开关实际变化时追加「可重复售卖：是 → 否」 | `backend/src/services.py` | ADR-038 §2 | 校验顺序（省份→单价→区间→判重）完全不变 |
+| 2026-10-22 | 新增 | **存量归一脚本 `backend/scripts/normalize_rs_repeat_sale.py`**：`--asset-id`（默认 29）/`--dry-run`/`--yes`（不带 `--yes` 只预览）；预检 `type == 遥感数据` + 条数/金额/精度/月份分布；执行 `UPDATE rs_items SET repeatSale = 0 WHERE assetId = :id AND repeatSale != 0`（`BEGIN IMMEDIATE` 单事务 + 事务内复核）→ 写 OpLog（`action='明细重复售卖归一'`）；在线备份 `sqlite3.Connection.backup()` → `/tmp/rs-repeat-backup-<ts>.db` | `backend/scripts/normalize_rs_repeat_sale.py`（新增） | ADR-038 §4 / ADR-031 | 回读校验：`repeatSale=1` 条数 0、总数 60、`sum(price)` 10354297 不变 |
+
+### 存量执行（真实库，不重启服务）
+
+- 命令：`python3 backend/scripts/normalize_rs_repeat_sale.py --asset-id 29 --yes`
+- **备份：`/tmp/rs-repeat-backup-20261022-152740.db`（保留，503808 B，integrity_check=ok）**
+- 预检：`assets#29 遥感数据-2026`（`type=遥感数据`）60 条明细全部 `repeatSale=1`，合计 10354297 元；分布 1m 6 / 1.5m 54；月份 9 期（2024-10 12 条，其余各 6 条）；占用 0 条。
+- 执行：**60 条 `repeatSale 1 → 0`**；OpLog **#695**（`target='asset'`、`targetName='遥感数据-2026'`、`action='明细重复售卖归一'`、`assetId=29`、`detail='60 条明细 repeatSale 置为 false（ADR-038）；明细总数 60 条、合计金额 10354297 元不变'`）。
+- 回读：`repeatSale=1` **0** 条、明细总数 **60**、`sum(price)` **10354297.00**（未动价/量）；产品本体未改（`quantity=1`/`unit='份（可售明细）'`/`soldCount=0`/`soldAmount=0`）；`bootstrap.assets#29.availableCount` **60**（脚本前按旧口径同为 60，因占用为 0）。
+
+### 验证（`python3 -m compileall backend/src backend/main.py` 通过；真实库副本 + TestClient；真实服务 curl 复核）
+
+- ① 编译：`compileall backend/src backend/main.py`、`compileall backend/scripts/normalize_rs_repeat_sale.py` 通过；`read_lints` 4 个文件 0 诊断。
+- ② 默认值：副本上 `POST /api/assets/29/rs-items` **不传 `repeatSale`** → 响应 `repeatSale=false`、落库 false；**传 `true`** → 响应/落库均 true。
+- ③ `PUT` 来回切换：`true → false → true → false` 四次均 200 且响应/落库一致；`GET /api/assets/29/rs-items` 的 `repeatSale` 同步变化（true / false 两向均验）。
+- ④ 可售口径：60 条全 false + 0 占用 → **60**；造 1 条占用（`contracts.status='pending'` 的 project_items 指向 `rs_items#1`）→ **59**；该明细 `PUT repeatSale=true` → **60**（重复售卖不扣减）；切回 `false` → **59**。
+- ⑤ 真实服务：`GET /api/bootstrap` → `assets#29.availableCount=60`、`rsItems(#29)` 60 条且 `repeatSale=true` 计 0；`GET /api/assets/29/rs-items?page=1&pageSize=2` → `total=60`、`items[].repeatSale=false`。
+- ⑥ 真实服务 curl 写链路：`POST`（不传 repeatSale）→ `repeatSale=false`；`PUT` true / false → 200 且响应一致；`DELETE` 清理 → `{"ok":true}`，`/rs-items` 回到 `total=60`（未留测试数据）。
+
+## 2026-10-22 ｜ RS-IMPORT-20261022：遥感明细重新录入 60 条（数据导入）
+
+> **纯数据写入**：无代码变更（`backend/src/` 零改动）、无表结构/列变更、无 Migration、无 Breaking。写入脚本 `backend/scripts/import_rs_items.py`（在线备份 → `BEGIN IMMEDIATE` 内二次校验 → 单事务插入 → OpLog → 回读）。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-22 | 新增 | **`assets#29`「遥感数据-2026」导入 60 条可售明细（1m 6 / 1.5m 54，金额 10354297 元）**：省份 6 组（新疆/陕西/甘肃/宁夏/青海/内蒙古，city 一律留空）、期次 1m 仅 `2024-10`、1.5m 9 期（2024-10~2025-04 + 2025-12~2026-01）；明细 `repeatSale=1`、`priceMin/priceMax=NULL`。OpLog #692（`target='asset'`、`assetId=29`、`action='导入可售明细'`、`operator='admin'`）。**备份路径 `/tmp/rs-items-import-backup-20261022-152059.db`（保留）** | `backend/core_holdings.db`（`rs_items` +60 行、`logs` +1 行） | RS-IMPORT-20261022 | 单价 = 面积(km²) × 费率（1m 25 元/km²、1.5m 18 元/km²，整数四舍五入）；城市留空；**产品本体未改**（quantity=1 / unit='份（可售明细）' / repeatSale=0 / soldCount=0 / soldAmount=0 / priceMin,priceMax 均不变）；`bootstrap.assets#29.availableCount` 97 → **60**（UI-OPT-20261022 派生口径，admin 与 viewer 同值） |
+
+### 验证（不重启服务；回读全部通过）
+
+- ① `rs_items where assetId=29` = **60**，按精度 1m **6** / 1.5m **54**。
+- ② 按月份：`2024-10` **12**（1m 6 + 1.5m 6），其余 8 个月各 **6**（仅 1.5m）。
+- ③ `sum(price)` = **10354297**（1m 110875 / 1.5m 10243422）。
+- ④ 抽样：新疆 1m `2024-10` = 27400；新疆 1.5m `2026-01` = 342270；青海 1.5m `2024-10` = 141426。
+- ⑤ 唯一键 `(province,city,resolution,saleMonth)` 重复组 **0**、唯一组合 **60**（`uq_rs_items_dim` 无冲突）。
+- ⑥ 产品本体不变（同上）；其它表行数：assets 25 / projects 2 / contracts 4 / project_items 4 / cart_items 5 / file_meta 50 / logs 626→**627**（+1）。
+- ⑦ 接口：`GET /api/bootstrap` → `assets#29.availableCount` = **60**（admin）；`GET /api/assets/29/rs-items?page=1&pageSize=10` → `total: 60`。
+- ⑧ viewer 复核：`viewer`（可见 1 个项目）与 `zhaoyin2`（可见 0 个项目）→ `availableCount` 均 **60**、`rs-items total` 均 **60**，验证聚合与可见性无关。`lshangkun` 密码未知（历史已记录），改用同角色账号对照。
+
+## 2026-10-22 ｜ UI-OPT-20261022：容器可售数量口径（`bootstrap.assets[].availableCount`）
+
+> 契约见 `docs/api-contracts.md`「UI-OPT-20261022 批次」§1。**纯加性字段**（`int | null`，追加在 `AssetOut` 末尾）；无表结构变更、无列变更、无数据迁移、无新依赖、无 Breaking。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-22 | 新增 | **`schemas.AssetOut` 新增加性可选字段 `availableCount: int \| None = None`**（追加在 `pricingMode` 之后）——容器「可售数量」= 可售期数 | `backend/src/schemas.py`（`AssetOut`） | UI-OPT-20261022 §1 | 旧快照/旧客户端缺该字段不受影响；`POST/PUT /assets` 同 schema 会带 `null`（写入后前端统一以 bootstrap 刷新） |
+| 2026-10-22 | 新增 | **`bootstrap.assets[]` 为容器填充 `availableCount`**：`type == RS_DATA_TYPE`（既有常量「遥感数据」）→ `该容器明细总数 − 已被非 terminated 销售记录占用的明细数`；占用 = `project_items.itemId` 非空且所属 `contracts.status != 'terminated'`（pending/active/delivering/delivered 全算占用）；非容器保持 `null`（前端继续用 `quantity-lockedQty-shippedQty`，双口径不混）；无明细容器 = `0` | `backend/src/services.py`（新增 `_rs_container_available_counts`、`bootstrap`) | UI-OPT-20261022 §1 | 存量 `#29 遥感数据-2026`：97 明细 / 0 占用 → `availableCount=97`（原前端显示 `quantity=1`） |
+| 2026-10-22 | 新增 | **占用去重口径**：同一明细被多条非 terminated 合同占用只计 1 条（`DISTINCT itemId`）——`availableCount` 是「可售条数」而非「已售次数」（次数仍走 `rsItems[].soldCount`）。空库/无容器 → 聚合查询直接返回 `{}`，不发第二条 | `backend/src/services.py` | UI-OPT-20261022 §1 | 与 ADR-011 容器模型一致 |
+| 2026-10-22 | 修改 | **性能：固定 2 条聚合查询、与可见性无关**——① `rs_items GROUP BY assetId`（明细总数）；② `project_items JOIN contracts` 的 `DISTINCT itemId`（占用集合）；itemId→assetId 映射取自 bootstrap 已整表读出的 `rs_items`（不发查询）。**不按产品循环、不 N+1**；两条查询均为全量、不过 Visibility（viewer 的 bootstrap 只含自己下单的项目/合同，用它算会失真，同 `_rs_item_sold_counts` 思路） | `backend/src/services.py`、`backend/src/routers/api.py`（未改，仅确认无 `GET /assets` 列表端点） | UI-OPT-20261022 §1 | 容器数 k=1、明细 97 → 复杂度 O(k + 占用行数)，与产品总数（25）无关 |
+
+### 验证（不重启服务；`python -m compileall backend/src backend/main.py` 通过；进程内 TestClient + **数据库副本** `/tmp/uiopt_verify.db`，跑完已删）
+
+- ① 语法：`compileall` 通过；`read_lints` 对 `services.py` / `schemas.py` 0 诊断。
+- ② 基线：`bootstrap.assets` 中 `#29` → `type=遥感数据`、`availableCount=97`（97 条明细 / 0 占用）；全部非容器产品 `availableCount is None`（实测 `#1 智元机器人-G1` 为 `null`）。
+- ③ 占用/释放：`POST /projects` 造单（明细行 `itemId` 命中 `#29` 明细）→ 合同 `pending` → **96**；viewer（`lshangkun`）同值 **96**（其 `bootstrap.contracts` 确实不含该合同）；审核 `confirm` → `active` → 仍 **96**；`PATCH /contracts/{id}/status terminated` → 回到 **97**（viewer 同值 97）。
+- ④ 交付也算占用：另一条明细走完整流程 `pending → active → delivering（录 signedDate）→ delivered` → **96**（viewer 同值 96）。
+- ⑤ 去重：同一条已占用明细再挂一条 `pending` 合同 → 仍 **96**（不重复扣减）。
+- ⑥ 既有规则佐证（非本批改动）：`pending` 合同直接 `PATCH /contracts/{id}/status` → 400「待审核销售记录不可直接变更状态，请通过订单审核（确认下单/驳回）操作」，故 terminate 断言走 `confirm → active → terminated`。
+
 ## 2026-10-22 ｜ FORMS-20261022：产品登记规则 + 生态人员购物车口径（ADR-036 / ADR-037）
 
 > 契约见 `docs/api-contracts.md`「FORMS-20261022 批次」。请求/响应字段形状零变化，全部为校验规则收紧/放宽；**无 schema 变更、无数据迁移**（`inboundDate` 用现有列）。
@@ -1254,3 +1578,18 @@
 | 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
 |---|---|---|---|---|---|
 | 2026-10-22 | 修复 | 新增一次性脚本 `backend/scripts/backfill_flow_refs.py`（幂等、可重复执行，支持 `--dry-run`）：`UPDATE flows SET ref = contracts.code WHERE contractId IS NOT NULL AND ref != contracts.code`，修复历史清理脚本改合同编号未同步流水导致 `ref` 指向已不存在旧编号的问题（仅展示层，可见性按 `contractId` 权威外键判定不受影响）。**实际执行一次，影响 64 行**（QA 标记的 5 行 id 78/136/160/164/212 均在其中，其余为同因未标记的历史流水）；复跑影响 0 行，验收只读查询（`contractId IS NOT NULL AND ref != c.code`）= 0 | `backend/scripts/backfill_flow_refs.py`（新增）、`backend/core_holdings.db`（flows.ref × 64） | FIX-20261022-OBS01 / OBS-FIX20261022-01 / ADR-031 | 执行前备份：`/tmp/flows-backup-1792638499.db`（保留）；未改 `backend/src/` 业务代码，数据变更无需重启服务 |
+
+## 2026-10-22 ｜ RS-RESET-20261022：一次性数据操作——清空「遥感数据-2026」可售明细
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-22 | 删除 | 新增一次性脚本 `backend/scripts/reset_rs_items.py`（显式 `--asset-id` + `--yes` 才写库，支持 `--dry-run`；预检强制 `type='遥感数据'`、`project_items.itemId` 有销售引用即中止；单事务删除 + 回读校验）：**实际执行一次，删除 `rs_items` 97 条**（assets#29「遥感数据-2026」，月份 2024-10 ~ 2026-09，单价 6350 ~ 330000 元/份），**同时清理 `cart_items` 3 行**指向这些明细的购物车引用（userId=8，itemId=1/3/4，qty=1，均为未结算草稿，不清理会留悬空 itemId 导致前端坏行/结算 400）；补写 OpLog #691（`target=asset`、`assetId=29`、`action=清空可售明细`、`operator=admin`） | `backend/scripts/reset_rs_items.py`（新增）、`backend/core_holdings.db`（rs_items −97 / cart_items −3 / logs +1） | RS-RESET-20261022 / ADR-011 / ADR-031 | 执行前备份：`/tmp/rs-items-backup-20261022-151059.db`（SQLite 在线备份 API，integrity_check=ok，保留不删）；**无销售引用**（`project_items.itemId` 全为 NULL），**未回滚任何销量**（assets#29 soldCount/soldAmount 仍为 0）；产品本体（quantity=1 / unit / repeatSale / 价格区间）未改动；未改 `backend/src/` 业务代码，数据变更无需重启服务，前端刷新即为空明细 |
+## 2026-10-22 ｜ NO-DISCOUNT-20261022：购物车折扣功能下线（⚠️ 行为变更：折扣率不再受理，历史值保留；ADR-039 / Deprecates ADR-023）
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-22 | 修改 | ⚠️ **折扣率入参全线「容忍但忽略」**：`PUT /api/cart/{id}`（`set_cart_qty`）、`PATCH /api/cart/{id}`（`patch_cart_item`）、`POST /api/cart`、`POST /api/cart/batch`（`_cart_add_inner`）不再读取/校验/写入 `discountRate`；`POST /api/projects`、`POST /api/sales/orders`、`POST /api/cart/checkout` 共用的权威校验链（`_create_project_core`）删掉「③ 折扣率」一步，新 `project_items.discountRate` **一律写 `null`**；checkout 分组元组去掉购物车行的历史 rate（历史快照不再透传）。旧客户端传 0 / 1.5 / 999 → 200（此前 400「折扣率须为 0 到 1 之间的正数」） | `backend/src/services.py`（`_cart_add_inner` / `patch_cart_item` / `set_cart_qty` / `checkout` / `_create_project_core` / `_restore_items_to_cart`）、`backend/src/routers/api.py`（2 端点）、`backend/src/schemas.py`（6 处字段注释） | NO-DISCOUNT-20261022 / ADR-039 | **列保留不清洗**（`cart_items.discountRate` / `project_items.discountRate` 均在，历史值原样可查）；存量行被 PUT/PATCH/加购合并时该列**保持原值**（不覆盖、不清空）；`POST /projects/{id}/review` 改价本就不写该列，本批补注释锁定不变量 |
+| 2026-10-22 | 删除 | 死代码清理：`services._validate_discount_rate`（原 ADR-023 的 `0 < rate ≤ 1` 校验）**调用点全部移除后删除**；删除前全部调用点 = `_create_project_core`（L1706）、`_cart_add_inner`（L3215）、`patch_cart_item`（L3309）、`set_cart_qty`（L3449），共 4 处，均已去掉调用 | `backend/src/services.py` | NO-DISCOUNT-20261022 / ADR-039 | `schemas` 中 `discountRate` 字段定义**保留**（旧客户端传值不 422），注释改为「已下线（ADR-039），后端忽略」 |
+| 2026-10-22 | 修改 | 不改动：`_check_discount_range` / `_check_unit_price_range` 的**金额区间校验**逻辑（`unit_price = amount ÷ qty` 与 `priceMin/priceMax` 比较、viewer 单边 / editor 双向）**逐字未动**；仅确认二者内部无「用折扣率推算金额」的路径（函数名 `discount` 为 ADR-018 历史命名），并在 docstring 注明 | `backend/src/services.py` | NO-DISCOUNT-20261022 / ADR-018 / ADR-021 / ADR-037 | 回归实测：viewer 超上限 30000 → 200、低于下限 20000 → 400；editor 双向 400；区间内 200；checkout 权威链 editor 超上限 → 400 |
+| 2026-10-22 | 修改 | 验证方式：**副本库 + TestClient**（`/tmp/nodiscount-verify.db`，TestClient 35 条断言全 PASS）+ 副本库上临时端口 8123 的真实 HTTP curl（不触碰 8000 运行中服务、不重启、无 schema 变更）。另：`python3 -m compileall src main.py` 通过 | `backend/src/**` | NO-DISCOUNT-20261022 | 前端需知：响应体仍返回 `discountRate`（存量值原样、新单恒 `null`）；前端已按 ADR-039 移除折扣入口，该字段仅作历史追溯 |
+| 2026-10-22 | 修改 | **400 文案去「折扣」字样（纯文案收口，逻辑/表零改动）**：`_check_discount_range` 超区间 400 `折扣单价超出该产品参考区间（…）` → **`单价超出该产品参考区间（…）`**；区间数值、单边/双边 `_range_label` 格式、viewer 单边 / editor 双向判定、错误码 400 全部不变 | `backend/src/services.py`（`_check_discount_range` 的 `raise HTTPException(400, ...)` + docstring 引用句）、`docs/backend/api.md`（5 处文案示例 + 收口说明） | NO-DISCOUNT-20261022 / ADR-039 | 全后端 grep 复核：用户可见字符串已无「折扣」，仅注释/启动期 `print` 保留 ADR-023/039 历史引述（`main.py` print 属运维日志，非业务文案，未改）；实测（副本库 TestClient + 临时端口 8123 真实 curl）：viewer `amount=20000`→400、editor `30000`→400 均返回新文案且不含「折扣」，editor `25200`→200；`python3 -m compileall src main.py` 通过，未重启服务（8000 为 `--reload`，改动已自动热载），未 commit |

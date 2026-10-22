@@ -209,6 +209,17 @@ def _ensure_migration() -> None:
             conn.execute(text("ALTER TABLE rs_items ADD COLUMN priceMin FLOAT"))
             conn.execute(text("ALTER TABLE rs_items ADD COLUMN priceMax FLOAT"))
         print("[migration] rs_items.priceMin/priceMax 列已补充（ADR-021 参考区间）")
+    # RS-STATUS-20261022（ADR-038 Decision 3 修订）：明细自带状态标识 —— 可售 / 已售罄，
+    # 与外层产品 status 同枚举（in_stock / all_sold），容器可售数量改为 COUNT(status='in_stock')。
+    # **纯结构迁移**：只补列 + 建索引，存量行由列 DEFAULT 'in_stock' 填充；
+    # 不做任何 DELETE/UPDATE 类数据动作（真值归一/修复走 backend/scripts/sync_rs_item_status.py，
+    # ADR-031 启动期禁止无标记数据操作）。
+    if "status" not in rs_cols:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "ALTER TABLE rs_items ADD COLUMN status VARCHAR(32) DEFAULT 'in_stock'"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_rs_items_status ON rs_items (status)"))
+        print("[migration] rs_items.status 列已补充（RS-STATUS-20261022 明细状态标识）")
     if "serviceStart" not in cart_cols:
         with engine.begin() as conn:
             conn.execute(text("ALTER TABLE cart_items ADD COLUMN serviceStart VARCHAR(10)"))
@@ -285,6 +296,11 @@ def _ensure_migration() -> None:
         with engine.begin() as conn:
             conn.execute(text("ALTER TABLE asset_deliverables ADD COLUMN file VARCHAR(255)"))
         print("[migration] asset_deliverables.file 列已补充（ADR-024 交付物附件）")
+    # 18) ADR-044 交付物外部链接：asset_deliverables.url（空串=无链接）；纯结构迁移，幂等补列
+    if "url" not in deliv_cols:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE asset_deliverables ADD COLUMN url VARCHAR(512) DEFAULT ''"))
+        print("[migration] asset_deliverables.url 列已补充（ADR-044 交付物外链）")
     # 17) ADR-024 存量交付物实例一次性清空 —— ⚠️ BUG-01 已移除「每次启动 DELETE 全表」。
     # 旧实现把「上线时一次性清空」写成了「表非空就清空」，导致每次进程重启（含 --reload）
     # 都静默删除全部手工维护的交付物（审计日志有 13 条历史交付物操作、表已 0 行，不可恢复）。

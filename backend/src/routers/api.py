@@ -318,12 +318,14 @@ def list_rs_items(
     db: Session = Depends(get_db),
     _: models.User = Depends(security.get_current_user),
 ):
-    """PAGE-20261021：可售明细分页（id ASC）。items = RsItemOut + 派生 soldCount。
+    """PAGE-20261021：可售明细分页（id ASC）。items = RsItemOut（含 status）+ 派生 soldCount。
     soldCount 口径：该明细被 delivered 状态合同的项目明细计数
     （project_items.itemId == rs_item.id 且所属合同 status='delivered'），
-    一条聚合查询按当页 id 批量计算，避免逐行查。
-    FIX-20261022-FOLLOWUP：聚合逻辑抽到 `services._rs_item_sold_counts`，
-    与 `bootstrap.rsItems` 共用**同一实现**（不复制两份口径）。"""
+    一条聚合查询按当页 id 批量计算，避免逐行查
+    （`services._rs_item_sold_counts`，与 `bootstrap.rsItems` 共用同一实现）。
+
+    RS-STATUS-20261022（ADR-038 Decision 3）：原派生字段 `occupied` **已删除**，
+    明细可售性统一看 `status`（in_stock=可售 / all_sold=已售罄）。"""
     a = db.get(models.Asset, asset_id)
     if a is None:
         raise HTTPException(404, "产品不存在")
@@ -333,7 +335,7 @@ def list_rs_items(
     sold: dict[int, int] = services._rs_item_sold_counts(db, [i.id for i in items])
     out = []
     for i in items:
-        d = schemas.RsItemOut.model_validate(i).model_dump()
+        d = schemas.RsItemOut.model_validate(i).model_dump()  # 含 status（in_stock/all_sold）
         d["soldCount"] = sold.get(i.id, 0)
         out.append(schemas.RsItemOutWithSold.model_validate(d).model_dump())
     return {"total": total, "items": out}
@@ -480,21 +482,36 @@ def withdraw_project(project_id: int, data: schemas.WithdrawInput, db: Session =
 
 
 @router.post("/projects/{project_id}/refill-cart")
-def refill_project_cart(project_id: int, db: Session = Depends(get_db),
+def refill_project_cart(project_id: int, mode: str = Query("merge"), db: Session = Depends(get_db),
                         user: models.User = Depends(security.require_order)):
     """「重新提交」收口购物车（ADR-027）：把已终止项目的明细回填**下单人**购物车，
     前端随后跳 `/cart` 改单再结算（不再走 create 页 copy 模式）。
 
+    ADR-042 三行要点：
+    ① **替换语义**：同键行（userId, assetId, itemId, customer）命中即**覆盖** qty/金额/服务期限，
+       不累加 —— 重试不再翻倍（`POST /cart` 加购仍累加，未受影响）；
+    ② **`mode` 查询参数**（`merge` 默认 | `replace`）：`merge` 保留购物车现有商品；
+       `replace` **先清空下单人购物车再回填**（同一事务、不可撤销），且**跳过 `cartRefilled`
+       幂等短路**（返回 `forced: true`）；非法取值 400「非法的回填模式」；
+    ③ **逐行结果**：响应 `rows: [{assetName, qty, ok, reason}]` + `owner: {id, username, name}`
+       + `mode/forced/cleared`（旧字段 `ok/alreadyRefilled/restored/amountFallback/skipped/
+       skippedReasons` 全部保留）；可售不足的 `reason` 带库存/已锁定/已出库数值与
+       「已被其他订单占用」提示。
+
     无 body；守卫：仅 `terminated` 项目（否则 400），viewer 仅自己下单的项目（403），
     admin/editor 放行（admin 代操作同样回填到**下单人**购物车）。
-    幂等：`Project.cartRefilled` 为 True 时直接返回 `alreadyRefilled: true`，不重复回填
-    （购物车行数不增加、不写日志）。回填容错口径与 withdraw 完全一致（共享实现）：
+    幂等：`Project.cartRefilled` 为 True 且 `mode=merge` 时直接返回 `alreadyRefilled: true`，
+    不重复回填（购物车行数不增加、不写日志）。回填容错口径与 withdraw 完全一致（共享实现）：
     单行失败降级「原价成交」重试，仍失败计入 skipped/skippedReasons，绝不中断。
-    副作用：首次回填仅新增 cart_items 行（不锁量、不改项目/合同状态）+ 1 条 OpLog。"""
-    result = services.refill_project_cart(db, project_id, user)
+    副作用：回填仅改 cart_items 行（不锁量、不改项目/合同状态）+ 1 条 OpLog。"""
+    result = services.refill_project_cart(db, project_id, user, mode=mode)
     if not result["alreadyRefilled"]:
+        detail = f"restored={result['restored']}"
+        if result.get("forced"):
+            # ADR-042 §2：清空重建属破坏性操作，审计留痕带上 mode 与清空行数
+            detail += f", mode=replace, cleared={result.get('cleared', 0)}"
         security.record_audit(db, user, "sale", "重新提交（回填购物车）", "project",
-                              str(project_id), f"restored={result['restored']}")
+                              str(project_id), detail)
     return result
 
 
@@ -510,7 +527,10 @@ def resubmit_project(project_id: int):  # noqa: ARG001 - 下线端点，仅保�
 
 @router.delete("/projects/{project_id}")
 def delete_project(project_id: int, db: Session = Depends(get_db),
-                   user: models.User = Depends(security.require_editor)):
+                   user: models.User = Depends(security.require_admin)):
+    # ADR-040 §2（2026-10-22）：权限由 require_editor 收紧为 require_admin——前端列表仅 admin
+    # 可见「更多▾ → 删除项目」，服务端必须同口径收口，防止 editor 持 token 直调。
+    # ADR-028 §3 的 terminated && cartRefilled → 403 护栏不变。
     # ADR-028 §3：撤销留痕护栏（terminated && cartRefilled → 403）在 services.delete_project 内收口，
     # 路由层不重复判断；其他终态（被驳回且从未回填）仍可删除
     p = db.get(models.Project, project_id)
@@ -597,11 +617,13 @@ def add_to_cart_batch(data: schemas.CartBatchInput, db: Session = Depends(get_db
 @router.put("/cart/{cart_id}", response_model=schemas.CartItemOut)
 def set_cart_qty(cart_id: int, data: schemas.CartQtyUpdate, db: Session = Depends(get_db),
                  user: models.User = Depends(security.require_order)):
-    """改数量（`qty` 必传）+ 可选金额/服务期限/折扣率（BUG-20：裸 dict → Pydantic，非法入参 422）。
+    """改数量（`qty` 必传）+ 可选金额/服务期限（BUG-20：裸 dict → Pydantic，非法入参 422）。
 
-    - ADR-008/ADR-018 §3：可选携带 amount（unit/遥感行=折扣金额过区间校验；amount 行=整数元权威）；
+    - ADR-008/ADR-018 §3：可选携带 amount（unit/遥感行=销售金额过区间校验；amount 行=整数元权威）；
     - ADR-020：可选携带 serviceStart/serviceEnd（服务期限）；
-    - ADR-023：可选携带 discountRate（0-1 小数，0 < rate ≤ 1 否则 400；null=清空）；
+    - NO-DISCOUNT-20261022 / ADR-039：`discountRate` **已下线**——入参容忍但忽略
+      （不读取、不校验、不落库，不会因 0/1.5/999 返回 400）；`cart_items.discountRate`
+      保持原值不动（历史快照）；
     - CART-PERF-20261021：响应为更新后的完整 CartItemOut（前端本地打补丁，免全量重拉）；
     - CART-PATCH-20261021：其余字段**未传 = 保持原值**（按 `model_fields_set` 判断），显式 null = 清空；
     - ADR-037 §3（FORMS-20261022）：区间校验分角色——viewer 只校验下限（上限放开），
@@ -614,8 +636,8 @@ def set_cart_qty(cart_id: int, data: schemas.CartQtyUpdate, db: Session = Depend
                                                 else services.UNSET),
                                  service_end=(data.serviceEnd if "serviceEnd" in provided
                                               else services.UNSET),
-                                 discount_rate=(data.discountRate if "discountRate" in provided
-                                                else services.UNSET),
+                                 # NO-DISCOUNT-20261022 / ADR-039：`data.discountRate` 直接丢弃
+                                 #（不读取、不校验、不落库；旧客户端照传不 400）
                                  viewer=(user.role == "viewer"))
     return item
 
@@ -624,20 +646,21 @@ def set_cart_qty(cart_id: int, data: schemas.CartQtyUpdate, db: Session = Depend
 def patch_cart_item(cart_id: int, data: schemas.CartPatchInput, db: Session = Depends(get_db),
                     user: models.User = Depends(security.require_order)):
     """修改购物车行级客户（ADR-007）；可选携带合同金额（ADR-008/ADR-018 §3）、
-    服务期限（ADR-020，PRICING-20261020）与折扣率（DISCOUNT-20261021/ADR-023，
-    0 < rate ≤ 1 否则 400；null=清空）。
+    服务期限（ADR-020，PRICING-20261020）。
+    NO-DISCOUNT-20261022 / ADR-039：`discountRate` **已下线**——入参容忍但忽略（不读取、
+    不校验、不落库，传 null/0.5/999 均 200）；`cart_items.discountRate` 保持原值不动。
     CART-PERF-20261021：响应由 {"ok": true} 改为更新后的完整 CartItemOut（前端本地打补丁，免全量重拉）。
     ADR-037 §3（FORMS-20261022）：区间校验分角色——viewer 只校验下限（上限放开），
     editor/admin 双向（角色取当前登录用户，与 PUT /cart/{id} / checkout 同函数）。"""
     # CART-PATCH-20261021：按 Pydantic model_fields_set 判断字段是否真的传了——
-    # 未传 = 保持原值（不改），显式 null = 清空（修复改客户时金额/服务期限/折扣被误清空）
+    # 未传 = 保持原值（不改），显式 null = 清空（修复改客户时金额/服务期限被误清空）
+    # NO-DISCOUNT-20261022 / ADR-039：`discountRate` 不再参与「是否真的传了」的判定，直接丢弃
     provided = data.model_fields_set
     item = services.patch_cart_item(
         db, cart_id, data.customer, user_id=str(user.id),
         amount=data.amount if "amount" in provided else services.UNSET,
         service_start=data.serviceStart if "serviceStart" in provided else services.UNSET,
         service_end=data.serviceEnd if "serviceEnd" in provided else services.UNSET,
-        discount_rate=data.discountRate if "discountRate" in provided else services.UNSET,
         viewer=(user.role == "viewer"))
     security.record_audit(db, user, "sale", "修改购物车客户", "cart", str(cart_id), f"customer={data.customer}")
     return item

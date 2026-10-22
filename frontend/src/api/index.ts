@@ -36,6 +36,8 @@ import {
   type Contract,
   type Board,
   type Entity,
+  type RefillMode,
+  type RefillResult,
   type RsItem,
   type RsItemWithSold,
 } from '@/types'
@@ -279,7 +281,9 @@ export interface RsItemInput {
   // 参考价格区间（ADR-021，RSITEM-RANGE-20261020）：元/份，选填（可单边）；未设为 null
   priceMin?: number | null
   priceMax?: number | null
-  repeatSale?: boolean // 默认 true
+  // 可重复售卖（ADR-038，RS-REPEAT-20261022）：**后端缺省 false** = 单次售卖（售出即占用可售数）；
+  // true = 只计次不扣量（售出后仍计入可售）。PUT /rs-items/{id} 为整行覆盖，该字段须随整行提交。
+  repeatSale?: boolean
 }
 
 export interface ProjectItemInput {
@@ -545,28 +549,30 @@ export async function createProject(input: ProjectInput): Promise<Project> {
 
 /** 重新提交回填购物车响应（ADR-027）：alreadyRefilled=此前已回填过（幂等，本次不重复回填）；
  *  restored=回填行数；amountFallback=金额降级为原价成交的行数；
- *  skipped/skippedReasons=回填失败被跳过的行数及原因类别（回填本身不中断） */
-export interface RefillCartResult {
-  ok: boolean
-  alreadyRefilled: boolean
-  restored: number
-  amountFallback: number
-  skipped: number
-  skippedReasons: string[]
-}
+ *  skipped/skippedReasons=回填失败被跳过的行数及原因类别（回填本身不中断）。
+ *  @deprecated ADR-042 / REFILL-20261022：结构已并入 `types.ts::RefillResult`（加 owner/rows/mode/forced/cleared），
+ *  保留本别名仅为兼容既有引用；新代码请直接用 `RefillResult`。 */
+export type RefillCartResult = RefillResult
 
 /**
- * 重新提交（ADR-027 / TASK-FE-031）：POST /projects/{id}/refill-cart（无 body）
+ * 重新提交（ADR-027 / TASK-FE-031；ADR-042 / REFILL-20261022 增 `mode` 查询参数）：
+ * POST /projects/{id}/refill-cart?mode=merge|replace（无 body）
  * 语义 = 确保**已终止**项目明细在**下单人**购物车（`cartRefilled` 幂等标记：已回填过则不重复回填），
  * 前端随后跳 /cart 改单重提（与撤销同动线）。权限与 resubmit 同口径（下单人本人 / admin / editor）。
- * 错误文案由后端 detail 给出（403 非本人下单 / 400 仅已终止项目可重新提交、下单账号不存在 / 404），
+ * - `mode='merge'`（默认）：保留购物车现有商品，同键行「替换」数量/金额（ADR-042 §1，不累加）；
+ * - `mode='replace'`：先清空下单人购物车再回填（ADR-042 §2，跳过幂等短路，返回 forced=true）。
+ * 错误文案由后端 detail 给出（403 非本人下单 / 400 仅已终止项目可重新提交、下单账号不存在、非法 mode / 404），
  * 经响应拦截器解析进 Error.message 后由调用方 showError 展示。
  *
+ * ⚠️ 后端并行期（REFILL-20261022-B 未热载）：不认识 `mode` 查询参数时会忽略（行为等同 merge，不报错），
+ * 响应亦不含 owner/rows/mode 等新字段 —— 调用方必须按 RefillResult 的可选字段降级，**不做能力探测请求**。
  * 不做 afterWrite 全量刷新：由调用方 `await refresh()` 后再跳 /cart（保证购物车镜像先就位）。
  * 注：后端 POST /projects/{id}/resubmit 保留（已 deprecated，无前端入口），前端封装已随之删除。
  */
-export async function refillProjectCart(id: number): Promise<RefillCartResult> {
-  const { data } = await http.post<RefillCartResult>(`/projects/${id}/refill-cart`)
+export async function refillProjectCart(id: number, mode: RefillMode = 'merge'): Promise<RefillResult> {
+  const { data } = await http.post<RefillResult>(`/projects/${id}/refill-cart`, null, {
+    params: { mode },
+  })
   return data
 }
 
@@ -729,7 +735,14 @@ export async function deleteBase(kind: BaseKind, id: number): Promise<void> {
 
 export async function addAssetDeliverable(
   assetId: number,
-  item: { name: string; category: AssetDeliverable['category']; required: boolean; note: string },
+  item: {
+    name: string
+    category: AssetDeliverable['category']
+    required: boolean
+    note: string
+    /** ADR-044：外部链接（选填；空串也照传，由后端归一为 ''） */
+    url?: string
+  },
 ): Promise<void> {
   await http.post(`/assets/${assetId}/deliverables`, item)
   await afterWrite()
@@ -768,9 +781,15 @@ export async function addRsItem(assetId: number, data: RsItemInput): Promise<RsI
   return d
 }
 
-export async function updateRsItem(id: number, data: RsItemInput): Promise<void> {
-  await http.put(`/rs-items/${id}`, data)
+/**
+ * 编辑明细（整行覆盖）：后端返回更新后的 RsItemOut。
+ * RS-STATUS-20261022：响应体已含后端**重算后的最新 `status`**（切 repeatSale=true → in_stock；
+ * 切回 false 且仍被有效合同引用 → all_sold），调用方可直接按响应回写该行状态，无需等 afterWrite 的镜像刷新。
+ */
+export async function updateRsItem(id: number, data: RsItemInput): Promise<RsItem> {
+  const { data: d } = await http.put<RsItem>(`/rs-items/${id}`, data)
   await afterWrite()
+  return d
 }
 
 /** 删除明细：后端 400「该明细存在销售关联，无法删除」（任一 project_items.itemId 引用，含已完成合同） */
@@ -892,22 +911,14 @@ export async function setCartQty(id: number, qty: number): Promise<void> {
 /**
  * 修改购物车行销售金额（ADR-008/ADR-018 §3，PRICING-20261020）：整数元。
  * - amount 模式行：权威输入，后端校验 int > 0；
- * - unit/遥感明细行：折扣金额，过产品参考区间校验（超区间 400，文案由后端给出）。
+ * - unit/遥感明细行：行内成交金额，过产品参考区间校验（超区间 400，文案由后端给出）。
  * ⚠️ 必须同时回传该行当前 qty（后端 PUT 对 qty<=0 直接 400，且区间校验按新 qty 重算）。
- * DISCOUNT-20261021（ADR-023，2026-10-21）：新增 discountRate 入参（0-1 小数，如 9 折传 0.9；
- * null = 清空；undefined = 不传该字段）。一致性规则由前端执行（折扣回填 amount 后一次性提交；
- * 手改 amount 时传 null），后端只存不算。
+ * ADR-039（NO-DISCOUNT-20261022）：购物车换算率功能下线——入参不再带 discountRate
+ * （后端自本批次起忽略该字段：传了不报错、不落库；新单恒为 null）。
  */
-export async function setCartAmount(
-  id: number,
-  qty: number,
-  amount: number,
-  discountRate?: number | null,
-): Promise<void> {
-  const body: { qty: number; amount: number; discountRate?: number | null } = { qty, amount }
-  if (discountRate !== undefined) body.discountRate = discountRate
+export async function setCartAmount(id: number, qty: number, amount: number): Promise<void> {
   // CART-PERF-20261021（2026-10-21）：行级写改本地打补丁（响应 CartItemOut 替换本地行，旧格式回退全量刷新）
-  const { data } = await http.put(`/cart/${id}`, body)
+  const { data } = await http.put(`/cart/${id}`, { qty, amount })
   await patchCartRow(id, data)
 }
 
@@ -985,6 +996,39 @@ export async function checkoutCart(data: CheckoutInput): Promise<ProjectOut> {
   const { data: d } = await http.post<ProjectOut>('/cart/checkout', data)
   await afterWrite()
   return d
+}
+
+/**
+ * 结算幂等键生成（BUG-10 / ADR-033 §1）。
+ *
+ * BUG-LAN-20261022：`crypto.randomUUID()` 是 secure-context-only API——仅在
+ * https: / localhost / 127.0.0.1 下存在；局域网 IP 访问（http://192.168.x.x:5173）
+ * 时它是 undefined，直接调用抛 TypeError（购物车下单全断）。
+ *
+ * 降级链（保证任何上下文都能生成合法 UUIDv4，后端 requestId 只校验 ≤64 字符）：
+ *   1. crypto.randomUUID()（最优，原生）
+ *   2. crypto.getRandomValues() 手工构造 v4 —— getRandomValues 不受 secure context 限制
+ *   3. Math.random 兜底（极老浏览器，仍保证格式合法）
+ */
+export function genRequestId(): string {
+  const c: Crypto | undefined = typeof globalThis !== 'undefined' ? globalThis.crypto : undefined
+  if (c && typeof c.randomUUID === 'function') {
+    try {
+      return c.randomUUID()
+    } catch {
+      // 极少见：某些 WebView 暴露了方法但调用抛错 → 继续降级
+    }
+  }
+  const bytes = new Uint8Array(16)
+  if (c && typeof c.getRandomValues === 'function') {
+    c.getRandomValues(bytes)
+  } else {
+    for (let i = 0; i < 16; i += 1) bytes[i] = Math.floor(Math.random() * 256)
+  }
+  bytes[6] = (bytes[6] & 0x0f) | 0x40 // version 4
+  bytes[8] = (bytes[8] & 0x3f) | 0x80 // variant 10xx
+  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
 }
 
 // 2026-10-20（ADR-020）：产品「登记销售」直接下单入口已移除，前端不再调用

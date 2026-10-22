@@ -5,7 +5,6 @@
  * 展示 3 项算力服务器产品（只读），不可操作；后续启用时按完整产品页实现。
  */
 import { computed } from 'vue'
-import { InfoFilled } from '@element-plus/icons-vue'
 import { ASSET_STOCK_STATE, assetStockState, expiryText, formatMoney, type Asset } from '@/types'
 import { db } from '@/api'
 
@@ -26,14 +25,7 @@ const list = computed<Asset[]>(() => db.assets.filter((a) => a.board === 'comput
       </div>
     </div>
 
-    <!-- 业务规则提示条 -->
-    <div class="info-bar">
-      <el-icon aria-hidden="true"><InfoFilled /></el-icon>
-      <span>
-        算力服务板块功能建设中，当前仅展示已登记的算力服务器产品（只读，不可操作）。后续启用时将支持资源池管理、可售算力、服务期额度、已售额度与交付开通记录。
-      </span>
-    </div>
-
+    <!-- ADR-041/UI-CLEANUP-20261022：移除页面说明条（用户要求，纯展示删除） -->
     <!-- 表格卡 -->
     <el-card shadow="never">
       <div class="table-head">

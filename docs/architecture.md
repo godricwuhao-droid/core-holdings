@@ -32,20 +32,22 @@
 | 销售记录结构（ADR-007 → ADR-013 → ADR-016） | 项目内**每个产品（×客户）一条销售记录**（ADR-016：同产品多客户拆多条）（HT-xxxx，界面名「销售记录」；代码/表名/路由仍为 contracts），**允许多主体**（记录主体=各行主体全一致→该值，混合→空）；项目状态/金额由销售记录派生；状态变更走 `PATCH /contracts/{id}/status` |
 | 状态机 | 项目状态只走 PATCH 状态接口（待审核项目例外：只走 `POST /projects/{id}/review`，ADR-012）；生态人员购物车结算建「待审核」（锁定照常），商务确认（可终审改价，**不回写挂牌价**，ADR-018）或驳回；录签订时间进「交付中」（ADR-019）；已完成/已终止不可编辑。**状态变更唯一入口 = `_change_contract_status_core`**（交付前置条件在此守卫，合同级/项目级共用，ADR-032）；项目级批量「全量或全不」（任一合同不合规整体 400 并列出全部原因）；终止**按明细状态回滚**（shipped→撤销交付回退销量，locked→释放锁定，缺明细/产品→400 不静默）；派生 `{delivered,terminated}`→`delivered`（ADR-032） |
 | 一致性 | 写操作单事务；数量前置校验（同产品多行合计防超卖）；被引用产品禁删（**含 delivered 引用**，ADR-032）；**下单校验单一出口**（`_create_project_core` 权威链：明细存在性→归属/qty→折扣→服务期限→参考区间→按产品聚合数量；unit 行单价也过区间校验；`contractAmount` 传值必须 = Σ 明细，ADR-029）；**并发**：checkout 幂等键 `requestId`（24h）、状态变更/数量扣减条件更新、不变量破坏显式 500 + 审计（无静默夹断，ADR-033）；**区间校验分角色**：viewer 仅下限（上限放开）、editor/admin 双向（改价与结算单函数复用，ADR-037） |
-| **订单撤销（ADR-026）** | `POST /projects/{id}/withdraw`（require_order）：仅 `pending`；下单人本人或 admin（存量回退 rep）；原因必填 ≤200 字；单事务 = 合同 pending→terminated（释放真实锁定 + cancel_release 流水 + remark「撤销：原因」）+ 项目 terminated + 解绑负责人 + 明细回填下单人购物车（复用 `_cart_add_inner`，判重累加）+ OpLog/审计；回填失败行降级不中断（原价回填/跳过并回报） |
+| **订单撤销（ADR-026）** | `POST /projects/{id}/withdraw`（require_order）：仅 `pending`；下单人本人或 admin（存量回退 rep）；原因必填 ≤200 字；单事务 = 合同 pending→terminated（释放真实锁定 + cancel_release 流水 + remark「撤销：原因」）+ 项目 terminated + 解绑负责人 + 明细回填下单人购物车（复用 `_cart_add_inner`，**同键替换不累加**——ADR-042 §1 起；此前为累加）+ OpLog/审计；回填失败行降级不中断（原价回填/跳过并回报） |
 | **交付物（ADR-024）** | 模板体系（`/settings/deliverables` 页 + `deliverable_templates` 表 + bootstrap 惰性生成）彻底下线；交付物实例仅详情页「交付物」页签手动增改；每项单个附件 `asset_deliverables.file`（upload 散列名；前端 accept 仅 pdf/docx/png/jpg/jpeg/gif/webp，禁 .doc）；抽屉与详情页两处点击预览（复用 FilePreview）；存量实例已一次性清空 |
-| **生态人员可见性（2026-10-16，编辑权 2026-10-21 收回）** | viewer 仅见**自己下单**的销售项目：`Project.creator`（登录 username，三建单入口自动写入）== 自己；存量 creator 为空回退 `rep in (自己姓名, username)`。`bootstrap` 过滤 projects/contracts，前端全视角（列表/详情/产品「销售关联」）天然过滤；**viewer 订单提交后不可编辑（ADR-028）** + 可终止 + 可撤销/重新提交，交付/删除/新建空项目仍仅商务/管理员 |
+| **生态人员可见性（2026-10-16，编辑权 2026-10-21 收回）** | viewer 仅见**自己下单**的销售项目：`Project.creator`（登录 username，三建单入口自动写入）== 自己；存量 creator 为空回退 `rep in (自己姓名, username)`。`bootstrap` 过滤 projects/contracts，前端全视角（列表/详情/产品「销售关联」）天然过滤；**viewer 订单提交后不可编辑（ADR-028）** + 可终止 + 可撤销/重新提交，交付/新建空项目仍仅商务/管理员，**删除项目仅管理员（ADR-040）**，**「重新提交」仅下单人本人 + 管理员（商务 editor 403，ADR-043）** |
 | **资产主体（ADR-035）** | 主体清单单一事实来源 = `entities` 表（设置页 `/settings/entities` 维护，`POST/PUT/DELETE` require_editor，`GET` 登录即可）；`assets.subject` 存**全称**（`name`），展示走 `short`（前端 `entityShort` 读 bootstrap `entities[]`，查不到回退原值）；被产品引用的主体禁删（400 带 N）；**改名不回写** `assets.subject`（存量产品需手动改选）；前端原 `ENTITIES` 硬编码常量已删除 |
 | **可见性判定收口（ADR-030）** | viewer 可见性一律走 `services` 单一判定函数（`Visibility`），**只用结构化外键**（projectId/contractId/assetId/uploadedBy），禁止 detail 文本正则；bootstrap 与全部分页端点共用：logs 按 target=contract 的 contractId 过滤、flows 按引用过滤、**files** 按「被产品引用→全员可见 / 孤儿文件→上传人或 admin / 下载不可见返回 404」；`GET /users/options` 提权 `require_editor`（viewer 403） |
-| **订单禁编辑与留痕（ADR-028）** | `PUT /projects/{id}` 对 viewer **一律 403**（系统无草稿态，「提交后禁编辑」≡「viewer 禁编辑」，不按状态分支）；唯一改单路径 =「撤销」→ 购物车重下（ADR-026/027）；撤销单不可删除：`DELETE /projects/{id}` 对 `terminated && cartRefilled` → 403（复用 cartRefilled 作留痕标记，无 schema 变更）；**撤销 ≠ 终止**：撤销仅 pending 且回填购物车，终止把已生效单作废但不回填（viewer 保留对自己项目的终止权，否则 active 单无退出路径） |
+| **订单禁编辑与留痕（ADR-028）** | `PUT /projects/{id}` 对 viewer **一律 403**（系统无草稿态，「提交后禁编辑」≡「viewer 禁编辑」，不按状态分支）；唯一改单路径 =「撤销」→ 购物车重下（ADR-026/027）；撤销单不可删除：`DELETE /projects/{id}` 对 `terminated && cartRefilled` → 403（复用 cartRefilled 作留痕标记，无 schema 变更）；**撤销 ≠ 终止**：撤销仅 pending 且回填购物车，终止把已生效单作废但不回填（viewer 保留对自己项目的终止权，否则 active 单无退出路径）。**ADR-040（2026-10-22）：该端点权限 `require_editor` → `require_admin`，前端入口由列表常驻按钮收进行尾「更多▾」（仅 admin 渲染），护栏与回滚逻辑逐字不变** |
 
 ## 4. 遥感数据模型（ADR-011，Supersedes ADR-010）
 
 **父产品 + 可售明细两层**：
 - 父产品（assets，type='遥感数据'）：容器，不可直接加购/下单；登记时表单隐藏"数量单价"卡（quantity=1/unit=份（可售明细）兜底），提示条在"产品类型"下方
-- 明细（`rs_items` 表）：省/市（可空）× 精度（米，0.5–2）× **月份（YYYY-MM）** 同父产品下唯一；每份一个单价（整数元/份）；`repeatSale` 默认 true（只计次不扣量）
+- 明细（`rs_items` 表）：省/市（可空）× 精度（米，0.5–2）× **月份（YYYY-MM）** 同父产品下唯一；每份一个单价（整数元/份）；`repeatSale` **默认 false（单次售卖，售出即占用）**，可按明细逐条开启（true = 只计次不扣量，ADR-038）；列表「可重复售卖」列为内联开关（行级互斥 + 失败回滚），新增/编辑弹窗同样可设
 - 接口：`POST /assets/{id}/rs-items`、`PUT/DELETE /rs-items/{id}`（require_editor；有 project_items/cart_items 引用的明细禁删 400）
 - 售卖：明细行购物车数量恒 1（qty≠1 → 400），判重键 (userId, assetId, itemId, customer)；金额 = 明细单价后端权威重算；`project_items.itemId` / `cart_items.itemId` 关联
+- **明细状态（ADR-038 修订 2 / RS-STATUS-20261022，业务方指定方案）**：`rs_items.status ∈ {in_stock(可售), all_sold(已售罄)}`，与外层 `assets.status` 同枚举、同语义；**唯一维护入口** `services._sync_rs_item_status`（按真值重算：`repeatSale=true` 或未被非 terminated 合同引用 → `in_stock`，否则 `all_sold`），在下单锁定/释放/交付/撤销交付/repeatSale 切换/驳回/批量状态变更/删项目处调用；下单护栏：`repeatSale=false` 且 `all_sold` → 400「该可售明细已售罄」；`repeatSale=true` 的明细永不置 `all_sold`
+- **数量口径（UI-OPT-20261022，口径经 ADR-038 修订 2）**：容器的「可售数量」= **`status = in_stock` 的明细条数**（`bootstrap.assets[].availableCount`）；容器 `assets.quantity` = 明细总条数（`_sync_container_quantity` 自动维护，`PUT /assets` 手改被忽略），因此 `quantity − lockedQty − shippedQty` 与 `count(in_stock)` 恒等——**外层产品逻辑与明细逻辑完全同构**；由 `bootstrap.assets[].availableCount` 后端派生（全量聚合，**viewer 视角同值**），前端 `availableQty()` 对容器优先读该字段。列表「可售数量」列、抽屉图例、详情、状态派生（可售/售罄）**统一走该函数**，禁止再用父产品 `quantity=1` 另算
 - 交互：加购/登记销售走 `RsItemPicker.vue` 树状选择（省→精度→月份·单价）；产品详情"可售明细"页签 CRUD；批量加购按钮对遥感父产品**分流拦截**（不进购物车，提示逐份选择，保留勾选）
 - 技术债：assets 表 ADR-010 的 4 列（province/city/resolution/imageDate）已废弃（列保留，schema/代码不再使用）；手动交付（POST /outbounds）未做明细感知（前端无该入口）
 
@@ -115,6 +117,9 @@
 | ADR-035 | Accepted | 资产主体可维护：`entities` 表（name UNIQUE/short）+ 设置页 `/settings/entities`（菜单名「公司主体」）增删改（被产品引用禁删）+ 前端 `ENTITIES` 硬编码常量删除、改读 bootstrap `entities[]`；改名不回写存量 `assets.subject` |
 | ADR-036 | Accepted | 产品登记规则：`inboundDate` 新建自动生成当天（编辑只读展示）+「长期买断」改「产品有效期」+ 新建销售单价自动同步参考区间（min=单价、max=×1.02，手改后停跟）+ 移除卫星数据自动勾选重复售卖（默认全关）+ 遥感容器强制 `repeatSale=false`（400 兜底）+ 登记页 4 卡重构（零字段增减） |
 | ADR-037 | Accepted | 生态人员购物车口径：viewer 不渲染折扣输入（后端忽略 viewer 行历史 `discountRate`，不 400）+ 区间校验分角色（viewer 仅下限、上限放开；editor/admin 双向不变；单函数两入口复用） |
+| ADR-038 | Accepted | 遥感可售明细级「可重复售卖」开关：默认 **false（单次售卖）** + 入参新增 `repeatSale` + 列表内联开关/弹窗可设 + `availableCount` 只扣 `repeatSale=false` 的占用明细 + 存量 60 条归一脚本（ADR-011 的"明细默认 true"被本 ADR 取代） |
+| ADR-039 | Accepted | 购物车折扣功能整体下线（Deprecates ADR-023）：前端折扣输入/摘要/预览全删，后端 `discountRate` 入参「容忍但忽略」、新单恒 `null`、列保留不清洗 |
+| ADR-040 | Accepted | 销售项目删除入口收敛：列表常驻「删除」→ 行尾「更多▾」仅 admin + `DELETE /projects/{id}` 权限 `require_editor` → `require_admin`（ADR-028 §3 护栏与回滚链零改动）；附带移除产品列表「编辑」按钮（入口 3→2） |
 
 ## 8. 文档地图与变更流程
 
@@ -134,3 +139,9 @@
 4. 算力服务板块只读占位（建设中）；预留页占位
 5. 开发态：admin/123456、editor/viewer 测试账号；backend 下有 .db.bak 与一次性迁移脚本
 6. 购物车行"数量"语义：普通产品可调（受行级合计≤可售约束）；遥感明细行恒 1
+7. **【硬规则】禁止裸用 secure-context-only 浏览器 API**（BUG-LAN-20261022，2026-10-22）：本项目当前部署形态是 **http + 局域网 IP**（`vite --host 0.0.0.0`、uvicorn 8000），此时 `crypto.randomUUID`、`crypto.subtle`、`navigator.clipboard`、`navigator.mediaDevices`、`serviceWorker` 等一律为 `undefined` —— 直调即 TypeError（曾导致局域网下购物车下单 100% 失败）。**必须封装降级后再用**：
+   - 唯一 UUID 需求 → `genRequestId()`（`src/api/index.ts`，三级降级：`randomUUID` → `getRandomValues` 手工 v4 → `Math.random`）
+   - 剪贴板 → `copyCode()` 的三级降级范式（Clipboard API → `execCommand('copy')` → 弹窗展示）
+   - 新增此类 API 前先问：**没有安全上下文时如何工作**；不可降级的改用服务端能力
+   - 注：后续若改为 nginx 反代 + HTTPS，secure context 会成立、降级分支不再触发，但**封装必须保留**（本地 http 调试、内网降级场景仍会走）
+8. **【硬规则】前端类型检查必须用 `npx vue-tsc -p tsconfig.app.json --noEmit`**（REFILL-20261022-F3，2026-10-22）：根 `tsconfig.json` 是 solution-style（`files: []` + `references`），直接跑 `vue-tsc --noEmit` **退出码恒 0 但一行业务源码都没检查** —— 此前多批次据此汇报「类型检查通过」，实为假通过。今后验收一律带 `-p tsconfig.app.json`，且退出码必须为 0（当前基线：4 条 TS6133 已于同批清理，基线 0 错误）

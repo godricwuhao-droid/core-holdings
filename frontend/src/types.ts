@@ -83,6 +83,12 @@ export interface Asset {
   // 参考价格区间（ADR-018，PRICING-20261020）：元/{unit}，选填（可单边），下单折扣区间校验用
   priceMin?: number | null
   priceMax?: number | null
+  // 可售明细数（UI-OPT-20261022，ADR-038 修订口径）：**仅容器（type='遥感数据'）有值**，后端派生
+  // = 明细总数 − 被「非 terminated 销售记录」占用**且 repeatSale=false** 的明细数
+  // （repeatSale=true 的明细售出后仍可售，不参与扣减；锁定/已交付都算占用）；
+  // 语义与普通产品的 quantity−lockedQty−shippedQty 对齐，只是容器的「数量」是明细条数。
+  // 非容器恒 null；旧后端/旧快照不返回该字段 → undefined（消费方回退旧口径）
+  availableCount?: number | null
   soldAmount: number // 累计售卖金额（元）
   soldCount: number // 授权/销售次数（可重复售卖）
   status: AssetStatus // 可售 / 全部出售
@@ -109,7 +115,13 @@ export interface RsItem {
   // 参考价格区间（ADR-021，RSITEM-RANGE-20261020）：元/份，选填（可单边）；下单折扣区间校验用
   priceMin?: number | null
   priceMax?: number | null
-  repeatSale: boolean // 可重复售卖（默认 true，只计次不扣量）
+  // 可重复售卖（ADR-038 起默认 false = 单次售卖，售出即占用可售数；true = 只计次不扣量）
+  repeatSale: boolean
+  // 可售状态（RS-STATUS-20261022 / ADR-038 Decision 3）：`in_stock`=可售 / `all_sold`=已售罄，
+  // **与 assets.status 同枚举**（AssetStatus），后端按真值维护（repeatSale=true 或未被非 terminated
+  // 合同引用 → in_stock），前端只读、不提交（RsItemInput 不含该字段）。
+  // 原派生字段 `occupied` 已由后端删除，「这条明细还能不能卖」只认本字段。
+  status: AssetStatus
   createdAt: string
   updatedAt: string
   // 已售次数（FIX-20261022-FOLLOWUP）：后端派生值（该明细被 delivered 合同明细计数）。
@@ -123,9 +135,27 @@ export function rsItemName(r: RsItem): string {
 }
 
 /** 可售明细 + 已售次数（PAGE-20261021）：GET /assets/{id}/rs-items 分页接口的派生行类型，
- * soldCount 由后端按 delivered 合同明细 itemId 计数（替代前端遍历 contracts 派生） */
+ * soldCount 由后端按 delivered 合同明细 itemId 计数（替代前端遍历 contracts 派生）；
+ * RS-STATUS-20261022：status 由 RsItem 继承（与 assets.status 同枚举），本接口无需重复声明 */
 export interface RsItemWithSold extends RsItem {
   soldCount: number
+}
+
+/** 明细状态 → 展示文案 + tag 类型（RS-STATUS-20261022）：
+ * 与 `ASSET_STOCK_STATE` 同口径（success=绿 / info=灰），**不新增色值**（§6 硬约束） */
+export const RS_ITEM_STATUS: Record<AssetStatus, { label: string; tag: 'success' | 'info' }> = {
+  in_stock: { label: '可售', tag: 'success' },
+  all_sold: { label: '已售罄', tag: 'info' },
+}
+
+/**
+ * 明细是否「已售罄且不可再选」（RS-STATUS-20261022）：
+ * `status === 'all_sold' && !repeatSale` → 详情表展示灰「已售罄」、选择器置灰禁选。
+ * `repeatSale === true` 的明细即使已售出也照常可选（后端放行，只计次不扣量）；
+ * 缺失 status（旧后端/旧快照）按可售处理，不误伤。
+ */
+export function isRsItemSoldOut(r: Pick<RsItem, 'status' | 'repeatSale'>): boolean {
+  return r.status === 'all_sold' && !r.repeatSale
 }
 
 /** 是否包量定价模式（ADR-008）：amount 模式下合同金额为权威输入，salePrice 仅参考 */
@@ -150,21 +180,38 @@ export interface CartItem {
   itemId?: number // 遥感数据明细 id（ADR-011，挂 rs_items；含 itemId 行数量恒 1）
   customer?: string // 行级客户（ADR-007）：结算时按 customer 分组拆合同；"" = 未填写
   qty: number
-  // 合同金额（元，整数；ADR-008 包量定价行权威输入；ADR-018 §3 PRICING-20261020 起 unit/遥感行=折扣金额，可空=原价成交）
+  // 合同金额（元，整数；ADR-008 包量定价行权威输入；ADR-018 §3 PRICING-20261020 起 unit/遥感行=行内成交金额，可空=原价成交）
   amount?: number
   // 服务期限（ADR-020，PRICING-20261020）：YYYY-MM-DD，购物车行填写、结算透传落 project_items；遥感行不填
   serviceStart?: string | null
   serviceEnd?: string | null
-  // 折扣率（DISCOUNT-20261021 / ADR-023，2026-10-21）：0-1 小数（0.9=九折），选填；
-  // 购物车行快捷入口，下单时快照落 project_items；null/空 = 未填
+  // 折算率：已下线（ADR-039），仅历史数据存在——购物车已无录入入口，后端也不再读取/校验/写入该字段；
+  // 保留字段仅为存量行（含历史快照）类型兼容，前端不展示、不提交
   discountRate?: number | null
   createdAt: string
   updatedAt: string
 }
 
-/** 可售数量：可重复售卖返回 null（表示"重复售卖，不扣减"） */
+/** 是否遥感数据容器（父产品 + 可售明细两层，ADR-011） */
+export function isRemoteContainer(a: Pick<Asset, 'type'>): boolean {
+  return a.type === '遥感数据'
+}
+
+/**
+ * 可售数量：可重复售卖返回 null（表示"重复售卖，不扣减"）。
+ *
+ * UI-OPT-20261022：容器（type='遥感数据'）的「数量」是**可售明细条数**，父产品 quantity 恒 1，
+ * 故优先读后端派生 `availableCount`（明细总数 − 被非 terminated 销售记录占用的明细数）。
+ *  - 有值（number）→ 直接用（后端权威，viewer 视角同样正确，不再前端本地汇总）；
+ *  - undefined / null（旧后端、旧快照、非容器）→ 回退旧口径 quantity−lockedQty−shippedQty（兼容）。
+ * repeatSale / 非容器逻辑与改造前完全一致。列表「可售数量」列、抽屉「可售 N 份」、
+ * assetStockState / noSellableStock 状态派生均依赖本函数，不得各自另算。
+ */
 export function availableQty(a: Asset): number | null {
   if (a.repeatSale) return null
+  if (isRemoteContainer(a) && typeof a.availableCount === 'number') {
+    return Math.max(0, a.availableCount)
+  }
   return Math.max(0, a.quantity - a.lockedQty - a.shippedQty)
 }
 
@@ -249,6 +296,69 @@ export const PROJECT_FLOW: ProjectStatus[] = [
   'delivered',
 ]
 
+// ============================================================
+// ADR-041 / FLOW-20261022：终止态细分（纯展示层）
+// ============================================================
+/** ADR-041：终止态三种成因——仅展示层概念，后端 status 一律 'terminated'，切勿当成状态机状态 */
+export type ProjectOutcome = 'revoked' | 'rejected' | 'terminated'
+
+export const PROJECT_OUTCOME: Record<ProjectOutcome, { label: string; tag: 'success' | 'info' | 'warning' | 'danger' | 'primary' }> = {
+  revoked: { label: '已撤销', tag: 'info' },
+  rejected: { label: '已驳回', tag: 'danger' },
+  terminated: { label: '已终止', tag: 'danger' },
+}
+
+/**
+ * 终止成因判定（ADR-041 §1）：先看日志 action（精确），无日志的存量单回退合同 remark 前缀。
+ * ⚠️ 只用于展示；筛选/按钮可用性一律继续用真实 status。
+ * 降级（FLOW-20261022 后端 projectId 并行期）：`l.projectId` 全为 undefined 时此处过滤结果为空，
+ * 自动走 remark 兜底分支，仍能区分撤销/驳回（故不得使用 `l.projectId!` 断言）。
+ */
+export function projectOutcome(
+  p: { id: number; status: ProjectStatus },
+  logs: OpLog[],
+  contracts: { projectId: number; remark?: string }[],
+): { label: string; tag: 'success' | 'info' | 'warning' | 'danger' | 'primary' } {
+  if (p.status !== 'terminated') return PROJECT_STATUS[p.status]
+  const mine = logs.filter((l) => l.projectId === p.id)
+  if (mine.some((l) => l.action === '撤销订单')) return PROJECT_OUTCOME.revoked
+  if (mine.some((l) => l.action === '驳回订单')) return PROJECT_OUTCOME.rejected
+  const remarks = contracts.filter((c) => c.projectId === p.id).map((c) => c.remark || '')
+  if (remarks.some((r) => r.includes('撤销：'))) return PROJECT_OUTCOME.revoked
+  if (remarks.some((r) => r.includes('驳回：'))) return PROJECT_OUTCOME.rejected
+  return PROJECT_OUTCOME.terminated
+}
+
+/**
+ * 从日志 detail 或合同 remark 提取撤销/驳回原因（ADR-041 §2），提不到返回 ''。
+ * ⚠️ 取数范围收紧到「成因事件」日志（action = 撤销订单 / 驳回订单）：ADR-041 §2 明确原因来源是
+ * 「撤销事件 / 驳回事件」。实测（2026-10-22 库内 project 1）撤销时各合同先落「销售记录状态变更」
+ * 日志，detail 为「…终止：释放锁定…，原因：撤销：撤销测试」——若对项目全部日志 join 后匹配，
+ * 会先命中这条，展示成「撤销：撤销测试」（前缀重复）；只取成因日志后得到「撤销测试」。
+ */
+export function outcomeReason(
+  p: { id: number; status: ProjectStatus },
+  logs: OpLog[],
+  contracts: { projectId: number; remark?: string }[],
+): string {
+  const mine = logs
+    .filter((l) => l.projectId === p.id)
+    .filter((l) => l.action === '撤销订单' || l.action === '驳回订单')
+  const logText = mine.map((l) => l.detail || '').join('\n')
+  // 撤销：「…原因：撤销测试；原商务负责人…」；驳回：「…订单已驳回：的（锁定已释放）」
+  const mRevoke = logText.match(/原因：([^；\n]+)/)
+  if (mRevoke) return mRevoke[1].trim()
+  const mReject = logText.match(/订单已驳回：([^（\n]+)/)
+  if (mReject) return mReject[1].trim()
+  // 兜底：合同 remark 前缀（存量单无日志时）
+  for (const c of contracts.filter((x) => x.projectId === p.id)) {
+    const r = (c.remark || '')
+    const m = r.match(/(?:撤销|驳回)：(.+)$/)
+    if (m) return m[1].trim()
+  }
+  return ''
+}
+
 export type ItemStatus = 'pending_asset' | 'pending_amount' | 'locked' | 'confirmed' | 'shipped' | 'released'
 
 export const ITEM_STATUS: Record<ItemStatus, { label: string; tag: 'success' | 'info' | 'warning' | 'danger' | 'primary' }> = {
@@ -275,8 +385,8 @@ export interface ProjectItem {
   // 服务期限（ADR-020，PRICING-20261020）：YYYY-MM-DD，下单人填、商务审核可改
   serviceStart?: string | null
   serviceEnd?: string | null
-  // 折扣率快照（DISCOUNT-20261021 / ADR-023，2026-10-21）：下单时购物车行 discountRate 快照（0-1 小数），
-  // 只写不改（与 origPrice 同级口径）；审核页只读展示，存量订单为空
+  // 折算率快照：已下线（ADR-039），仅历史数据存在——本批次起下单不再写入（新单恒为 null），
+  // 审核页也不再展示该列；保留字段仅为存量订单类型兼容，前端不读不写
   discountRate?: number | null
   status: ItemStatus
   locked?: boolean // 明细下单时刻是否真实加锁（存量数据 false）
@@ -312,6 +422,73 @@ export interface Project {
   cartRefilled?: boolean
   createdAt: string
   updatedAt: string
+}
+
+// ============================================================
+// ADR-042 / REFILL-20261022：「重新提交」回填购物车响应
+// ============================================================
+/**
+ * 回填方式（ADR-042 §2）：
+ * - `merge`（默认）：保留购物车现有商品，同产品同客户的行用本次明细**覆盖**（替换，不累加）；
+ * - `replace`：先清空下单人购物车再回填（不可撤销）。
+ */
+export type RefillMode = 'merge' | 'replace'
+
+/**
+ * 逐行失败代码（REFILL-20261022-F3 / 后端 B3 新增 `code`）。
+ * 前端用它选「状态胶囊文案 + 颜色」并决定是否展示「库存/锁定/出库」数值，
+ * 不再靠解析中文 `reason`（解析仅在 `code` 缺失时作为降级）。
+ * - `insufficient`：可售数量不足（库存 − 锁定 − 出库 < 本次需）
+ * - `no_asset`：产品不存在（assetId 在库存里查不到）
+ * - `other`：其它原因（价格区间不符、数据异常等）
+ */
+export type RefillRowCode = 'ok' | 'insufficient' | 'no_asset' | 'other'
+
+/** 逐行回填结果（ADR-042 §3/§4）：reason 为「可售不足/区间不符」等可读中文原因（含库存数值） */
+export interface RefillRowResult {
+  assetName: string
+  qty: number
+  ok: boolean
+  reason: string
+  // ---- REFILL-20261022-F3：以下 3 字段由后端 B3 加性提供，旧后端缺失时必须降级（不得非空断言）----
+  /** 产品 id —— 前端据此从 `db.assets` 直读库存，避免解析中文 reason */
+  assetId?: number | null
+  /** 失败代码（展示用）；缺失 → 按 reason 关键字猜（仅降级路径） */
+  code?: RefillRowCode
+  /** 本次需要的数量；缺失 → 回退 `qty` */
+  need?: number
+}
+
+/** 回填目标账号 = 下单人（ADR-042 §5 归属提示用） */
+export interface RefillOwner {
+  id: number
+  username: string
+  name: string
+}
+
+/**
+ * 重新提交回填购物车响应（ADR-027 旧字段全保留 + ADR-042 加性字段）。
+ *
+ * ⚠️ 降级约定（REFILL-20261022 / 后端并行未热载）：`owner` / `rows` / `mode` / `forced` / `cleared`
+ * 一律 **optional**——旧后端不返回时必须按「本人 + 无逐行明细」处理，不得非空断言。
+ */
+export interface RefillResult {
+  ok: boolean
+  alreadyRefilled: boolean
+  restored: number
+  amountFallback: number
+  skipped: number
+  skippedReasons: string[]
+  /** 本次实际生效的回填方式（旧后端缺失 → 视为 merge） */
+  mode?: RefillMode
+  /** replace 跳过幂等短路时为 true（旧后端缺失） */
+  forced?: boolean
+  /** replace 清掉的购物车行数（旧后端缺失） */
+  cleared?: number
+  /** 回填目标（下单人）；缺失 → 跳过归属判断，按本人处理 */
+  owner?: RefillOwner
+  /** 逐行结果；缺失 → 回退 `skippedReasons` 展示 */
+  rows?: RefillRowResult[]
 }
 
 // ============================================================
@@ -434,6 +611,8 @@ export interface OpLog {
   targetName: string
   /** 目标为产品时的产品 ID（后端 logs[] 回传，用于按 ID 精确过滤、避免重名串台） */
   assetId?: number
+  /** ADR-041（FLOW-20261022）：项目/交付单日志的结构化外键，按 id 精确过滤（对齐 assetId 做法） */
+  projectId?: number | null
   action: string // 新增/编辑/状态变更/删除/交付...
   detail: string
   operator: string
@@ -486,6 +665,18 @@ export interface AssetDeliverable {
   status: 'ready' | 'todo' // 已就绪 / 待完善
   updatedAt: string
   file?: string | null // 附件（upload 返回的散列文件名；空/NULL = 无附件，ADR-024）
+  /** 外部链接（ADR-044；仅 http/https，'' = 未填）。可选：旧后端未热载该字段时为 undefined → 前端降级不渲染 */
+  url?: string
+}
+
+/** ADR-044：交付物外链校验——仅 http/https（渲染为可点击 <a>，伪协议 = XSS 入口）。
+ *  返回 '' 表示合法，否则返回错误文案。与后端 `_normalize_deliverable_url` 同规则。 */
+export function checkDeliverableUrl(raw: string): string {
+  const u = (raw ?? '').trim()
+  if (!u) return '' // 空 = 不填，合法
+  if (!/^https?:\/\//i.test(u)) return '链接地址必须以 http:// 或 https:// 开头'
+  if (u.length > 512) return '链接地址过长（最多 512 字符）'
+  return ''
 }
 
 export const DELIVERABLE_STATUS: Record<

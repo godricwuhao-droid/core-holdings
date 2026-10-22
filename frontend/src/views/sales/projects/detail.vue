@@ -19,14 +19,17 @@ import {
   formatMoney,
   formatTokens,
   isAmountMode,
+  projectOutcome,
   rsItemName,
   tagInfo,
   type Contract,
 } from '@/types'
-import { allUserOptions, changeContractStatus, claimProject, db, getAsset, patchContractFields, refillProjectCart, refresh, showError, type UserOption } from '@/api'
+import { allUserOptions, changeContractStatus, claimProject, db, getAsset, patchContractFields, refresh, showError, type UserOption } from '@/api'
 import TransferDialog from '@/components/TransferDialog.vue'
 import WithdrawProjectDialog from '@/components/WithdrawProjectDialog.vue'
 import { canWrite, isViewer, isAdmin, currentUser, NO_PERM_TIP } from '@/auth'
+// ADR-042 / REFILL-20261022：「重新提交」动线收敛到 composable（与列表页共用同一套弹窗/失败/归属逻辑）
+import { useResubmitProject } from '@/composables/useResubmitProject'
 
 // 生态人员（viewer）：数据已按「自己下单」在后端过滤，能进入本页即自己项目——
 // ADR-028（2026-10-21）：订单提交后禁编辑（头部「编辑」不渲染 + goEdit 兜底拦截），
@@ -100,23 +103,22 @@ async function onWithdrawn() {
 }
 
 /**
- * 重新提交（ADR-027 / TASK-FE-031）：已终止项目不再跳 create 页 copy 模式——
- * 调 POST /projects/{id}/refill-cart 确保明细在下单人购物车（幂等）→ `refresh()` → 跳 /cart 改单重提。
- * 失败 showError 并停留本页，不跳转。
+ * 重新提交（ADR-027 / TASK-FE-031；ADR-042 / REFILL-20261022 改造）：已终止项目不再跳 create 页 copy 模式——
+ * 统一走 `useResubmitProject()`（购物车非空三选弹窗 / 全部失败不跳空车 / 部分失败带警告条 / 归属提示），
+ * 本处只保留**按钮 loading**（refilling，模板 `:loading`）与入口判断；提示文案与跳转不再由本页维护。
  */
+const { resubmit: resubmitProject } = useResubmitProject()
 const refilling = ref(false)
 async function handleResubmit() {
   const p = project.value
   if (!p || refilling.value) return
   refilling.value = true
   try {
-    const res = await refillProjectCart(p.id)
-    await refresh()
-    const base = res.alreadyRefilled ? '明细已在购物车，可直接修改后提交' : '明细已回填购物车，可修改后提交'
-    ElMessage.success(res.skipped > 0 ? `${base}（${res.skipped} 行未能回填，请核对明细）` : base)
-    router.push('/cart')
-  } catch (e) {
-    showError(e, '重新提交失败')
+    // creator/rep 仅供 composable 做「弹窗前归属预判」（避免给别人的购物车弹三选框，ADR-042 §5）
+    await resubmitProject(
+      { id: p.id, code: p.code, name: p.name, creator: p.creator, rep: p.rep },
+      { cartCount: db.cart.length },
+    )
   } finally {
     refilling.value = false
   }
@@ -319,13 +321,15 @@ async function submitDateDialog() {
           </a>
           <div class="title-row">
             <h1>{{ project?.name ?? '销售项目详情' }}</h1>
+            <!-- ADR-041 / FLOW-20261022：终止态细分展示（已撤销 / 已驳回 / 已终止）——纯展示，
+                 下方合同卡片状态与按钮可用性仍按真实 status（后端只有 terminated） -->
             <el-tag
               v-if="project"
-              :type="tagInfo(PROJECT_STATUS, project.status).tag"
+              :type="projectOutcome(project, db.logs, db.contracts).tag"
               size="large"
               effect="light"
             >
-              {{ tagInfo(PROJECT_STATUS, project.status).label }}
+              {{ projectOutcome(project, db.logs, db.contracts).label }}
             </el-tag>
           </div>
         </div>
@@ -382,10 +386,13 @@ async function submitDateDialog() {
             <el-tooltip v-if="!isViewer && project.status === 'delivered'" content="已完成项目不可编辑" placement="top">
               <el-button :icon="EditPen" disabled>编辑</el-button>
             </el-tooltip>
-            <!-- ADR-027（2026-10-21）：重新提交——已终止（驳回/终止）项目由下单账号（或商务/管理员）
-                 回填购物车（幂等）后跳 /cart 改单重提，旧单保留终止历史（驳回原因可查） -->
+            <!-- ADR-027（2026-10-21）：重新提交——已终止（驳回/终止）项目由下单账号（或管理员）
+                 回填购物车（幂等）后跳 /cart 改单重提，旧单保留终止历史（驳回原因可查）。
+                 ADR-043（2026-10-22）：权限收紧为「下单人本人（viewer）+ 管理员」——商务（editor）
+                 回填目标恒为下单人（明细进别人的车、自己购物车毫无变化），故**整块不渲染**
+                 （含禁用态，与站内"商务不可用功能不渲染"口径一致）；后端已对该角色 403。 -->
             <el-button
-              v-if="project.status === 'terminated' && (canWrite || isViewer)"
+              v-if="project.status === 'terminated' && (isAdmin || isViewer)"
               type="warning"
               plain
               :loading="refilling"

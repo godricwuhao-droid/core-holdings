@@ -49,12 +49,6 @@ function editItemName(it: { assetId?: number | null }): string {
   return getAsset(it.assetId)?.name ?? '产品已删除'
 }
 
-/** DISCOUNT-20261021（ADR-023，2026-10-21）：折扣率小数 → 展示文案（0.9→"9折"、0.85→"8.5折"，一位小数去尾零） */
-function discountRateText(rate: number): string {
-  const t = (rate * 10).toFixed(1)
-  return (t.endsWith('.0') ? t.slice(0, -2) : t) + '折'
-}
-
 // ==================== 订单审核（原编辑页面板迁移） ====================
 interface ReviewLine {
   id: number // project_items.id（审核接口 items[].itemId）
@@ -70,9 +64,6 @@ interface ReviewLine {
   origAmount: number
   price: number | null // unit 模式可编辑（实际单价）
   amount: number | null // amount 模式可编辑（实际合同金额，整数元）
-  // 折扣率快照（DISCOUNT-20261021 / ADR-023，2026-10-21）：下单时生态人员填写的折扣率（0-1 小数），
-  // 只读展示（快照不可改，review 接口不改该字段）；null 显示 -
-  discountRate: number | null
   // 服务期限（ADR-020，PRICING-20261020）：confirm 可改（start ≤ end 后端 400 兜底）
   serviceStart: string
   serviceEnd: string
@@ -100,8 +91,6 @@ watch(contracts, (cs) => {
         origPrice: it.origPrice ?? it.price, origAmount: it.origAmount ?? it.amount,
         price: it.price ?? null,
         amount: it.amount ?? null,
-        // DISCOUNT-20261021（ADR-023，2026-10-21）：折扣率快照（只读；存量订单为空 → 显示 -）
-        discountRate: it.discountRate ?? null,
         // ADR-020（PRICING-20261020）：服务期限预填（可改）
         serviceStart: it.serviceStart ?? '',
         serviceEnd: it.serviceEnd ?? '',
@@ -371,7 +360,8 @@ const pageReady = computed(() => proj.value != null)
                 <span class="rv-ct-total">销售金额合计（实时）：{{ formatMoney(contractTotal(c.id)) }}</span>
               </div>
               <div v-for="l in reviewLines.filter((x) => x.contractId === c.id)" :key="l.id" class="rv-line">
-                <!-- 第 1 层：产品名 + 数量 + 折扣 + 原价 + 可编辑价 + 金额（固定列网格，单行不换行，仅产品名可省略） -->
+                <!-- 第 1 层：产品名 + 数量 + 原价 + 可编辑价 + 金额（固定列网格，单行不换行，仅产品名可省略）
+                     ADR-039（NO-DISCOUNT-20261022）：原「折扣」只读列已删除，其列宽并入产品名列 -->
                 <div class="rv-line-main-row">
                   <div class="rv-c-name">
                     <el-tooltip :content="l.name" placement="top">
@@ -379,16 +369,6 @@ const pageReady = computed(() => proj.value != null)
                     </el-tooltip>
                   </div>
                   <span class="rv-c-qty muted">× {{ l.qty }}{{ l.unit }}</span>
-                  <!-- DISCOUNT-20261021（ADR-023，2026-10-21）：折扣率只读展示（下单时生态人员填写的快照，不可改；
-                       null 显示 -）；与已有原单价/原金额 + 可编辑终审价并列，商务可见「原价、折扣率、折扣价」三要素 -->
-                  <div class="rv-c-disc">
-                    <span class="rv-lbl rv-discount-lbl">
-                      <el-tooltip content="下单时生态人员填写的折扣率（快照，不可改）" placement="top">
-                        <span>折扣</span>
-                      </el-tooltip>
-                    </span>
-                    <span class="rv-orig">{{ l.discountRate != null ? discountRateText(l.discountRate) : '-' }}</span>
-                  </div>
                   <!-- ADR-018 §2（PRICING-20261020）：原价列只读——展示下单时挂牌价快照；
                        存量订单 orig 为空时数据层已按当前 price/amount 兜底（见 reviewLines 展开逻辑），
                        故此处恒展示，无需再判空 -->
@@ -570,14 +550,16 @@ const pageReady = computed(() => proj.value != null)
 .rv-line + .rv-line {
   border-top: 1px solid var(--divider-color);
 }
-/* B-1 层：产品名 + 数量 + 折扣 + 原价 + 可编辑价 + 金额
+/* B-1 层：产品名 + 数量 + 原价 + 可编辑价 + 金额
    TASK-FE-028（2026-10-21）：flex → 固定列 CSS Grid。「标签+值」成对包成分组，
    每个标签/输入框落在固定列上，三种明细行（unit/amount/rs）的输入框左边缘吸附同一列，
-   标签不再被 overflow 裁切（只剩产品名省略）。 */
+   标签不再被 overflow 裁切（只剩产品名省略）。
+   ADR-039（NO-DISCOUNT-20261022）：删除「折扣」只读列（原 92px）——该列宽由第 1 列的 1fr 自动吸收，
+   产品名列变宽（可省略的仍是它），其余三价列宽原样不动 → 一行内「原价 | 可编辑价 | 金额」仍严格对齐。 */
 .rv-line-main-row {
   display: grid;
-  /* 产品名 | 数量 | 折扣 | 原价 | 可编辑价 | 金额 */
-  grid-template-columns: minmax(150px, 1fr) 78px 92px 176px 280px minmax(132px, auto);
+  /* 产品名 | 数量 | 原价 | 可编辑价 | 金额 */
+  grid-template-columns: minmax(150px, 1fr) 78px 176px 280px minmax(132px, auto);
   align-items: center;
   column-gap: 10px;
   padding: 9px 0;
@@ -609,20 +591,15 @@ const pageReady = computed(() => proj.value != null)
   font-size: 12px;
   color: var(--text-secondary);
 }
-/* DISCOUNT-20261021（ADR-023，2026-10-21）：折扣只读列（窄列，标签带 tooltip 说明快照口径） */
-.rv-discount-lbl {
-  cursor: help;
-}
 /* TASK-FE-028（2026-10-21）：成对分组容器——标签 + 值/输入框同组，组内 label 定宽 → 列内对齐 */
-.rv-c-disc,   /* 第 3 列：折扣（标签 + 折扣率） */
-.rv-c-orig,   /* 第 4 列：原单价/原金额（标签 + 值，标签文案随分支原样） */
-.rv-c-edit {  /* 第 5 列：实际单价/销售金额（定宽标签 + 输入框） */
+.rv-c-orig,   /* 第 3 列：原单价/原金额（标签 + 值，标签文案随分支原样） */
+.rv-c-edit {  /* 第 4 列：实际单价/销售金额（定宽标签 + 输入框） */
   display: flex;
   align-items: center;
   gap: 6px;
   min-width: 0;
 }
-/* 第 4 列的值不换行、数字等宽 */
+/* 第 3 列的值不换行、数字等宽 */
 .rv-c-orig .rv-orig {
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
@@ -643,7 +620,7 @@ const pageReady = computed(() => proj.value != null)
   font-weight: 600;
   font-variant-numeric: tabular-nums;
 }
-/* 第 6 列：金额 / 参考单价（末列右边缘 = 行右边缘 → 各行右对齐） */
+/* 第 5 列：金额 / 参考单价（末列右边缘 = 行右边缘 → 各行右对齐） */
 .rv-c-amt {
   justify-self: end;
   text-align: right;
@@ -722,7 +699,8 @@ const pageReady = computed(() => proj.value != null)
    标签定宽保持 112px（不换行、不截断），输入框 150px；第 1 层仍为单行网格，不换行 */
 @media (max-width: 1360px) {
   .rv-line-main-row {
-    grid-template-columns: minmax(0, 1fr) 72px 88px 170px 268px minmax(132px, auto);
+    /* 产品名 | 数量 | 原价 | 可编辑价 | 金额（ADR-039：列数 6 → 5，产品名列依旧先让位） */
+    grid-template-columns: minmax(0, 1fr) 72px 170px 268px minmax(132px, auto);
     column-gap: 8px;
   }
   .rv-input {

@@ -751,3 +751,186 @@ body {
   margin-top: 4px;
   line-height: 1.5;
 }
+
+/* ============ el-dropdown 菜单项：危险操作红色（FT-20261022-B） ============ */
+/* ADR-040：el-dropdown 的 popper teleport 到 body，scoped :deep 编译出的 [data-v-x] 前缀命中不到，
+   危险项统一在全局定义。实测 DOM（EP 2.14.7）：
+   body > .el-popper.el-dropdown__popper > .el-scrollbar > .el-scrollbar__wrap
+        > .el-scrollbar__view.el-dropdown__list > ul.el-dropdown-menu > li.el-dropdown-menu__item.danger-item
+   本规则不含祖先约束，中间层增减都不影响命中。优先级：本规则 (0,2,0) > EP 的 .el-dropdown-menu__item
+   (0,1,0)，且 global.css 在 element-plus/dist/index.css 之后引入（main.ts L3 → L8），同权重亦胜出。
+   禁用态 EP 用 .el-dropdown-menu__item.is-disabled (0,2,0)，故显式叠加 .is-disabled 抬到 (0,3,0) 稳定覆盖。
+   hover/focus 态：EP `.el-dropdown-menu__item:not(.is-disabled):hover` 为 (0,3,0)，本规则 (0,4,0) 覆盖，
+   避免悬停瞬间跳蓝（EP 同一条规则里的 :focus 分支即键盘导航聚焦态，已一并纳入同一组选择器）。 */
+.el-dropdown-menu__item.danger-item {
+  color: #d9534f;
+}
+.el-dropdown-menu__item.danger-item.is-disabled {
+  color: #f5a9a5;
+}
+/* FT-20261022-C（ADR-040）：EP 的 hover/focus 规则 (0,3,0) 会把危险项文字改回
+   var(--el-dropdown-menuItem-hover-color) = var(--el-color-primary) = #1769d4（主色蓝）；此处用
+   :not(.is-disabled) 抬到 (0,4,0) 只锁 color，不引入 !important。背景仍走 EP 的
+   var(--el-dropdown-menuItem-hover-fill) = var(--el-color-primary-light-9) = #e8f0fb（浅蓝底），红字在浅蓝底上可读。 */
+.el-dropdown-menu__item.danger-item:not(.is-disabled):hover,
+.el-dropdown-menu__item.danger-item:not(.is-disabled):focus {
+  color: #d9534f;
+}
+
+/* ============ ADR-042 / REFILL-20261022-F3：重新提交弹窗（h() 渲染，scoped 无法命中） ============ */
+/* 两个弹窗（「购物车中已有商品」三选框 / 「无法回填到购物车」）共用 .rf-* 命名空间：
+   头部「图标 + 标题 + 副标题」、逐行失败详情、底部浅橙提示条、footer 按钮区。
+   颜色/尺寸全部取既有值（#1A2E4E=--text-primary、#425774=--text-body、#71829A=--text-secondary、
+   #E1E8F1=--border-color、#E7EDF5=--divider-color、#1769D4=--primary-color、
+   #A86514/#FFF5E7=--warning-color/--warning-bg），**不新增色值 token**（复用「建设中」橙）。
+   EP 2.14 的 .el-dialog 自带 16px 内边距（--el-dialog-padding-primary），此处抬到 20px，
+   并压掉 header/footer 的对称内边距，避免「头重脚重」。 */
+.rf-dialog {
+  --el-dialog-padding-primary: 20px;
+  --el-dialog-border-radius: 10px;
+  max-width: calc(100vw - 32px);
+}
+/* 弹窗不可拖动：去掉 EP 的 cursor:move / user-select:none，失败原因需要能被选中复制 */
+.rf-dialog .el-dialog__header {
+  padding-bottom: 10px;
+  cursor: default;
+  user-select: text;
+}
+.rf-dialog .el-dialog__headerbtn {
+  width: 40px;
+  height: 40px;
+}
+.rf-dialog .el-dialog__body {
+  padding: 0;
+  font-size: 13px;
+  color: var(--text-body);
+}
+.rf-dialog .el-dialog__footer {
+  padding-top: 14px;
+  text-align: right;
+}
+
+/* ---- 头部：⚠/ⓘ + 标题(17 / 600 / #1A2E4E) + 副标题(13 / #71829A) ---- */
+.rf-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding-right: 26px; /* 让开右上角关闭按钮 */
+}
+.rf-head-icon {
+  flex: none;
+  margin-top: 2px;
+  font-size: 18px;
+}
+.rf-head-icon.is-warn {
+  color: var(--warning-color);
+}
+.rf-head-icon.is-info {
+  color: var(--primary-color);
+}
+.rf-head-text {
+  min-width: 0;
+}
+.rf-head-title {
+  font-size: 17px;
+  font-weight: 600;
+  line-height: 1.4;
+  color: var(--text-primary);
+}
+.rf-head-sub {
+  margin-top: 3px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+/* ---- 逐行失败列表：行间 1px 分隔（不做卡片套卡片），行多时内部滚动（头/尾固定） ---- */
+.rf-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 300px;
+  overflow-y: auto;
+}
+.rf-row {
+  padding: 10px 2px;
+}
+.rf-row + .rf-row {
+  border-top: 1px solid var(--divider-color);
+}
+.rf-row-main {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.rf-name {
+  min-width: 0;
+  font-size: 13.5px;
+  font-weight: 500;
+  line-height: 1.5;
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+.rf-qty {
+  margin-left: 6px;
+  font-size: 12.5px;
+  font-weight: 400;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+.rf-row-main .el-tag {
+  flex: none;
+}
+.rf-meta {
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+.rf-detail {
+  margin-top: 3px;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+
+/* ---- 底部提示条：浅橙底 #FFF5E7 / 文字 #A86514（复用「建设中」橙，不新增 token） ---- */
+.rf-tip {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--warning-bg);
+  color: var(--warning-color);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+/* 破坏性结果（replace 已清空原购物车）：同结构换警示红，避免与「可售不足」提示混淆 */
+.rf-tip.is-danger {
+  background: var(--el-color-danger-light-9);
+  color: var(--danger-color);
+}
+
+/* ---- 三选框选项（视觉与失败弹窗同源，功能不变） ---- */
+.rf-opt {
+  margin-bottom: 12px;
+}
+.rf-opt-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.rf-opt-desc {
+  margin-top: 2px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+}
+
+/* ---- footer：单按钮右对齐（宽度自适应） ---- */
+.rf-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}

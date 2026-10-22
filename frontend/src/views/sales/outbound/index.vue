@@ -263,12 +263,7 @@ async function handleRevert(o: Outbound) {
       </div>
     </div>
 
-    <!-- 业务规则提示条 -->
-    <div class="info-bar">
-      <el-icon aria-hidden="true"><InfoFilled /></el-icon>
-      <span>撤销交付必须填写原因，系统将反向生成调整流水；审计记录不可删除，仅可追溯。</span>
-    </div>
-
+    <!-- ADR-041/UI-CLEANUP-20261022：移除页面说明条（用户要求，纯展示删除） -->
     <!-- 表格卡 -->
     <el-card shadow="never">
       <div class="table-head">
