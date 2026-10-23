@@ -1593,3 +1593,11 @@ repeatSale 明细短路，交付/终止都不再触碰它）。此时 `available
 | 2026-10-22 | 修改 | 不改动：`_check_discount_range` / `_check_unit_price_range` 的**金额区间校验**逻辑（`unit_price = amount ÷ qty` 与 `priceMin/priceMax` 比较、viewer 单边 / editor 双向）**逐字未动**；仅确认二者内部无「用折扣率推算金额」的路径（函数名 `discount` 为 ADR-018 历史命名），并在 docstring 注明 | `backend/src/services.py` | NO-DISCOUNT-20261022 / ADR-018 / ADR-021 / ADR-037 | 回归实测：viewer 超上限 30000 → 200、低于下限 20000 → 400；editor 双向 400；区间内 200；checkout 权威链 editor 超上限 → 400 |
 | 2026-10-22 | 修改 | 验证方式：**副本库 + TestClient**（`/tmp/nodiscount-verify.db`，TestClient 35 条断言全 PASS）+ 副本库上临时端口 8123 的真实 HTTP curl（不触碰 8000 运行中服务、不重启、无 schema 变更）。另：`python3 -m compileall src main.py` 通过 | `backend/src/**` | NO-DISCOUNT-20261022 | 前端需知：响应体仍返回 `discountRate`（存量值原样、新单恒 `null`）；前端已按 ADR-039 移除折扣入口，该字段仅作历史追溯 |
 | 2026-10-22 | 修改 | **400 文案去「折扣」字样（纯文案收口，逻辑/表零改动）**：`_check_discount_range` 超区间 400 `折扣单价超出该产品参考区间（…）` → **`单价超出该产品参考区间（…）`**；区间数值、单边/双边 `_range_label` 格式、viewer 单边 / editor 双向判定、错误码 400 全部不变 | `backend/src/services.py`（`_check_discount_range` 的 `raise HTTPException(400, ...)` + docstring 引用句）、`docs/backend/api.md`（5 处文案示例 + 收口说明） | NO-DISCOUNT-20261022 / ADR-039 | 全后端 grep 复核：用户可见字符串已无「折扣」，仅注释/启动期 `print` 保留 ADR-023/039 历史引述（`main.py` print 属运维日志，非业务文案，未改）；实测（副本库 TestClient + 临时端口 8123 真实 curl）：viewer `amount=20000`→400、editor `30000`→400 均返回新文案且不含「折扣」，editor `25200`→200；`python3 -m compileall src main.py` 通过，未重启服务（8000 为 `--reload`，改动已自动热载），未 commit |
+
+## 2026-10-23 ｜ TASK-USER-FINANCE-01：新建 4 个商务人员（editor）账号
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-23 | 新增 | 新建 4 个商务人员（editor）账号：luojie/罗杰、ldanhong/刘丹红、xieyou/谢优、zjingren/周靖人 | users 表 + audit_logs（经 POST /api/users） | TASK-USER-FINANCE-01 | 初始密码 123456，需首次登录后修改 |
+
+> 纯数据操作（**未改任何业务代码**，服务未重启）：4 次 `POST /api/users` 均 200，返回 id=25/26/27/28、role=editor、enabled=true；`GET /api/users` 复核 4 条在列；`POST /api/auth/login`（luojie/123456）200 且 role=editor；`audit_logs` 新增 4 条 `actionType=user_mgmt / action=新增用户 / target=user`（`targetName` 分别 luojie、ldanhong、xieyou、zjingren，`detail=role=editor`，id 1232~1235）。

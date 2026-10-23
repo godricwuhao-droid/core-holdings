@@ -489,16 +489,15 @@ async function submitDateDialog() {
                 <div class="ch-left">
                   <!-- 2026-10-21：卡头改为「甲方：客户名称；乙方：签约主体全称」文本式——
                        甲方 = 生态人员下单时输入的客户名称；乙方 = 该项目签约主体全称（不再用简称徽标）。
-                       状态标签保留在右侧。 -->
+                       状态标签保留在右侧。
+                       TASK-FE-DETAIL-REV2：甲方、乙方各占一行（样式见 .ch-left/.contract-party） -->
                   <span class="contract-party">
                     <span class="cp-label">甲方：</span>{{ c.customer || '-' }}
                   </span>
                   <span v-if="c.subject" class="contract-party">
                     <span class="cp-label">乙方：</span>{{ c.subject }}
                   </span>
-                  <el-tag :type="tagInfo(PROJECT_STATUS, c.status).tag" size="small" effect="light">
-                    {{ tagInfo(PROJECT_STATUS, c.status).label }}
-                  </el-tag>
+                  <!-- TASK-FE-DETAIL-REV：状态收敛——乙方后不再显示 el-tag，唯一状态指示改为卡头最右侧带背景色块胶囊 -->
                 </div>
                 <div class="op-actions">
                   <!-- ADR-012：待审核销售记录无 交付/终止 快捷（后端对 pending 一律 400），唯一出口是编辑页审核面板 -->
@@ -616,35 +615,43 @@ async function submitDateDialog() {
                       </el-button>
                     </span>
                   </el-tooltip>
-                  <span v-else class="muted contract-ended">已终止</span>
                 </div>
+                <!-- TASK-FE-DETAIL-REV：唯一状态指示——由纯文字升级为带背景色块胶囊，
+                     文案复用 tagInfo(PROJECT_STATUS, c.status).label；按状态映射 3 个修饰类分色 -->
+                <span
+                  class="status-pill"
+                  :class="c.status === 'terminated' ? 'sp-ended' : c.status === 'delivered' ? 'sp-done' : 'sp-active'"
+                >
+                  {{ tagInfo(PROJECT_STATUS, c.status).label }}
+                </span>
               </div>
 
               <div class="contract-info">
+                <!-- TASK-FE-DETAIL-REV2：label 加 ci-label 类（加深加粗），值不加粗（空值占位仍走 muted） -->
                 <span class="ci-item">
-                  <span class="muted">销售金额</span>
+                  <span class="muted ci-label">销售金额</span>
                   <b class="ci-amount">{{ formatMoney(c.contractAmount) }}</b>
                 </span>
                 <span class="ci-item" v-if="c.items.some((it) => it.lockedDate)">
                   <!-- 2026-10-20（ADR-019）：原「签约/锁定」改名「下单时间」（锁定即下单时刻；签订时间另列） -->
-                  <span class="muted">下单时间</span>
+                  <span class="muted ci-label">下单时间</span>
                   <span>{{ formatDate(c.items.find((it) => it.lockedDate)?.lockedDate) }}</span>
                 </span>
                 <!-- ADR-019（PRICING-20261020）：合同签订时间 / 预计交付时间（存量合同为 null，显示占位文案） -->
                 <span class="ci-item">
-                  <span class="muted">合同签订</span>
+                  <span class="muted ci-label">合同签订</span>
                   <span :class="{ muted: !c.signedDate }">{{ c.signedDate || '未签订' }}</span>
                 </span>
                 <span class="ci-item">
-                  <span class="muted">预计交付</span>
+                  <span class="muted ci-label">预计交付</span>
                   <span :class="{ muted: !c.scheduledDeliveryDate }">{{ c.scheduledDeliveryDate || '未录入' }}</span>
                 </span>
                 <span class="ci-item" v-if="c.items.some((it) => it.shippedDate)">
-                  <span class="muted">交付</span>
+                  <span class="muted ci-label">交付</span>
                   <span>{{ formatDate(c.items.find((it) => it.shippedDate)?.shippedDate) }}</span>
                 </span>
                 <span class="ci-item" v-if="c.remark">
-                  <span class="muted">备注</span>
+                  <span class="muted ci-label">备注</span>
                   <span>{{ c.remark }}</span>
                 </span>
               </div>
@@ -835,13 +842,18 @@ async function submitDateDialog() {
 }
 .ch-left {
   display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
+  /* TASK-FE-DETAIL-REV2：甲方、乙方各占一行（原同行 +「；」分隔） */
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 5px;
+  /* TASK-FE-DETAIL-REV：占满左侧，把动作按钮与状态胶囊推到卡头最右 */
+  flex: 1;
+  min-width: 0;
 }
-/* 2026-10-21：卡头「甲方：客户 / 乙方：主体全称」文本式（甲方值加粗，标签次要色） */
+/* TASK-FE-DETAIL-REV2：卡头「甲方：客户 / 乙方：主体全称」各占一行——
+   label 12px 深灰加粗（与下方栅格 label 风格统一），值 14px 主色普通字重 */
 .contract-party {
-  font-size: 13px;
+  font-size: 14px;
   color: var(--text-primary);
   white-space: nowrap;
   max-width: 100%;
@@ -849,13 +861,9 @@ async function submitDateDialog() {
   text-overflow: ellipsis;
 }
 .cp-label {
-  color: var(--text-secondary);
-}
-/* 甲乙方之间的「；」分隔（用伪元素，不额外增加 DOM 文案） */
-.contract-party + .contract-party::before {
-  content: '；';
-  color: var(--text-secondary);
-  margin-right: 2px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-body);
 }
 .op-actions {
   display: flex;
@@ -868,19 +876,58 @@ async function submitDateDialog() {
 .contract-ended {
   font-size: 13px;
 }
-.contract-info {
-  display: flex;
+/* TASK-FE-DETAIL-REV：卡头最右唯一状态胶囊——带背景色块，按状态映射 3 个修饰类分色
+   （终态红 / 已完成绿 / 进行中·交付中·待审核蓝） */
+.status-pill {
+  flex-shrink: 0;
+  display: inline-flex;
   align-items: center;
-  gap: 24px;
-  flex-wrap: wrap;
-  margin-bottom: 10px;
+  border-radius: 999px;
+  padding: 2px 12px;
   font-size: 13px;
+  line-height: 20px;
+  white-space: nowrap;
+}
+.status-pill.sp-ended {
+  background: #fdecee;
+  color: #c0392b;
+}
+.status-pill.sp-done {
+  background: #eaf8f1;
+  color: #0c7b51;
+}
+.status-pill.sp-active {
+  background: #eef0ff;
+  color: #4e63a8;
+}
+/* TASK-FE-DETAIL-REV：合同卡信息区改两列竖向栅格（label 12px 在上，值 14px 在下） */
+.contract-info {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 24px;
+  margin-bottom: 10px;
+  font-size: 14px;
   color: var(--text-body);
 }
 .ci-item {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.ci-item .muted {
+  font-size: 12px;
+}
+/* TASK-FE-DETAIL-REV2：栅格 label 加深（#71829A → var(--text-body)）+ 加粗，
+   值保持普通字重（空值占位「未签订/未录入」仍走 muted 不加粗） */
+.ci-item .ci-label {
+  color: var(--text-body);
+  font-weight: 600;
+}
+@media (max-width: 720px) {
+  .contract-info {
+    grid-template-columns: 1fr;
+  }
 }
 .ci-amount {
   color: var(--primary-color);

@@ -4,7 +4,7 @@
     <div class="top-header">
       <div class="header-left">
         <span class="header-logo">
-          <el-icon :size="24"><Coin /></el-icon>
+          <img src="/brand/logo-icon.png" alt="蜂云时代" style="height: 26px; display: block;" />
         </span>
         <span class="header-title">蜂云产品及服务平台</span>
         <el-button
@@ -134,7 +134,6 @@ import {
   TrendCharts,
   Setting,
   OfficeBuilding,
-  Coin,
   CircleCheckFilled,
   Fold,
   Expand,
