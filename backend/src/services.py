@@ -3867,10 +3867,12 @@ def checkout(db: Session, data: schemas.CheckoutInput, user_id: str = DEFAULT_US
     不自动交付。customer 取分组键客户（同客户多产品=同项目多条记录）。
     ADR-012 修订（2026-10-19）：**所有角色**结算 → 项目/记录建 pending（待审核，锁定照常），
     商务接手后经审核（改价确认/驳回）生效。
-    ADR-022（REQUIRED-20261024）：逐行必填校验——客户非空 / 销售金额 > 0 整数元（所有行类型）/
-    普通产品行服务期限起止均必填且 start ≤ end；缺项 400 一次报全（文案含行标识：产品名/遥感明细名）。
+    ADR-022（REQUIRED-20261024）：逐行必填校验——客户非空 / 销售金额 > 0 整数元（所有行类型）；
+    缺项 400 一次报全（文案含行标识：产品名/遥感明细名）。
     取代 ADR-018 §3「留空=挂牌价成交」兜底（viewer 免填金额口径同步作废）；
     遥感明细行（itemId 非空）服务期限仍豁免（ADR-020：期数即服务时间）。
+    ADR-047（OPTIONAL-SERVICEPERIOD-20261026）：普通产品行服务期限改为**选填**
+    ——两端都空放行，只填一端仍按缺项 400（成对校验），两端都填时校验 start ≤ end。
     ADR-037 §3（FORMS-20261022）：区间校验分角色——viewer（`viewer=True`）行金额
     只校验参考区间下限（上限放开，加价成交允许）；editor/admin 双向不变。
     NO-DISCOUNT-20261022 / ADR-039：折扣率已下线——购物车行的历史 `discountRate`
@@ -3897,7 +3899,8 @@ def checkout(db: Session, data: schemas.CheckoutInput, user_id: str = DEFAULT_US
     # - 客户非空（现状保留）；
     # - 销售金额 > 0 整数元（**所有行类型**：unit/amount/遥感明细行）——
     #   取代 ADR-018 §3「留空=原价成交」兜底（amount 为空回退 salePrice×qty 的分支已删除）；
-    # - 普通产品行：serviceStart 与 serviceEnd 均必填，且 start ≤ end（格式校验现状保留）；
+    # - 普通产品行：serviceStart/serviceEnd **选填**（ADR-047）——两端都空放行，
+    #   只填一端按成对缺失计入缺项，两端都填时校验格式与 start ≤ end（ADR-020 口径保留）；
     # - 遥感明细行（itemId 非空）服务期限豁免（ADR-020）。
     missing: list[str] = []
     for c in cart:
@@ -3917,12 +3920,16 @@ def checkout(db: Session, data: schemas.CheckoutInput, user_id: str = DEFAULT_US
         if amt is None or amt <= 0 or amt != amt.to_integral_value():
             missing.append(f"{label}：销售金额（整数元，大于 0）")
         if c.itemId is None:
-            # 普通产品行：服务期限起止均必填（遥感明细行豁免）；
-            # 均已填时按 ADR-020 口径校验格式与 start ≤ end
-            if not (c.serviceStart or "").strip() or not (c.serviceEnd or "").strip():
-                missing.append(f"{label}：服务期限（开始/结束日期均必填）")
-            else:
-                _validate_service_period(c.serviceStart, c.serviceEnd)
+            # 普通产品行：服务期限**选填**（ADR-047，取代 ADR-022 §1 的「起止均必填」）；
+            # 口径：两端都空 = 合法（不填期限）；只填一端 = 成对缺失，仍计入缺项；
+            # 两端都填时按 ADR-020 校验格式与 start ≤ end
+            s_raw = (c.serviceStart or "").strip()
+            e_raw = (c.serviceEnd or "").strip()
+            if s_raw or e_raw:
+                if not s_raw or not e_raw:
+                    missing.append(f"{label}：服务期限（开始/结束日期需成对填写，或都留空）")
+                else:
+                    _validate_service_period(c.serviceStart, c.serviceEnd)
     if missing:
         raise HTTPException(400, "购物车存在必填缺项，请补齐后再结算：" + "；".join(missing))
     # 按 (产品, 客户) 分组（保持购物车行序）；七元组

@@ -2204,3 +2204,30 @@
 | 2026-10-23 | 修改 | 项目详情页合同卡：字段改两列竖向栅格、状态收敛为最右侧带背景色块胶囊 | src/views/sales/projects/detail.vue | TASK-FE-DETAIL-REV | |
 | 2026-10-23 | 修改 | 项目详情合同卡：甲乙方分两行；字段 label 加深(#425774)+加粗，值保持普通字重 | src/views/sales/projects/detail.vue | TASK-FE-DETAIL-REV2 | |
 | 2026-10-23 | 修改 | 登录页文案更新（产品服务一体化；能力卡改产品商城/订单管理/交付协同） | src/views/login/index.vue | TASK-FE-LOGIN-TEXT | |
+
+## 2026-10-26 ｜ 修改：购物车服务期限改选填（ADR-047）
+
+**关联任务**：OPTIONAL-SERVICEPERIOD-20261026（决策 ADR-047，部分取代 ADR-022 §1 第三条）。业务口径：服务期限两日期**都留空 → 合法**；**只填一端或开始晚于结束 → 仍拦截并标红**。
+
+| 日期 | 类型 | 变更内容 | 影响文件 | 关联任务 | 备注 |
+|------|------|----------|----------|----------|------|
+| 2026-10-26 | 修改 | `serviceMissing()` 改三态判定：两端都空 → `false`（不标红，原 ADR-022「任一为空即标红」作废）；只填一端 → `true`；两端都填但 start > end → `true`；函数去掉 `which` 参数（模板两处调用同步简化） | views/cart/index.vue | ADR-047 | 遥感明细行仍豁免（模板不渲染日期输入） |
+| 2026-10-26 | 修改 | `openOrder()` 结算前置校验：`missingService` 改用 `serviceMissing(r)`（原内联「任一为空即缺项」）；缺项提示文案改「服务期限（开始/结束日期需成对填写，或都留空）」 | views/cart/index.vue | ADR-047 | 客户 / 销售金额校验逻辑与文案**未动** |
+| 2026-10-26 | 修改 | 服务期限列头去必填红星（`<i class="req-star">*</i>` 删除），tooltip 改「选填（开始/结束日期需成对填写；遥感明细行按期数售卖，不填期限）」；两个 `el-date-picker` placeholder 改「开始日期（选填）」「结束日期（选填）」 | views/cart/index.vue | ADR-047 | `.req-star` 样式**保留**（客户/金额两列仍在使用） |
+| 2026-10-26 | 修改 | 顶部规则提示条文案：服务期限由「必填…」改为「为选填（填则开始/结束日期须成对且开始不晚于结束；遥感明细行按期数售卖，不填期限）」 | views/cart/index.vue | ADR-047 | 金额区间 / 分组口径表述未变 |
+
+> 验证：`read_lints` 对 `views/cart/index.vue` 无新增诊断。后端口径实测见 `docs/backend/changelog.md` 同日条目（副本库 8001 实例四例全通过）。未构建、未部署、未 commit。
+
+## 2026-10-27 ｜ 修改：购物车数量支持直接键入（DIRECT-QTY-INPUT）
+
+**关联任务**：DIRECT-QTY-INPUT。用户反馈「购物车下单不能输入数量，只能 − + 调整」——原数量列是自定义步进器，中区为只读 `span`（2026-10-22 视觉优化时由 `el-input-number` 换成自定义 stepper 的副作用）。本次补回键入能力，保留步进器外观与全部既有校验。
+
+| 日期 | 类型 | 变更内容 | 影响文件 | 关联任务 | 备注 |
+|------|------|----------|----------|----------|------|
+| 2026-10-27 | 新增 | 数量列中区 `span.step-value` → 原生 `input.step-input`（`type="text"` + `inputmode="numeric"` + `autocomplete="off"`）：支持直接键入、回车/失焦提交；**遥感明细行仍为只读 `span`**（ADR-011 数量恒 1） | views/cart/index.vue | DIRECT-QTY-INPUT | 不用 `el-input-number`：保持 2026-10-22 定稿的 28px 双按钮 + 无 spinner 视觉 |
+| 2026-10-27 | 新增 | 本地草稿 `qtyDrafts`（与 `amountDrafts` 同模式，按行 id 存）+ `qtyText()` / `onQtyInput()` / `onQtyCommit()`：敲字只写草稿不碰共享镜像；`onQtyInput` 只保留数字（去负号/小数点/字母）且限 6 位 | views/cart/index.vue | DIRECT-QTY-INPUT | 与金额输入同一「敲字不写镜像、失焦才提交」性能口径（CART-PERF-20261021） |
+| 2026-10-27 | 重构 | `stepQty()` 的落库逻辑抽为 `applyQty(row, next, clampMax)`，± 按钮与手工输入共用同一条 PUT 链路（含 `qtyBusy` 行级互斥、上限拦截、400 回滚、`prevAmount` 被清空时的「请重新填写销售金额」提示）；`stepQty` 退化为 `applyQty(row, qty ± 1)` | views/cart/index.vue | DIRECT-QTY-INPUT | 业务校验零变更：min=1（减到 1 按钮禁用）、max=可用上限（+ 到上限按钮禁用）、遥感行 400/双保险不变 |
+| 2026-10-27 | 修改 | 手工输入超上限 → **截断到上限并提示**「可用数量仅 N{unit}，已按上限填写」（`clampMax=true`）；空 / 0 / 非整数 / 未变更 → 静默回退显示镜像值（不弹提示，避免误触打扰）；提交后被截断或 400 回退时回写 DOM 为最新镜像值 | views/cart/index.vue | DIRECT-QTY-INPUT | `±` 按钮路径仍为 `clampMax=false`（点不上去，双保险） |
+| 2026-10-27 | 修改 | 样式：新增 `.step-input`（去边框/透明底/等宽数字，聚焦浅蓝底 `--primary-light` + 主蓝字，禁用态灰字灰底）；`.cart-stepper` 宽度 96 → **104px**（中区 48px），保证 6 位数字完整显示；`.step-value` 补 `line-height: 30px` 对齐 | views/cart/index.vue | DIRECT-QTY-INPUT | 数量列宽 120px 未改，步进器仍居中；未引入新色值 |
+
+> 验证：`npx vue-tsc --noEmit` 通过（EXIT=0），`read_lints` 对 `views/cart/index.vue` 无新增诊断。未构建、未部署、未 commit（Vite HMR 已自动生效）。

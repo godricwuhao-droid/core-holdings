@@ -97,7 +97,7 @@ const totalQty = computed(() => db.cart.reduce((s, c) => s + c.qty, 0))
 const totalAmount = computed(() => cartRows.value.reduce((s, r) => s + r.subtotal, 0))
 
 // ==================== 行级客户（ADR-007/ADR-016：结算时按（产品, 客户）双键分组拆合同） ====================
-// 2026-10-24（ADR-022）：客户/金额/服务期限统一「必填」口径——缺项标红改为值驱动
+// 2026-10-24（ADR-022）：客户/金额必填口径——缺项标红改为值驱动；2026-10-26（ADR-047）服务期限改选填
 //（字段为空即标红，与列头红星同口径），不再维护 error id 集合（原 customerErrors/amountErrors 删除）
 
 /** CART-PERF2-20261021（2026-10-21）：客户输入本地草稿（与 amountDrafts 同模式，按行 id 存）——
@@ -164,13 +164,17 @@ function amountInvalid(row: CartRow): boolean {
   return n === undefined || !Number.isInteger(n) || n <= 0
 }
 
-/** 2026-10-24（ADR-022）：服务期限缺项（对应日期为空，或 start > end）→ 标红；
+/** 2026-10-26（ADR-047，OPTIONAL-SERVICEPERIOD-20261026）：服务期限改为**选填**，标红口径同步：
+ *  - 两端都空 → 合法，不标红（原 ADR-022「任一为空即标红」口径作废）；
+ *  - 只填一端 → 成对缺失，两端都标红；
+ *  - 两端都填但 start > end → 两端都标红。
  *  遥感明细行豁免（ADR-020，模板本就不渲染日期输入） */
-function serviceMissing(row: CartRow, which: 'start' | 'end'): boolean {
-  const s = row.cart.serviceStart
-  const e = row.cart.serviceEnd
-  const orderBad = !!s && !!e && s > e
-  return which === 'start' ? !s || orderBad : !e || orderBad
+function serviceMissing(row: CartRow): boolean {
+  const s = row.cart.serviceStart || ''
+  const e = row.cart.serviceEnd || ''
+  if (!s && !e) return false // 选填：都不填 → 放行
+  if (!s || !e) return true // 成对校验：只填一端 → 缺项
+  return s > e // 顺序校验：开始晚于结束 → 非法
 }
 
 // 2026-10-25：金额输入框 tooltip 文案 amountTip() 随输入框 hover 提示删除（用户反馈「太碍事」）——
@@ -352,23 +356,71 @@ async function onQtyChange(row: CartRow): Promise<boolean> {
   }
 }
 
-/** 步进器行级 in-flight 互斥（FIX-20261022 / BUG-25）：同行请求在飞期间禁用 ± 按钮，
+/** 步进器行级 in-flight 互斥（FIX-20261022 / BUG-25）：同行请求在飞期间禁用 ± 按钮/输入框，
  *  避免连点产生并发 PUT、响应乱序把镜像写回旧数量/旧金额 */
 const qtyBusy = reactive<Record<number, boolean>>({})
 
-/** 步进器 ±1（2026-10-22 视觉优化：替代 el-input-number）：
- *  改数量后复用现有 onQtyChange 的 PUT 提交链路（含上限拦截 / 400 回滚），业务逻辑零变更 */
-async function stepQty(row: CartRow, delta: number) {
+/** 数量输入本地草稿（2026-10-27 DIRECT-QTY-INPUT）：数量改为可直接键入——
+ *  敲字只写草稿、不碰共享镜像，失焦/回车才提交（与 amountDrafts 同模式，按行 id 存） */
+const qtyDrafts = reactive<Record<number, string>>({})
+
+/** 输入框显示值：草稿优先，未编辑时回落到镜像值 */
+function qtyText(row: CartRow): string {
+  return qtyDrafts[row.cart.id] ?? String(row.cart.qty)
+}
+
+/** 键入过滤：只留数字（去掉负号/小数点/字母），最多 6 位（数量级远小于此） */
+function onQtyInput(row: CartRow, e: Event) {
+  const el = e.target as HTMLInputElement
+  const filtered = el.value.replace(/\D/g, '').slice(0, 6)
+  if (el.value !== filtered) el.value = filtered // 非法字符立即清掉，光标位置由浏览器保持
+  qtyDrafts[row.cart.id] = filtered
+}
+
+/** 数量提交（失焦 / 回车）：空、0、非整数 → 静默回退显示镜像值；未变更 → 直接收起草稿；
+ *  变更 → 走 applyQty 的 PUT 提交链路（上限截断 / 400 回滚 / 金额被清空提示与 ± 同口径） */
+async function onQtyCommit(row: CartRow, e?: Event) {
+  const el = e?.target as HTMLInputElement | undefined
+  const raw = qtyDrafts[row.cart.id]
+  if (raw === undefined) return // change 与 blur 双触发：第二次已无草稿
+  delete qtyDrafts[row.cart.id]
+  if (row.rsItem || qtyBusy[row.cart.id]) {
+    if (el) el.value = String(row.cart.qty)
+    return
+  }
+  const n = Number(raw)
+  if (!raw.trim() || !Number.isInteger(n) || n < 1) {
+    if (el) el.value = String(row.cart.qty) // 非法输入静默回退，不弹提示（避免误触打扰）
+    return
+  }
+  if (n === row.cart.qty) {
+    if (el) el.value = String(n)
+    return
+  }
+  await applyQty(row, n, true)
+  // 提交后回写 DOM：可能被上限截断、400 回退或被 refresh 替换镜像（用最新镜像值兜底）
+  const fresh = db.cart.find((c) => c.id === row.cart.id)
+  if (el) el.value = String(fresh ? fresh.qty : row.cart.qty)
+}
+
+/** 数量落库（± 按钮与手工输入共用）：
+ *  clampMax=true → 超可用上限时截断到上限并提示（手工输入 999 比「静默不生效」更易理解）；
+ *  false → 直接忽略（± 按钮本就在上限处禁用，双保险） */
+async function applyQty(row: CartRow, next: number, clampMax = false) {
   if (row.rsItem) return // ADR-011：遥感明细行数量恒 1
   if (qtyBusy[row.cart.id]) return // 本行上一次请求未回：忽略连点（按钮同时置灰）
-  const next = row.cart.qty + delta
   if (next < 1) return
+  let target = next
   const max = qtyMax(row)
-  if (max != null && next > max) return // 已达可用上限，+ 号本就禁用（双保险）
+  if (max != null && target > max) {
+    if (!clampMax) return
+    target = max
+    ElMessage.warning(`「${row.asset.name}」可用数量仅 ${max}${row.asset.unit}，已按上限填写`)
+  }
   const prevAmount = row.cart.amount
   qtyBusy[row.cart.id] = true
   try {
-    row.cart.qty = next
+    row.cart.qty = target
     const ok = await onQtyChange(row)
     if (!ok) return
     // FIX-20261022 / BUG-27：后端改数量时会静默清空已填金额（旧总额对新数量已失真）。
@@ -383,6 +435,12 @@ async function stepQty(row: CartRow, delta: number) {
   } finally {
     delete qtyBusy[row.cart.id] // 只清自己的行锁（行 id 唯一，天然不误清新行）
   }
+}
+
+/** 步进器 ±1（2026-10-22 视觉优化：替代 el-input-number）：
+ *  改数量后复用 applyQty 的 PUT 提交链路（含上限拦截 / 400 回滚），业务逻辑零变更 */
+async function stepQty(row: CartRow, delta: number) {
+  await applyQty(row, row.cart.qty + delta)
 }
 
 async function removeRow(row: CartRow) {
@@ -433,9 +491,10 @@ const orderItems = computed<OrderItem[]>(() =>
   })),
 )
 
-/** 结算前置校验（2026-10-24 ADR-022：三必填项逐行校验，与后端 checkout 400 同口径）：
- *  客户非空 / 金额整数元 > 0（所有行类型，含遥感行）/ 普通行服务期限两日期齐全且 start ≤ end
- *  （遥感明细行期限豁免，ADR-020）；有缺项不弹结算窗——提示点明缺项类别，
+/** 结算前置校验（2026-10-24 ADR-022 / 2026-10-26 ADR-047，与后端 checkout 400 同口径）：
+ *  客户非空 / 金额整数元 > 0（所有行类型，含遥感行）为必填；普通行服务期限为**选填**
+ *  ——两端都空放行，只填一端或 start > end 才拦（成对校验）；遥感明细行期限豁免（ADR-020）。
+ *  有缺项不弹结算窗——提示点明缺项类别，
  *  缺项输入框本身已值驱动标红（amountInvalid / serviceMissing / 客户空值），用户可直接定位
  *  CART-PERF-20261021（2026-10-21）：金额校验读「草稿或已提交值」合并口径（amountInvalid → amountValue）——
  *  点结算按钮本身会先触发金额输入框 blur（change 先于 click，onAmountChange 同步段已把合法草稿写入镜像），
@@ -447,15 +506,13 @@ function openOrder() {
   if (!db.cart.length) return
   const missingCustomer = cartRows.value.filter((r) => customerValue(r) === '')
   const missingAmount = cartRows.value.filter((r) => amountInvalid(r))
-  const missingService = cartRows.value.filter(
-    (r) => !r.rsItem && (!r.cart.serviceStart || !r.cart.serviceEnd || r.cart.serviceStart > r.cart.serviceEnd),
-  )
+  const missingService = cartRows.value.filter((r) => !r.rsItem && serviceMissing(r))
   const missingCount = missingCustomer.length + missingAmount.length + missingService.length
   if (missingCount) {
     const parts: string[] = []
     if (missingCustomer.length) parts.push('客户')
     if (missingAmount.length) parts.push('销售金额（整数元）')
-    if (missingService.length) parts.push('服务期限（遥感明细行豁免）')
+    if (missingService.length) parts.push('服务期限（开始/结束日期需成对填写，或都留空）')
     ElMessage.warning(`${missingCount} 行信息未填齐：请填写${parts.join('、')}`)
     return
   }
@@ -536,10 +593,9 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
         <el-icon aria-hidden="true"><InfoFilled /></el-icon>
         <div>
           <b>下单前请完善关键信息</b>
-          <!-- 2026-10-24（ADR-022）：必填口径——客户/销售金额/服务期限三必填（遥感明细行期限豁免），
-               原「生态可留空回退 / 其余选填」表述废弃 -->
+          <!-- 2026-10-24（ADR-022）：必填口径——客户/销售金额必填；2026-10-26（ADR-047）服务期限改选填 -->
           <!-- ADR-037（FORMS-20261022）：区间校验分角色——viewer 仅下限（上限放开，加价成交允许），editor/admin 双向 -->
-          <span>每件产品必填客户、销售金额（整数元 &gt; 0）与服务期限（开始/结束日期，遥感明细行豁免期限）；设参考区间时金额须{{ isViewer ? '不低于区间下限（上限不限）' : '落在区间内' }}；数量受产品可用数量约束（可重复售卖不受限）。下单后按「产品 + 客户」分组各生成一条销售记录，销售项目进入「待审核」并锁定数量，商务确认（可改价）后生效，再执行「交付」生成交付记录。</span>
+          <span>每件产品必填客户、销售金额（整数元 &gt; 0），服务期限为选填（填则开始/结束日期须成对且开始不晚于结束；遥感明细行按期数售卖，不填期限）；设参考区间时金额须{{ isViewer ? '不低于区间下限（上限不限）' : '落在区间内' }}；数量受产品可用数量约束（可重复售卖不受限）。下单后按「产品 + 客户」分组各生成一条销售记录，销售项目进入「待审核」并锁定数量，商务确认（可改价）后生效，再执行「交付」生成交付记录。</span>
         </div>
       </div>
 
@@ -666,7 +722,24 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
                     >
                       −
                     </button>
-                    <span class="step-value">{{ row.cart.qty }}</span>
+                    <!-- 2026-10-27（DIRECT-QTY-INPUT）：数量支持直接键入（原为只读 span，只能点 ±）——
+                         原生 input + 本地草稿：敲字不写镜像，失焦/回车提交，非法值静默回退、超上限截断提示；
+                         遥感明细行数量恒 1，保留只读展示 -->
+                    <input
+                      v-if="!row.rsItem"
+                      class="step-input"
+                      type="text"
+                      inputmode="numeric"
+                      autocomplete="off"
+                      :value="qtyText(row)"
+                      :disabled="!!qtyBusy[row.cart.id]"
+                      :aria-label="`${row.asset.name}数量，可直接输入`"
+                      @input="onQtyInput(row, $event)"
+                      @change="onQtyCommit(row, $event)"
+                      @keyup.enter="onQtyCommit(row, $event)"
+                      @blur="onQtyCommit(row, $event)"
+                    />
+                    <span v-else class="step-value">{{ row.cart.qty }}</span>
                     <button
                       type="button"
                       class="step-btn"
@@ -737,16 +810,16 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
                两个日期输入各设明确宽度 136px（可完整显示 YYYY-MM-DD + 日历图标），中间留 8px 间距 -->
           <!-- FT-20261022-F：表头显式居中（自定义 #header 内为 el-tooltip 包裹的内联 span，text-align 即可居中） -->
           <el-table-column label="服务期限" width="300" align="center" header-align="center">
-            <!-- 2026-10-24（ADR-022）：列头必填红星 + tooltip 说明遥感明细行豁免 -->
+            <!-- 2026-10-26（ADR-047）：列头去必填红星（选填），tooltip 说明成对填写口径 + 遥感明细行豁免 -->
             <template #header>
-              <el-tooltip content="必填（遥感明细行按期数售卖，豁免期限）" placement="top">
-                <span>服务期限<i class="req-star">*</i></span>
+              <el-tooltip content="选填（开始/结束日期需成对填写；遥感明细行按期数售卖，不填期限）" placement="top">
+                <span>服务期限</span>
               </el-tooltip>
             </template>
             <template #default="{ row }">
               <!-- 2026-10-23 修复①：统一单元格结构——双日期（136px 不变）进主内容区，本列无副提示（空占位）
                    2026-10-24（ADR-022）：placeholder 改「开始日期/结束日期」（修正语义）；
-                   任一日期为空（或 start > end）对应输入框标红（与输入框标红同色系）；遥感行仍豁免 -->
+                   2026-10-26（ADR-047）：服务期限改选填——两端都空不标红，只填一端或 start > end 才标红；遥感行仍豁免 -->
               <div class="cart-cell">
                 <div class="cell-main cell-main-center">
                   <template v-if="!row.rsItem">
@@ -758,9 +831,9 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
                         type="date"
                         value-format="YYYY-MM-DD"
                         size="small"
-                        placeholder="开始日期"
+                        placeholder="开始日期（选填）"
                         style="width: 136px;"
-                        :class="{ 'cart-service-error': serviceMissing(row, 'start') }"
+                        :class="{ 'cart-service-error': serviceMissing(row) }"
                         @change="onServiceChange(row)"
                       />
                       <el-date-picker
@@ -768,9 +841,9 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
                         type="date"
                         value-format="YYYY-MM-DD"
                         size="small"
-                        placeholder="结束日期"
+                        placeholder="结束日期（选填）"
                         style="width: 136px;"
-                        :class="{ 'cart-service-error': serviceMissing(row, 'end') }"
+                        :class="{ 'cart-service-error': serviceMissing(row) }"
                         @change="onServiceChange(row)"
                       />
                     </div>
@@ -828,7 +901,7 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
             <small>应付合计</small>{{ formatMoney(totalAmount) }}
           </div>
         </div>
-        <!-- 结算下单对三角色均可用（含生态人员）；前置校验（2026-10-24 ADR-022：客户/金额/服务期限三必填）仍走 openOrder
+        <!-- 结算下单对三角色均可用（含生态人员）；前置校验（2026-10-24 ADR-022 / 2026-10-26 ADR-047：客户/金额必填，服务期限选填）仍走 openOrder
              FIX-20261022 / BUG-10：请求期间 loading + 禁用（防重复提交，配合结算弹窗的 requestId 幂等） -->
         <el-button
           class="co-btn"
@@ -1045,11 +1118,13 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
   font-weight: 600;
 }
 
-/* 数量步进器 [−] 数值 [+]：圆角 8px 边框容器、按钮 28px 灰底、数值居中只读 */
+/* 数量步进器 [−] 数值 [+]：圆角 8px 边框容器、按钮 28px 灰底、数值居中可键入
+   2026-10-27（DIRECT-QTY-INPUT）：中区改 input 后由 96px 加宽到 104px（中区 48px），
+   保证 6 位数字（如 472）完整显示不被裁切；数量列宽 120px 内仍居中 */
 .cart-stepper {
   display: inline-flex;
   align-items: center;
-  width: 96px;
+  width: 104px;
   border: 1px solid var(--input-border);
   border-radius: 8px;
   overflow: hidden;
@@ -1087,6 +1162,36 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
   font-variant-numeric: tabular-nums;
   border-left: 1px solid var(--divider-color);
   border-right: 1px solid var(--divider-color);
+  line-height: 30px;
+}
+/* 2026-10-27（DIRECT-QTY-INPUT）：中间数值区改可键入 input——外观与只读态完全一致
+   （无边框/透明底/等宽数字），聚焦时浅蓝底提示「可编辑」，禁用态（请求在飞）灰字 */
+.step-input {
+  flex: 1;
+  min-width: 0;
+  width: 40px;
+  height: 30px;
+  border: 0;
+  padding: 0 2px;
+  background: transparent;
+  text-align: center;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+  border-left: 1px solid var(--divider-color);
+  border-right: 1px solid var(--divider-color);
+  outline: none;
+  transition: background-color 0.15s;
+}
+.step-input:focus {
+  background: var(--primary-light);
+  color: var(--primary-color);
+}
+.step-input:disabled {
+  color: #c3cddb;
+  background: #f7f9fc;
+  cursor: not-allowed;
 }
 /* 2026-10-23 修复③：× 图标不明显，改回文字按钮「删除」；
    2026-10-24（ADR-022 批次）：默认即系统警示红 + 浅红底（danger-light-9，沿用系统色板），
@@ -1231,9 +1336,11 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
   align-items: center;
   gap: 8px;
 }
-/* 必填缺项标红（2026-10-24 ADR-022：客户/金额/服务期限统一同一「必填缺项」样式——
-   EP 2.14 独立 el-input / el-date-picker 无 validate 态，按 wrapper box-shadow 描边，警示红同色系；
-   原 .cart-amount-empty 置灰样式随「viewer 免填」口径一并废弃） */
+/* 缺项标红（2026-10-24 ADR-022：客户/金额/服务期限统一同一「缺项」样式——
+  EP 2.14 独立 el-input / el-date-picker 无 validate 态，按 wrapper box-shadow 描边，警示红同色系；
+  原 .cart-amount-empty 置灰样式随「viewer 免填」口径一并废弃）
+  2026-10-26（ADR-047）：服务期限改选填后本样式仅用于「只填一端 / start > end」，
+  不再用于「空值即缺项」（客户 / 销售金额仍是空值即标红） */
 .cart-customer-error :deep(.el-input__wrapper),
 .cart-service-error :deep(.el-input__wrapper) {
   box-shadow: 0 0 0 1px var(--danger-color) inset;

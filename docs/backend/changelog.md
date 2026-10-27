@@ -1601,3 +1601,28 @@ repeatSale 明细短路，交付/终止都不再触碰它）。此时 `available
 | 2026-10-23 | 新增 | 新建 4 个商务人员（editor）账号：luojie/罗杰、ldanhong/刘丹红、xieyou/谢优、zjingren/周靖人 | users 表 + audit_logs（经 POST /api/users） | TASK-USER-FINANCE-01 | 初始密码 123456，需首次登录后修改 |
 
 > 纯数据操作（**未改任何业务代码**，服务未重启）：4 次 `POST /api/users` 均 200，返回 id=25/26/27/28、role=editor、enabled=true；`GET /api/users` 复核 4 条在列；`POST /api/auth/login`（luojie/123456）200 且 role=editor；`audit_logs` 新增 4 条 `actionType=user_mgmt / action=新增用户 / target=user`（`targetName` 分别 luojie、ldanhong、xieyou、zjingren，`detail=role=editor`，id 1232~1235）。
+
+## 2026-10-26 ｜ 修改：购物车服务期限由必填改选填（ADR-047）
+
+**关联任务**：OPTIONAL-SERVICEPERIOD-20261026（决策 ADR-047，部分取代 ADR-022 §1 第三条）。业务拍板：服务期限改为可选，只放开「两端都空」，半填仍拦截。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-26 | 修改 | ⚠️ `checkout` 服务期限由必填改**选填**：普通产品行 `serviceStart`/`serviceEnd` **两端都空 → 放行**（落库 `null`）；**只填一端 → 仍计入缺项**（400 文案改 `{行标识}：服务期限（开始/结束日期需成对填写，或都留空）`，原「（开始/结束日期均必填）」作废）；**两端都填 → 保持 ADR-020 校验**（`YYYY-MM-DD` + start ≤ end，非法仍 400 `服务开始日期不能晚于结束日期`）；客户 / 销售金额必填口径**不变**（ADR-022 §1 前两条继续有效）；遥感明细行（`itemId` 非空）豁免不变 | `backend/src/services.py`（`checkout` 必填校验分支 + docstring / 校验注释）、`backend/src/routers/api.py`（`POST /cart/checkout` docstring） | ADR-047 / OPTIONAL-SERVICEPERIOD-20261026 | **无 schema 变更**：`cart_items` 与 `project_items` 的 `serviceStart/serviceEnd` 本就 `nullable=True`，无迁移；`_validate_service_period()` 本来就支持 None/空串，**零改动**；行更新接口（`POST/PUT/PATCH /cart`）允许暂存行为不变；存量数据无需回填 |
+| 2026-10-26 | 修改 | 文档同步：新增 `docs/adr/ADR-047.md`；`ADR-022` 标注「部分被取代」；`architecture.md` ADR 表补 ADR-047、ADR-022 行注明服务期限一条已取代；`api-contracts.md` 新增 OPTIONAL-SERVICEPERIOD-20261026 批次；`api.md` 更新错误码表 3 处文案 + 2 处引用 | `docs/**` | ADR-047 | — |
+
+> 验证方式：把 `core_holdings.db` 复制到 `/tmp/ch_test.db`，以 `DATABASE_URL` 指向副本另起 **8001** 实例做真实 HTTP 实测（**不触碰 8000 运行中服务、不动生产库**，测完关闭实例并清理临时文件）：① 两端都不填 → **200 建单**，`project_items.serviceStart/serviceEnd` 均 `NULL`；② 只填开始 → **400** `…智元机器人-X2：服务期限（开始/结束日期需成对填写，或都留空）`；③ 只填结束 → **400** 同上（对称）；④ 两端都填且 start ≤ end → **200**，落库 `2026-11-01` / `2026-12-31`。另：`python3 -m compileall -q src main.py` 通过。未构建、未部署、未 commit。
+
+## 2026-10-27 ｜ 数据订正：销售单价与区间最低价统一上调 1%（PRICE-UP-20261027）
+
+**关联任务**：PRICE-UP-20261027。业务要求：除遥感数据销售明细价格（`rs_items.price`）外，其余产品的**销售单价**（`assets.salePrice`）与**参考区间最低价**（`assets.priceMin`）上调 1%。**纯数据订正，未改任何业务代码**（脚本 `backend/scripts/adjust_price_up_1pct.py`，dry-run + `--yes` 两段式）。
+
+| 日期 | 类型 | 变更内容 | 影响范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-27 | 修改 | **19 个产品** `salePrice` / `priceMin` × 1.01（round 2 位）：#1 3006700→3036767、#2 1305000→1318050、#3 7600000→7676000、#4 955000→964550、#5 3130000→3161300、#9 25000→25250、#15 35100→35451、#16 26800→27068、#21 102200→103222、#22/#23 5500000→5555000、#24 3160000→3191600、#25 5550000→5605500、#26 5000000→5050000、#27 7430925→7505234.25、#28 32560000→32885600、#30 24213.65→24455.79、#31 24243→24485.43、#32 6700000→6767000 | `assets`（salePrice / priceMin） | PRICE-UP-20261027 | 每个产品写 1 条 `logs`（`action='调整价格'`，共 19 条）；`priceMin` 与 `salePrice` 调后仍相等（ADR-036「min=单价」口径未破） |
+| 2026-10-27 | 不变 | **排除**：① Token 服务 #6/#7/#8（宏大卫星 26年10月发射 / 46号卫星 / 38号卫星，业务明确不调，仍为 `0.03333333`）；② 无实际价格产品 #18/#19/#20 算力服务器、#29 遥感数据容器（`salePrice=0` 且 `priceMin=NULL`）；③ **`rs_items.price` 60 条未动**（Σ=10,354,297 执行前后一致）；④ `project_items.origPrice/origAmount/price/amount`（历史快照，Σ 79,773,700 / 142,498,850 前后一致）、`contracts.contractAmount`（Σ 142,498,850 前后一致）；⑤ **`priceMax` 全部未动**（Σ 89,388,341.78 前后一致） | — | PRICE-UP-20261027 | 副作用：`priceMin` 上移而 `priceMax` 不变 → 可谈价区间由约 2% 收窄至约 1%（如 #1：3036767~3066834） |
+| 2026-10-27 | 修改 | 购物车在途行同步：`cart_items#7`（产品 #1 智元机器人-G1，客户 `QA034-UI客户`）`amount` 3006700 → **3036767**，避免结算时低于新区间下限被 400 拦截 | `cart_items` | PRICE-UP-20261027 | 其余 5 行 `amount` 为空，不受影响；购物车行的 `serviceStart/serviceEnd` 未动 |
+
+> 安全措施：执行前用 **SQLite 在线备份 API** 备份到 `backend/core_holdings.db.bak.20261027-094358-price-up-1pct`（服务在线运行，未用 `cp`）；单事务 UPDATE + 事务内回读校验（19 行逐行比对预览值），异常即回滚；`priceMin > priceMax` 前置拦截（本次无命中）。
+> 校验结果：`min <= max` 全部合法（无违规行）；`priceMin == salePrice` 全部成立；`logs` 719 → 738（+19），样例 `智元机器人-G1 / 调整价格 / 销售单价 3006700.0 → 3036767.00；区间最低价 3006700.0 → 3036767.00（统一上调 1%）`。
+> 前端需知：产品列表/表单/购物车读 bootstrap 实时值，**刷新页面即生效**；无需重启服务（未改代码、未构建、未 commit）。回滚方式：用上述备份文件覆盖 `core_holdings.db`。

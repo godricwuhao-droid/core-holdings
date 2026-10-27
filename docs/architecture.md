@@ -101,7 +101,7 @@
 | ADR-019 | Accepted | 关键时间节点与状态机：合同 signedDate（录即 active→delivering，不可清空）/scheduledDeliveryDate（仅 admin）；交付前置签订时间；撤销交付回 delivering；项目派生新增「交付中」 |
 | ADR-020 | Accepted | 销售明细服务期限（购物车填写、审核可改、遥感行不填）+ 下单入口统一收口购物车（移除「登记销售」，sales/order 端点保留标废弃） |
 | ADR-021 | Accepted | 遥感售卖明细（rs_items）参考价区间（取代 ADR-018 §5「遥感行不限制」口径）：区间挂明细级，遥感行折扣校验取该明细自身区间 |
-| ADR-022 | Accepted | 购物车结算必填校验（客户/金额/服务期限，遥感行豁免服务期限，缺项 400 一次报全） |
+| ADR-022 | Accepted（服务期限一条被 ADR-047 取代） | 购物车结算必填校验（客户/金额/服务期限，遥感行豁免服务期限，缺项 400 一次报全）；服务期限已由 ADR-047 改为选填，客户/金额必填不变 |
 | ADR-023 | Accepted | 购物车折扣率选填快捷入口（discountRate，金额仍权威必填，手改金额清 rate） |
 | ADR-024 | Accepted | 交付物模板彻底下线 + 存量实例清空 + 交付物单文件附件（file 列）+ 抽屉/详情两处预览 + 抽屉删「最近动态」 |
 | ADR-025 | Accepted | 卫星 Token 单位「个」+ 单价展示百万Token 口径（amount 模式 salePrice×1e6 两位小数，交易链路零改动） |
@@ -120,6 +120,7 @@
 | ADR-038 | Accepted | 遥感可售明细级「可重复售卖」开关：默认 **false（单次售卖）** + 入参新增 `repeatSale` + 列表内联开关/弹窗可设 + `availableCount` 只扣 `repeatSale=false` 的占用明细 + 存量 60 条归一脚本（ADR-011 的"明细默认 true"被本 ADR 取代） |
 | ADR-039 | Accepted | 购物车折扣功能整体下线（Deprecates ADR-023）：前端折扣输入/摘要/预览全删，后端 `discountRate` 入参「容忍但忽略」、新单恒 `null`、列保留不清洗 |
 | ADR-040 | Accepted | 销售项目删除入口收敛：列表常驻「删除」→ 行尾「更多▾」仅 admin + `DELETE /projects/{id}` 权限 `require_editor` → `require_admin`（ADR-028 §3 护栏与回滚链零改动）；附带移除产品列表「编辑」按钮（入口 3→2） |
+| ADR-047 | Accepted | 购物车服务期限由必填改**选填**（部分取代 ADR-022 §1 第三条）：两端都空放行（落库 `NULL`）、只填一端仍 400（成对校验）、两端都填保持 ADR-020 校验；客户/金额必填不变；前端去列头红星并同步提示文案 |
 
 ## 8. 文档地图与变更流程
 

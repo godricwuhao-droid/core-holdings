@@ -170,6 +170,20 @@
 
 ---
 
+## OPTIONAL-SERVICEPERIOD-20261026 批次：服务期限改选填（ADR-047）
+
+> 部分取代 ADR-022 §1 第三条（服务期限必填）；客户 / 销售金额必填口径**不变**。无接口签名变更、无 DB 迁移（`cart_items` / `project_items` 的 `serviceStart/serviceEnd` 本就 `nullable=True`）。前后端同批上线。
+
+1. `POST /cart/checkout` 服务期限校验口径（三态）：
+   - **两端都空** → 合法，`serviceStart` / `serviceEnd` 落库为 `null`；
+   - **只填一端** → 仍 400，缺项文案 `{行标识}：服务期限（开始/结束日期需成对填写，或都留空）`（原 `（开始/结束日期均必填）` 文案作废）；
+   - **两端都填** → 保持 ADR-020 校验（`YYYY-MM-DD` + start ≤ end，非法时 400 `服务开始日期不能晚于结束日期`）。
+2. 遥感明细行（`itemId` 非空）继续豁免服务期限，行为不变。
+3. 行更新（`POST/PUT/PATCH /cart`）允许任意暂存状态，行为不变。
+4. 前端 `views/cart/index.vue`：`serviceMissing()` 改三态判定（都空 → 不标红；半填 / start>end → 两端标红）；`openOrder()` 前置校验复用同一函数；列头去必填红星、tooltip 改「选填（开始/结束日期需成对填写…）」；两个 date-picker placeholder 加「（选填）」；顶部提示条文案同步。
+
+---
+
 ## CART-PATCH-20261021 批次：购物车行更新改为 PATCH 语义（修复金额被误清空）
 
 > 背景（2026-10-21 用户反馈）：购物车先填「销售金额（元）」再选服务期限 → 金额被清空。根因：`PUT/PATCH /cart/{id}` 对未携带的 `amount` 执行清空，且 `discountRate` 每次无条件覆盖。

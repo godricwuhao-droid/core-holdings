@@ -686,8 +686,10 @@ def checkout(data: schemas.CheckoutInput, db: Session = Depends(get_db),
     """购物车结算：按产品分组 → 每个产品一条销售记录（ADR-013）。
     【核心业务规则 ADR-012 修订 2026-10-19】所有角色结算统一建 **pending（待审核）**
     （数量锁定照常）→ 商务接手审核（改价确认/驳回）后生效。
-    ADR-022（REQUIRED-20261024）：逐行必填校验（客户/销售金额>0整数元/普通行服务期限起止），
+    ADR-022（REQUIRED-20261024）：逐行必填校验（客户/销售金额>0整数元），
     缺项 400 一次报全（文案含行标识）；「留空=挂牌价」兜底与 viewer 金额免填口径已作废。
+    ADR-047（OPTIONAL-SERVICEPERIOD-20261026）：普通行服务期限改**选填**——两端都空放行、
+    只填一端仍 400（成对校验）、两端都填时校验 start ≤ end。
 
     BUG-10 / ADR-033 §1：可选 `requestId` 幂等——响应 = `ProjectOut` 全部字段 + `idempotent`
     （首次 false；同一 `(userId, requestId)` 24h 内重复请求返回首次项目、`idempotent: true`，
