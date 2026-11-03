@@ -27,11 +27,11 @@
 | 两阶段交付 | 下单 → 项目"进行中" + 锁定数量（lockedQty 只占可售不扣实物）；交付（合同置 delivered）→ 扣 shippedQty + 累加 soldAmount/soldCount + 自动生成交付单（CK-xxxx）；终止/删除 → 完整回滚 |
 | 数量口径 | 可售 = quantity − lockedQty − shippedQty（非 repeatSale）；状态两态：可售 / 已售罄 |
 | repeatSale | 只计次不扣量；开启后锁定自动清零 |
-| **金额口径** | **全程"元"**（库内/接口/展示，前端 ¥+千分位+两位小数）。禁止"万"字、禁止 ×10000 桥接。`amount = price × qty`（Decimal）后端权威重算；卫星 Token（amount 模式）单价展示走 `round(salePrice×1e6, 2)` 元/百万Token 口径（ADR-025，仅展示层） |
-| **包量定价（ADR-008）** | `Asset.pricingMode`：`'unit'`（默认）/ `'amount'`（卫星 Token 登记自动置）。amount 模式：销售明细**合同金额（整数元）为权威输入**（后端校验 int>0，否则 400），跳过 price×qty 重算，price 仅作派生展示（元/万Token 参考，2026-10-16 起不带"约"）；购物车 amount 模式行需填合同金额（`cart_items.amount`，经 `PUT /cart/{id}` **必须带 qty** 提交，缺 qty=0 会删行）；checkout 不再传 items，金额已在 cart_items 持久化 |
+| **金额口径** | **全程"元"**（库内/接口/展示，前端 ¥+千分位+**最少两位、最多 6 位小数**，尾随 0 截到两位，ADR-048）。禁止"万"字、禁止 ×10000 桥接。`amount = price × qty`（Decimal，量化 1e-6）后端权威重算；卫星 Token（amount 模式）单价展示走 `salePrice×1e6` 元/百万Token 口径（ADR-025，仅展示层） |
+| **包量定价（ADR-008）** | `Asset.pricingMode`：`'unit'`（默认）/ `'amount'`（卫星 Token 登记自动置）。amount 模式：销售明细**合同金额（元，最多 6 位小数，ADR-048）为权威输入**（后端校验 >0 且 ≤6 位小数，否则 400），跳过 price×qty 重算，price 仅作派生展示（元/万Token 参考，2026-10-16 起不带"约"）；购物车 amount 模式行需填合同金额（`cart_items.amount`，经 `PUT /cart/{id}` **必须带 qty** 提交，缺 qty=0 会删行）；checkout 不再传 items，金额已在 cart_items 持久化 |
 | 销售记录结构（ADR-007 → ADR-013 → ADR-016） | 项目内**每个产品（×客户）一条销售记录**（ADR-016：同产品多客户拆多条）（HT-xxxx，界面名「销售记录」；代码/表名/路由仍为 contracts），**允许多主体**（记录主体=各行主体全一致→该值，混合→空）；项目状态/金额由销售记录派生；状态变更走 `PATCH /contracts/{id}/status` |
 | 状态机 | 项目状态只走 PATCH 状态接口（待审核项目例外：只走 `POST /projects/{id}/review`，ADR-012）；生态人员购物车结算建「待审核」（锁定照常），商务确认（可终审改价，**不回写挂牌价**，ADR-018）或驳回；录签订时间进「交付中」（ADR-019）；已完成/已终止不可编辑。**状态变更唯一入口 = `_change_contract_status_core`**（交付前置条件在此守卫，合同级/项目级共用，ADR-032）；项目级批量「全量或全不」（任一合同不合规整体 400 并列出全部原因）；终止**按明细状态回滚**（shipped→撤销交付回退销量，locked→释放锁定，缺明细/产品→400 不静默）；派生 `{delivered,terminated}`→`delivered`（ADR-032） |
-| 一致性 | 写操作单事务；数量前置校验（同产品多行合计防超卖）；被引用产品禁删（**含 delivered 引用**，ADR-032）；**下单校验单一出口**（`_create_project_core` 权威链：明细存在性→归属/qty→折扣→服务期限→参考区间→按产品聚合数量；unit 行单价也过区间校验；`contractAmount` 传值必须 = Σ 明细，ADR-029）；**并发**：checkout 幂等键 `requestId`（24h）、状态变更/数量扣减条件更新、不变量破坏显式 500 + 审计（无静默夹断，ADR-033）；**区间校验分角色**：viewer 仅下限（上限放开）、editor/admin 双向（改价与结算单函数复用，ADR-037） |
+| 一致性 | 写操作单事务；数量前置校验（同产品多行合计防超卖）；被引用产品禁删（**含 delivered 引用**，ADR-032）；**下单校验单一出口**（`_create_project_core` 权威链：明细存在性→归属/qty→折扣→服务期限→参考区间→按产品聚合数量；unit 行单价也过区间校验；`contractAmount` 传值必须 = Σ 明细，ADR-029）；**并发**：checkout 幂等键 `requestId`（24h）、状态变更/数量扣减条件更新、不变量破坏显式 500 + 审计（无静默夹断，ADR-033）；**参考区间只约束下限**：购物车/结算（任何角色）金额可高于区间上限，仅拦低于下限；商务审核改价不受区间限制；仅商务手工建单仍双向校验（ADR-049，部分取代 ADR-037） |
 | **订单撤销（ADR-026）** | `POST /projects/{id}/withdraw`（require_order）：仅 `pending`；下单人本人或 admin（存量回退 rep）；原因必填 ≤200 字；单事务 = 合同 pending→terminated（释放真实锁定 + cancel_release 流水 + remark「撤销：原因」）+ 项目 terminated + 解绑负责人 + 明细回填下单人购物车（复用 `_cart_add_inner`，**同键替换不累加**——ADR-042 §1 起；此前为累加）+ OpLog/审计；回填失败行降级不中断（原价回填/跳过并回报） |
 | **交付物（ADR-024）** | 模板体系（`/settings/deliverables` 页 + `deliverable_templates` 表 + bootstrap 惰性生成）彻底下线；交付物实例仅详情页「交付物」页签手动增改；每项单个附件 `asset_deliverables.file`（upload 散列名；前端 accept 仅 pdf/docx/png/jpg/jpeg/gif/webp，禁 .doc）；抽屉与详情页两处点击预览（复用 FilePreview）；存量实例已一次性清空 |
 | **生态人员可见性（2026-10-16，编辑权 2026-10-21 收回）** | viewer 仅见**自己下单**的销售项目：`Project.creator`（登录 username，三建单入口自动写入）== 自己；存量 creator 为空回退 `rep in (自己姓名, username)`。`bootstrap` 过滤 projects/contracts，前端全视角（列表/详情/产品「销售关联」）天然过滤；**viewer 订单提交后不可编辑（ADR-028）** + 可终止 + 可撤销/重新提交，交付/新建空项目仍仅商务/管理员，**删除项目仅管理员（ADR-040）**，**「重新提交」仅下单人本人 + 管理员（商务 editor 403，ADR-043）** |
@@ -43,7 +43,7 @@
 
 **父产品 + 可售明细两层**：
 - 父产品（assets，type='遥感数据'）：容器，不可直接加购/下单；登记时表单隐藏"数量单价"卡（quantity=1/unit=份（可售明细）兜底），提示条在"产品类型"下方
-- 明细（`rs_items` 表）：省/市（可空）× 精度（米，0.5–2）× **月份（YYYY-MM）** 同父产品下唯一；每份一个单价（整数元/份）；`repeatSale` **默认 false（单次售卖，售出即占用）**，可按明细逐条开启（true = 只计次不扣量，ADR-038）；列表「可重复售卖」列为内联开关（行级互斥 + 失败回滚），新增/编辑弹窗同样可设
+- 明细（`rs_items` 表）：省/市（可空）× 精度（米，0.5–2）× **月份（YYYY-MM）** 同父产品下唯一；每份一个单价（元/份，最多 6 位小数，ADR-048）；`repeatSale` **默认 false（单次售卖，售出即占用）**，可按明细逐条开启（true = 只计次不扣量，ADR-038）；列表「可重复售卖」列为内联开关（行级互斥 + 失败回滚），新增/编辑弹窗同样可设
 - 接口：`POST /assets/{id}/rs-items`、`PUT/DELETE /rs-items/{id}`（require_editor；有 project_items/cart_items 引用的明细禁删 400）
 - 售卖：明细行购物车数量恒 1（qty≠1 → 400），判重键 (userId, assetId, itemId, customer)；金额 = 明细单价后端权威重算；`project_items.itemId` / `cart_items.itemId` 关联
 - **明细状态（ADR-038 修订 2 / RS-STATUS-20261022，业务方指定方案）**：`rs_items.status ∈ {in_stock(可售), all_sold(已售罄)}`，与外层 `assets.status` 同枚举、同语义；**唯一维护入口** `services._sync_rs_item_status`（按真值重算：`repeatSale=true` 或未被非 terminated 合同引用 → `in_stock`，否则 `all_sold`），在下单锁定/释放/交付/撤销交付/repeatSale 切换/驳回/批量状态变更/删项目处调用；下单护栏：`repeatSale=false` 且 `all_sold` → 400「该可售明细已售罄」；`repeatSale=true` 的明细永不置 `all_sold`
@@ -87,7 +87,7 @@
 
 | ADR | 状态 | 主题 |
 |---|---|---|
-| ADR-008 | Accepted | 卫星 Token 包量定价（pricingMode='amount'，合同金额整数元权威） |
+| ADR-008 | Accepted（金额精度一条被 ADR-048 取代） | 卫星 Token 包量定价（pricingMode='amount'，合同金额为权威输入；精度见 ADR-048） |
 | ADR-009 | Accepted | 购物车按登录用户隔离 + viewer 下单链路权限对齐 |
 | ADR-010 | **Superseded by ADR-011** | 遥感数据三维字段挂 assets（已废弃，勿参考实现） |
 | ADR-011 | Accepted | 遥感数据"父产品 + 可售明细"两层模型（省×精度×月份） |
@@ -121,6 +121,8 @@
 | ADR-039 | Accepted | 购物车折扣功能整体下线（Deprecates ADR-023）：前端折扣输入/摘要/预览全删，后端 `discountRate` 入参「容忍但忽略」、新单恒 `null`、列保留不清洗 |
 | ADR-040 | Accepted | 销售项目删除入口收敛：列表常驻「删除」→ 行尾「更多▾」仅 admin + `DELETE /projects/{id}` 权限 `require_editor` → `require_admin`（ADR-028 §3 护栏与回滚链零改动）；附带移除产品列表「编辑」按钮（入口 3→2） |
 | ADR-047 | Accepted | 购物车服务期限由必填改**选填**（部分取代 ADR-022 §1 第三条）：两端都空放行（落库 `NULL`）、只填一端仍 400（成对校验）、两端都填保持 ADR-020 校验；客户/金额必填不变；前端去列头红星并同步提示文案 |
+| ADR-048 | Accepted | 金额精度放开到**最多 6 位小数**（部分取代 ADR-008/022 的「整数元」）：全链路 `Decimal` 量化 1e-6（取消强制到分），展示「最少两位、最多六位、尾随 0 截到两位」，覆盖购物车/建单/审核改价/产品单价与区间/遥感明细单价/交付补录；业务规则（必填/区间/分组/锁定）不变，无 DB 迁移 |
+| ADR-049 | Accepted（部分取代 ADR-037 §3） | 参考区间**只约束下单下限**：购物车加购/改数量/改金额/结算（任何角色）金额可高于区间上限，仅低于下限 400；商务审核改价不受区间限制（仅校验 >0 与 ≤6 位小数）；商务手工建单保留双向校验；无数据结构变更 |
 
 ## 8. 文档地图与变更流程
 

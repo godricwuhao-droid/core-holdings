@@ -15,9 +15,14 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { ArrowLeft, CircleCheck, Money, UserFilled } from '@element-plus/icons-vue'
 import {
+  amountInputFormatter,
+  amountInputParser,
   entityShort,
+  formatAmountValue,
   formatMoney,
   isAmountMode,
+  isAmountPrecisionValid,
+  roundAmount,
   rsItemName,
 } from '@/types'
 import {
@@ -63,7 +68,7 @@ interface ReviewLine {
   origPrice: number
   origAmount: number
   price: number | null // unit 模式可编辑（实际单价）
-  amount: number | null // amount 模式可编辑（实际合同金额，整数元）
+  amount: number | null // amount 模式可编辑（实际合同金额，元，最多 6 位小数，ADR-048）
   // 服务期限（ADR-020，PRICING-20261020）：confirm 可改（start ≤ end 后端 400 兜底）
   serviceStart: string
   serviceEnd: string
@@ -101,20 +106,20 @@ watch(contracts, (cs) => {
   )
 }, { immediate: true })
 
-/** 行当前金额（unit=单价×数量 派生；amount/rs=行金额） */
+/** 行当前金额（unit=单价×数量 派生；amount/rs=行金额）——ADR-048：按 1e-6 规整 */
 function lineAmount(l: ReviewLine): number {
-  if (l.mode === 'unit') return Math.round(((l.price ?? 0) * l.qty) * 100) / 100
+  if (l.mode === 'unit') return roundAmount((l.price ?? 0) * l.qty)
   return l.amount ?? 0
 }
 /** 合同合计（实时） */
 function contractTotal(contractId: number): number {
-  return Math.round(reviewLines.value
+  return roundAmount(reviewLines.value
     .filter((l) => l.contractId === contractId)
-    .reduce((s, l) => s + lineAmount(l), 0) * 100) / 100
+    .reduce((s, l) => s + lineAmount(l), 0))
 }
 /** 项目总金额（实时 = Σ 行） */
 const projectTotal = computed(() =>
-  Math.round(reviewLines.value.reduce((s, l) => s + lineAmount(l), 0) * 100) / 100,
+  roundAmount(reviewLines.value.reduce((s, l) => s + lineAmount(l), 0)),
 )
 /** 是否有改价行（确认弹窗文案用；2026-10-20：rs 行金额也可改，一并计入） */
 const hasPriceChange = computed(() =>
@@ -181,8 +186,9 @@ async function handleConfirm() {
       return
     }
     // amount/rs 行统一校验（2026-10-20：遥感明细行金额放开可改，仅本单生效）
-    if (l.mode !== 'unit' && (!l.amount || l.amount <= 0 || !Number.isInteger(l.amount))) {
-      ElMessage.warning(`「${l.name}」销售金额须为正整数（元）`)
+    // ADR-048：金额精度由「整数元」放宽为「> 0 且最多 6 位小数」
+    if (l.mode !== 'unit' && (!l.amount || l.amount <= 0 || !isAmountPrecisionValid(l.amount))) {
+      ElMessage.warning(`「${l.name}」销售金额须大于 0，且最多 6 位小数`)
       return
     }
     if (lineAmount(l) <= 0) {
@@ -379,7 +385,8 @@ const pageReady = computed(() => proj.value != null)
                     </div>
                     <div class="rv-c-edit">
                       <span class="rv-lbl">实际单价（元）</span>
-                      <el-input-number v-model="l.price" :min="0" :precision="2" :controls="false" class="rv-input" />
+                      <!-- ADR-048：单价支持最多 6 位小数（formatter 失焦展示两位起，parser 截断到 6 位） -->
+                      <el-input-number v-model="l.price" :min="0" :controls="false" :formatter="amountInputFormatter" :parser="amountInputParser" class="rv-input" />
                     </div>
                     <span class="rv-c-amt">金额 {{ formatMoney(lineAmount(l)) }}</span>
                   </template>
@@ -389,10 +396,11 @@ const pageReady = computed(() => proj.value != null)
                       <span class="rv-orig muted">{{ formatMoney(l.origAmount) }}</span>
                     </div>
                     <div class="rv-c-edit">
-                      <span class="rv-lbl">销售金额（整数元）</span>
-                      <el-input-number v-model="l.amount" :min="0" :precision="0" :step="1000" :controls="false" class="rv-input" />
+                      <span class="rv-lbl">销售金额（元）</span>
+                      <!-- ADR-048：金额支持最多 6 位小数（原整数元 + 步进 1000） -->
+                      <el-input-number v-model="l.amount" :min="0" :controls="false" :formatter="amountInputFormatter" :parser="amountInputParser" class="rv-input" />
                     </div>
-                    <span v-if="l.qty > 0" class="rv-c-amt rv-derived muted">参考单价 ≈ {{ (lineAmount(l) / l.qty).toFixed(2) }} 元/{{ l.unit || '个' }}</span>
+                    <span v-if="l.qty > 0" class="rv-c-amt rv-derived muted">参考单价 ≈ {{ formatAmountValue(lineAmount(l) / l.qty, false) }} 元/{{ l.unit || '个' }}</span>
                   </template>
                   <template v-else>
                     <!-- 2026-10-20：遥感明细行金额放开可改（仅本单生效，不回写产品明细单价） -->
@@ -401,10 +409,11 @@ const pageReady = computed(() => proj.value != null)
                       <span class="rv-orig muted">{{ formatMoney(l.origAmount) }}</span>
                     </div>
                     <div class="rv-c-edit">
-                      <span class="rv-lbl">销售金额（整数元）</span>
-                      <el-input-number v-model="l.amount" :min="0" :precision="0" :step="1000" :controls="false" class="rv-input" />
+                      <span class="rv-lbl">销售金额（元）</span>
+                      <!-- ADR-048：金额支持最多 6 位小数（原整数元 + 步进 1000） -->
+                      <el-input-number v-model="l.amount" :min="0" :controls="false" :formatter="amountInputFormatter" :parser="amountInputParser" class="rv-input" />
                     </div>
-                    <span v-if="l.qty > 0" class="rv-c-amt rv-derived muted">参考单价 ≈ {{ (lineAmount(l) / l.qty).toFixed(2) }} 元/{{ l.unit || '份' }}（明细单价不回写）</span>
+                    <span v-if="l.qty > 0" class="rv-c-amt rv-derived muted">参考单价 ≈ {{ formatAmountValue(lineAmount(l) / l.qty, false) }} 元/{{ l.unit || '份' }}（明细单价不回写）</span>
                   </template>
                 </div>
                 <!-- 第 2 层：服务期限（同一行不换行）——ADR-020（PRICING-20261020）：普通行可改；遥感明细行按期数售卖不展示 -->
@@ -604,7 +613,7 @@ const pageReady = computed(() => proj.value != null)
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
 }
-/* 可编辑列标签定宽（容纳最长的「销售金额（整数元）」，不截断）→ 三种分支的输入框左边缘完全一致 */
+/* 可编辑列标签定宽（容纳最长的「销售金额（元）」，不截断）→ 三种分支的输入框左边缘完全一致 */
 .rv-c-edit .rv-lbl {
   width: 112px;
   flex: 0 0 auto;

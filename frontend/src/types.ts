@@ -111,7 +111,7 @@ export interface RsItem {
   city: string // 市，可空（默认 ""）
   resolution: number // 精度（米），如 1.5
   saleMonth: string // YYYY-MM
-  price: number // 单价（整数元/份）
+  price: number // 单价（元/份，最多 6 位小数，ADR-048）
   // 参考价格区间（ADR-021，RSITEM-RANGE-20261020）：元/份，选填（可单边）；下单折扣区间校验用
   priceMin?: number | null
   priceMax?: number | null
@@ -217,7 +217,7 @@ export function availableQty(a: Asset): number | null {
 
 /** 可售金额 = 可售数量 × 单价。
  * 包量定价（amount 模式，卫星Token）返回 0：其 salePrice 为参考值（元/份，不参与计价，
- * ADR-008/ADR-017），以合同金额（整数元）为权威口径，两者相乘不是真实金额
+ * ADR-008/ADR-017），以合同金额（元，最多 6 位小数）为权威口径，两者相乘不是真实金额
  * （曾导致看板/板块「可售金额」虚高）。已体现在项目/合同的 contractAmount 统计中。 */
 export function availableValue(a: Asset): number {
   if (isAmountMode(a)) return 0
@@ -744,25 +744,96 @@ export function formatAssetQty(a: Pick<Asset, 'pricingMode'>, n: number | null |
 }
 
 /**
- * 派生参考单价（ADR-017，仅包量定价模式展示用）：合同金额 ÷ 数量（元/份），
- * 与后端 `_derived_price` 同口径，无 1e4 换算（2026-10-20：删除「元/万Token」口径）；
- * 不参与任何金额计算。
+ * 金额精度（ADR-048，2026-10-29）：最多 6 位小数（1e-6 元，微元级）。
+ * 取代 ADR-008/ADR-022 的「整数元」口径；展示规则为「最少 2 位、最多 6 位、尾随 0 截到 2 位」。
+ */
+export const AMOUNT_MAX_FRAC = 6
+
+/** 金额按 1e-6 规整（消除 JS 浮点尾巴，如 0.1+0.2；仅用于前端合计，不改变用户输入值） */
+export function roundAmount(v: number): number {
+  const f = 10 ** AMOUNT_MAX_FRAC
+  return Math.round(v * f) / f
+}
+
+/**
+ * 金额格式化核心（ADR-048）：千分位整数 + 小数「最少 2 位、最多 6 位，尾随 0 截到 2 位」。
+ * 例：12.5 → 12.50；12.3400 → 12.34；12.345678 → 12.345678；1000 → 1,000.00。
+ * 不做四舍五入隐藏（原 Intl `maximumFractionDigits: 2` 会把 12.3456 显示成 12.35，与落库值不符）。
+ * @param withSymbol 是否带 ¥ 前缀（formatMoney 带、输入框/纯数值场景不带）
+ */
+export function formatAmountValue(v: number, withSymbol = true): string {
+  const n = Number(v)
+  if (!Number.isFinite(n)) return '-'
+  const sign = n < 0 ? '-' : ''
+  const fixed = Math.abs(n).toFixed(AMOUNT_MAX_FRAC)
+  const dot = fixed.indexOf('.')
+  const intPart = dot < 0 ? fixed : fixed.slice(0, dot)
+  const fracRaw = dot < 0 ? '' : fixed.slice(dot + 1)
+  const frac = fracRaw.replace(/0+$/, '').padEnd(2, '0')
+  return `${sign}${withSymbol ? '¥' : ''}${intPart.replace(/\B(?=(\d{3})+(?!\d))/g, ',')}.${frac}`
+}
+
+/**
+ * 派生参考单价（ADR-017 / ADR-048，仅包量定价模式展示用）：合同金额 ÷ 数量（元/份），
+ * 与后端 `_derived_price` 同口径（6 位小数），无 1e4 换算；不参与任何金额计算。
  * @param unit 产品计量单位，用于「元/{unit}」展示；缺省显示「元/份」
  */
 export function derivedUnitPrice(amount: number, qty: number, unit?: string): string {
   if (!amount || !qty) return '-'
-  return `${(amount / qty).toFixed(2)} 元/${unit || '份'}`
+  return `${formatAmountValue(amount / qty, false)} 元/${unit || '份'}`
 }
 
-/** 标准金额展示：字段单位即元（ADR-006），直显「¥ + 千分位 + 两位小数」，0/空显示 '-' */
+/**
+ * 标准金额展示：字段单位即元（ADR-006），直显「¥ + 千分位 + 最少两位小数」（ADR-048 支持多位），
+ * 空/非法显示 '-'。全站金额统一走本函数。
+ */
 export function formatMoney(v: number | null | undefined): string {
   if (v === null || v === undefined) return '-'
-  return new Intl.NumberFormat('zh-CN', {
-    style: 'currency',
-    currency: 'CNY',
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  }).format(v)
+  return formatAmountValue(Number(v), true)
+}
+
+/** el-input-number 金额显示格式（ADR-048）：聚焦时显示用户原文，失焦后走「最少两位/最多六位」 */
+export function amountInputFormatter(v: number | string | null | undefined): string {
+  if (v === null || v === undefined || v === '') return ''
+  const n = Number(v)
+  if (!Number.isFinite(n)) return ''
+  return formatAmountValue(n, false)
+}
+
+/**
+ * el-input-number 金额解析（ADR-048）：剔除千分位等非法字符，多余小数点丢弃，
+ * 小数位超过 6 位直接截断（不四舍五入，与后端 6 位校验同口径）。
+ */
+export function amountInputParser(v: string | number): string {
+  const raw = String(v ?? '').replace(/[^\d.-]/g, '')
+  const dot = raw.indexOf('.')
+  if (dot < 0) return raw
+  return raw.slice(0, dot + 1) + raw.slice(dot + 1).replace(/\./g, '').slice(0, AMOUNT_MAX_FRAC)
+}
+
+/**
+ * 金额文本输入过滤（ADR-048，el-input 场景）：保留数字与单个小数点、剔除千分位等字符，
+ * 小数位超过 6 位截断；保留「12.」这类中间态，避免用户输小数点时被吞。
+ */
+export function sanitizeAmountInput(v: string | number | null | undefined): string {
+  const raw = String(v ?? '').replace(/[^\d.]/g, '')
+  const dot = raw.indexOf('.')
+  if (dot < 0) return raw
+  return raw.slice(0, dot + 1) + raw.slice(dot + 1).replace(/\./g, '').slice(0, AMOUNT_MAX_FRAC)
+}
+
+/** 金额文本格式校验（ADR-048）：数字 + 最多 6 位小数（允许「12.」「.5」中间态） */
+export const AMOUNT_INPUT_RE = new RegExp(`^\\d*(\\.\\d{0,${AMOUNT_MAX_FRAC}})?$`)
+
+/** 金额文本是否合法（ADR-048）：空串 / 超 6 位小数 / 含非法字符 → false */
+export function isAmountTextValid(t: string): boolean {
+  return AMOUNT_INPUT_RE.test((t ?? '').trim())
+}
+
+/** 金额是否满足 6 位小数精度（ADR-048，数值场景）：用于提交前校验，避免浮点尾巴误判 */
+export function isAmountPrecisionValid(v: number): boolean {
+  if (!Number.isFinite(v)) return false
+  return roundAmount(v) === v
 }
 
 /**
@@ -776,14 +847,11 @@ export function displayUnitPrice(a: Pick<Asset, 'pricingMode' | 'salePrice'>): s
   return formatMoney(a.salePrice)
 }
 
-/** 元单位金额的输入框展示（千分位 + 两位小数，不含 ¥ 前缀，空/非法回退 0.00），与 formatMoney 同为元口径 */
+/** 元单位金额的输入框展示（千分位，不含 ¥ 前缀，空/非法回退 0.00），精度规则同 formatMoney（ADR-048） */
 export function formatYuan(v: number | null | undefined): string {
   const n = Number(v)
-  if (v === null || v === undefined || Number.isNaN(n)) return '0.00'
-  return new Intl.NumberFormat('zh-CN', {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  }).format(n)
+  if (v === null || v === undefined || !Number.isFinite(n)) return '0.00'
+  return formatAmountValue(n, false)
 }
 
 /** 将用户输入（含千分位）解析为元单位的数值；非法输入返回 0 */

@@ -37,7 +37,7 @@ class AssetOut(_ORM):
     contractFile: str = ""
     remark: str
     updatedAt: str
-    # 计价模式（ADR-008）：'unit'（单价×数量）| 'amount'（包量金额整数元权威）。
+    # 计价模式（ADR-008）：'unit'（单价×数量）| 'amount'（包量金额权威，元、最多 6 位小数）。
     # 后端按类型权威决定（卫星Token → 'amount'），不接受前端入参。
     pricingMode: str = "unit"
     # 容器「可售数量」= 可售期数（加性可选字段，追加在末尾）。
@@ -118,7 +118,7 @@ class StatusInput(BaseModel):
 # ============================================================
 class ReviewItemInput(BaseModel):
     """行级改价入参：itemId = project_items.id。
-    unit 模式传 price（实际单价）；amount 模式传 amount（实际合同金额，整数元）；
+    unit 模式传 price（实际单价）；amount 模式传 amount（实际合同金额，元（最多 6 位小数））；
     遥感明细行（含 itemId 的销售明细）不接受改价 → 400。"""
     itemId: int
     price: float | None = None
@@ -157,13 +157,13 @@ class WithdrawInput(BaseModel):
 class RsItemInput(BaseModel):
     """POST /assets/{assetId}/rs-items 与 PUT /rs-items/{id} 入参。
 
-    金额单位=元（ADR-006）：price 为整数元/份（服务层校验 >0 且整数，否则 400）。
+    金额单位=元（ADR-006）；单价为元/份、最多 6 位小数（ADR-048，服务层校验 >0 且精度，否则 400）。
     """
     province: str  # 省/自治区/直辖市，必填（服务层校验非空）
     city: str = ""  # 市，可空（默认 ''）
     resolution: float = Field(gt=0)  # 精度，单位米（如 1.5）
     saleMonth: str = Field(pattern=r"^\d{4}-\d{2}$")  # 售卖月份 YYYY-MM
-    price: float = Field(gt=0)  # 单价，整数元/份
+    price: float = Field(gt=0)  # 单价，元（最多 6 位小数）/份
     # 参考区间（ADR-021，RSITEM-RANGE-20261020）：元/份，选填（单边允许）；
     # 两者都有时 min ≤ max，否则 400「参考区间下限不能大于上限」（与产品区间同口径）
     priceMin: float | None = Field(default=None, ge=0)
@@ -181,7 +181,7 @@ class RsItemOut(_ORM):
     city: str
     resolution: float
     saleMonth: str
-    price: float  # 元（整数元/份）
+    price: float  # 元/份，最多 6 位小数（ADR-048）
     # 参考区间（ADR-021，RSITEM-RANGE-20261020）：元/份，null=不限制
     priceMin: float | None
     priceMax: float | None
@@ -222,7 +222,7 @@ class ProjectItemInput(BaseModel):
     qty: int = Field(ge=0)
     price: float = Field(ge=0)  # 元
     # 计价分支（ADR-008）：
-    # - 产品 pricingMode='amount'：amount 为**权威输入**（整数元，>0，否则 400），
+    # - 产品 pricingMode='amount'：amount 为**权威输入**（元，最多 6 位小数，>0，否则 400），
     #   后端跳过 price×qty 重算，price = round(amount/qty, 6) 仅作派生展示值；
     # - pricingMode='unit'：后端权威重算 amount = (Decimal(price) * qty).quantize(0.01)，不采信传入值。
     amount: float = Field(ge=0)
@@ -580,7 +580,7 @@ class CartPatchInput(BaseModel):
     与服务期限（ADR-020，PRICING-20261020）。
 
     amount 语义（ADR-018 §3）：unit/遥感明细行=销售金额（传入即采信并过参考区间校验，
-    不传保持原值）；amount 模式行=权威合同金额（整数元，不传保持原值）。
+    不传保持原值）；amount 模式行=权威合同金额（元，最多 6 位小数，不传保持原值）。
     discountRate：**已下线（ADR-039），后端忽略**——容忍旧客户端传值，不校验、不落库。
     """
     customer: str
@@ -648,7 +648,7 @@ class CheckoutInput(BaseModel):
 class SaleOrderItemInput(BaseModel):
     assetId: int
     qty: int = Field(default=1, ge=0)
-    # 包量计价合同金额（ADR-008，元，整数）：amount 模式产品必填（缺失/非整数 400）；unit 模式忽略
+    # 包量计价合同金额（ADR-008，元，最多 6 位小数）：amount 模式产品必填（缺失/超精度 400）；unit 模式忽略
     amount: float | None = None
     # 遥感数据明细（ADR-011，可选）：非空时 qty 强制 1（≠1 → 400），
     # amount 后端权威 = 明细 price × 1（忽略前端传值）

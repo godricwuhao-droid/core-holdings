@@ -11,6 +11,8 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Document, InfoFilled, Money, Plus, Search, Van } from '@element-plus/icons-vue'
 import {
   OUTBOUND_TYPES,
+  amountInputFormatter,
+  amountInputParser,
   availableQty,
   defaultOutboundType,
   formatAssetQty,
@@ -458,7 +460,8 @@ async function handleRevert(o: Outbound) {
               <el-input-number v-model="createDialog.form.qty" :min="0" :precision="0" :step="1" controls-position="right" style="width: 100%;" />
             </el-form-item>
             <el-form-item label="销售金额（元）">
-              <el-input-number v-model="createDialog.form.amount" :min="0" :precision="2" :controls="false" style="width: 100%;" />
+              <!-- ADR-048：金额支持最多 6 位小数（formatter 失焦展示两位起） -->
+              <el-input-number v-model="createDialog.form.amount" :min="0" :controls="false" :formatter="amountInputFormatter" :parser="amountInputParser" style="width: 100%;" />
             </el-form-item>
           </div>
           <el-form-item label="备注">

@@ -2231,3 +2231,28 @@
 | 2026-10-27 | 修改 | 样式：新增 `.step-input`（去边框/透明底/等宽数字，聚焦浅蓝底 `--primary-light` + 主蓝字，禁用态灰字灰底）；`.cart-stepper` 宽度 96 → **104px**（中区 48px），保证 6 位数字完整显示；`.step-value` 补 `line-height: 30px` 对齐 | views/cart/index.vue | DIRECT-QTY-INPUT | 数量列宽 120px 未改，步进器仍居中；未引入新色值 |
 
 > 验证：`npx vue-tsc --noEmit` 通过（EXIT=0），`read_lints` 对 `views/cart/index.vue` 无新增诊断。未构建、未部署、未 commit（Vite HMR 已自动生效）。
+
+## 2026-10-29 ｜ 金额精度放开到最多 6 位小数（ADR-048）
+
+**关联任务**：ADR-048。用户反馈「购物车下单手动填入金额不支持输入小数点」→ 业务拍板：金额支持多位小数、展示「最少两位，尾随 0 截到两位」，覆盖所有页面与销售明细价格。
+
+| 日期 | 类型 | 变更内容 | 影响文件 | 关联任务 | 备注 |
+|------|------|----------|----------|----------|------|
+| 2026-10-29 | 新增 | `AMOUNT_MAX_FRAC=6`、`roundAmount`、`formatAmountValue`（千分位 + 最少两位 / 最多六位、尾随 0 截断，不四舍五入）、`amountInputFormatter`/`amountInputParser`（el-input-number 聚焦原文、失焦两位起、截断 6 位）、`sanitizeAmountInput`/`isAmountTextValid`/`isAmountPrecisionValid` | types.ts | ADR-048 | 替换原 `Intl.NumberFormat(maximumFractionDigits:2)` 的 2 位四舍五入 |
+| 2026-10-29 | 修改 | 购物车行金额输入放开到 6 位小数（`sanitizeAmountInput` + `isAmountTextValid`），提交前 `roundAmount` 规整；合计/分组小计/结算弹窗合计同口径（去掉 `Math.round` 取整） | views/cart/index.vue、components/SalesOrderDialog.vue | ADR-048 | 文案「必填，整数元」→「必填，最多 6 位小数」 |
+| 2026-10-29 | 修改 | 销售建单：单价 `el-input-number` 改用 formatter/parser；包量行金额改 `el-input` + 草稿字符串（保留「12.」中间态），行金额/合同合计 `roundAmount`；校验改 `isAmountPrecisionValid` | views/sales/projects/create.vue | ADR-048 | 合同金额只读框同走 formatter |
+| 2026-10-29 | 修改 | 审核改价：实际单价/销售金额去 `:precision`（原 0/2）与步进 1000，改 formatter/parser；行金额/合同/项目合计 `roundAmount`；参考单价展示改 `formatAmountValue` | views/sales/projects/review.vue | ADR-048 | 校验文案改「> 0 且最多 6 位小数」 |
+| 2026-10-29 | 修改 | 产品登记（销售单价、参考区间；区间自动同步 `roundAmount`）、遥感明细单价（原 `:precision="0"` 整数元/份）与区间、交付补录金额统一放开 6 位小数 | views/assets/create.vue、views/assets/detail.vue、views/sales/outbound/index.vue | ADR-048 | 数量类输入（`precision="0"`）不变 |
+
+> 验证：`read_lints` 全部改动文件 0 诊断；金额格式化/解析规则用 Node 复算（`12.5→12.50`、`12.3400→12.34`、`12.345678→12.345678`、`1,234.5678912→1234.567891`）；Element Plus 2.14.7 源码确认 `formatter` 仅作用于失焦展示、`parser` 同时作用于 input/change，未设 `precision` 时不做舍入。未构建、未部署、未 commit。
+
+## 2026-10-29 ｜ 参考区间只约束下限、审核改价不受区间限制（ADR-049）
+
+**关联任务**：ADR-049。购物车订单金额允许高于参考区间上限；商务审核改价不受区间范围限制。
+
+| 日期 | 类型 | 变更内容 | 影响文件 | 关联任务 | 备注 |
+|------|------|----------|----------|----------|------|
+| 2026-10-29 | 修改 | 购物车顶部提示条去掉 `isViewer` 分支，统一为「设参考区间时金额不得低于区间下限（上限不限制，可高于上限成交）」；删除多余 `isViewer` 导入；输入/提交注释同步 | views/cart/index.vue | ADR-049 | 低于下限仍由后端 400，页面文案走 `showError` |
+| 2026-10-29 | 修改 | 产品登记 & 遥感明细的参考区间说明改为「下单时用于校验金额/单价下限（上限不限制），未设置则不限制」 | views/assets/create.vue、views/assets/detail.vue | ADR-049 | 审核页（review.vue）本就不展示区间限制，无需改 |
+
+> 验证：`vue-tsc --noEmit` EXIT=0，`read_lints` 0 诊断；后端区间口径已在副本库实测（超上限放行、低于下限 400、审核改价不受限）。未构建、未 commit。

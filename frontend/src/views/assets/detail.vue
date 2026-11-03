@@ -32,6 +32,8 @@ import {
   FLOW_TYPES,
   PROJECT_STATUS,
   RS_ITEM_STATUS,
+  amountInputFormatter,
+  amountInputParser,
   assetStockState,
   availableQty,
   boardLabel,
@@ -42,6 +44,7 @@ import {
   formatAssetQty,
   formatMoney,
   isAmountMode,
+  isAmountPrecisionValid,
   noSellableStock,
   priceRangeText,
   tagInfo,
@@ -740,8 +743,9 @@ async function saveRsItem() {
     ElMessage.warning('请选择月份')
     return
   }
-  if (!rsForm.price || !Number.isInteger(rsForm.price) || rsForm.price <= 0) {
-    ElMessage.warning('单价须为整数元（大于 0）')
+  // ADR-048：明细单价精度由「整数元/份」放宽为「> 0 且最多 6 位小数」
+  if (!rsForm.price || rsForm.price <= 0 || !isAmountPrecisionValid(rsForm.price)) {
+    ElMessage.warning('单价须大于 0，且最多 6 位小数')
     return
   }
   const data: RsItemInput = {
@@ -1037,7 +1041,7 @@ function operatorText(f: AssetFlow): string {
                   <div class="card-title">可售明细</div>
                   <!-- ADR-038（RS-REPEAT-20261022）：默认单次售卖；开启后只计次不扣量；
                        RS-STATUS-20261022：补「可售数量」口径说明（= 状态为可售的明细条数） -->
-                  <div class="card-desc">按 省/精度/月份 维护可售卖明细，每份明细独立计价（整数元/份）；<b>默认为单次售卖</b>（售出即占用），开启「可重复售卖」后只计次不扣量；<b>可售数量 = 状态为「可售」的明细条数</b>。</div>
+                  <div class="card-desc">按 省/精度/月份 维护可售卖明细，每份明细独立计价（元/份，最多 6 位小数）；<b>默认为单次售卖</b>（售出即占用），开启「可重复售卖」后只计次不扣量；<b>可售数量 = 状态为「可售」的明细条数</b>。</div>
                 </div>
                 <el-tooltip :content="NO_PERM_TIP" :disabled="canWrite" placement="bottom">
                   <span>
@@ -1624,27 +1628,29 @@ function operatorText(f: AssetFlow): string {
             />
           </el-form-item>
           <el-form-item label="单价（元）" required>
+            <!-- ADR-048：明细单价支持最多 6 位小数（原整数元/份） -->
             <el-input-number
               v-model="rsForm.price"
-              :min="1"
-              :precision="0"
-              :step="1"
+              :min="0"
               :controls="false"
-              placeholder="整数元/份"
+              :formatter="amountInputFormatter"
+              :parser="amountInputParser"
+              placeholder="元/份，最多 6 位小数"
               style="width: 100%;"
             />
-            <div class="dlg-hint">整数元/份，须大于 0</div>
+            <div class="dlg-hint">元/份，须大于 0，最多 6 位小数</div>
           </el-form-item>
-          <!-- ADR-021（RSITEM-RANGE-20261020）：参考价格区间——元/份，选填（可单边），
-               下单时单价须落在区间内，超区间后端 400；交互/样式与产品区间一致 -->
+          <!-- ADR-021（RSITEM-RANGE-20261020）：参考价格区间——元/份，选填（可单边）；
+               ADR-049（2026-10-29）：下单时**只校验下限**（低于下限 400，高于上限不拦截），
+               商务审核改价不受区间约束；交互/样式与产品区间一致 -->
           <el-form-item label="参考价格区间（元）">
             <div class="price-range-row">
-              <el-input-number v-model="rsForm.priceMin" :min="0" :precision="2" :controls="false" placeholder="下限（选填）" style="width: 100%;" />
+              <el-input-number v-model="rsForm.priceMin" :min="0" :controls="false" :formatter="amountInputFormatter" :parser="amountInputParser" placeholder="下限（选填）" style="width: 100%;" />
               <span class="muted price-range-sep">~</span>
-              <el-input-number v-model="rsForm.priceMax" :min="0" :precision="2" :controls="false" placeholder="上限（选填）" style="width: 100%;" />
+              <el-input-number v-model="rsForm.priceMax" :min="0" :controls="false" :formatter="amountInputFormatter" :parser="amountInputParser" placeholder="上限（选填）" style="width: 100%;" />
             </div>
             <div class="muted" style="font-size: 12px; margin-top: 4px;">
-              元/份，选填（可只填一边）；下单时单价校验用，未设置则不限制
+              元/份，选填（可只填一边）；下单时用于校验单价下限（上限不限制），未设置则不限制
             </div>
           </el-form-item>
           <!-- ADR-038（RS-REPEAT-20261022）：明细级「可重复售卖」，默认关闭 = 单次售卖；

@@ -30,9 +30,12 @@ BOARD_CODE = {
 
 PROJECT_FLOW = ["active", "delivered"]
 
-# 金额精度（ADR-006）：单位=元，累加/重算/比较一律 decimal.Decimal，
+# 金额精度（ADR-006 / ADR-048）：单位=元，累加/重算/比较一律 decimal.Decimal，
 # 落库前转 float（SQLite REAL）。禁止对金额使用 round(x, 4) 旧单位式写法。
-CENT = Decimal("0.01")
+# ADR-048（2026-10-29）：金额最多 6 位小数（1e-6 元）——原「强制量化到分」会把 3~6 位小数
+# 的行金额悄悄舍掉，导致 Σ明细 ≠ 合同金额（一致性校验误报），故全链路改用 AMOUNT_QUANT。
+AMOUNT_QUANT = Decimal("0.000001")
+CENT = Decimal("0.01")  # 历史常量（ADR-006 时代「精确到分」），勿再用于金额量化
 
 # 编号格式：项目 SP-{14位时间戳+2位随机}（存量旧编号 SP-001 同为 SP- 前缀数字）、
 # 销售记录 HT-{...}、交付 CK-{4位}。
@@ -52,10 +55,15 @@ UNSET = object()
 
 
 def _fmt_money(v) -> str:
-    """金额文案（报错/日志展示）：千分位 + 两位小数，禁止科学计数法（如 7.58e+06）。"""
+    """金额文案（报错/日志展示）：千分位 + 最少两位 / 最多 6 位小数（ADR-048），
+    禁止科学计数法（如 7.58e+06）。"""
     if v is None:
         return "-"
-    return f"{_dec(v):,.2f}"
+    int_part, frac = f"{_dec(v):,.6f}".split(".")
+    frac = frac.rstrip("0")
+    if len(frac) < 2:
+        frac = frac.ljust(2, "0")
+    return f"{int_part}.{frac}"
 
 
 def today() -> str:
@@ -342,23 +350,28 @@ def item_status_of_input(it: schemas.ProjectItemInput) -> str:
 
 
 def _is_amount_mode(a: models.Asset) -> bool:
-    """ADR-008：是否包量计价（合同金额整数元权威，salePrice 仅参考值）"""
+    """ADR-008/ADR-048：是否包量计价（合同金额元、最多 6 位小数权威，salePrice 仅参考值）"""
     return (a.pricingMode or "unit") == "amount"
 
 
 def _validate_amount_yuan(amount) -> Decimal:
-    """ADR-008：包量计价金额校验——整数元且 > 0，否则 400。返回 Decimal（元）。"""
+    """ADR-008/ADR-048：销售金额校验——> 0 且最多 6 位小数，否则 400。返回 Decimal（元，1e-6）。
+
+    2026-10-29 精度放宽（ADR-048）：原口径为「整数元」，现允许到 6 位小数；
+    超过 6 位（Float 双精度落地会失真）仍拒绝。
+    """
+    msg = "销售金额须大于 0 且最多保留 6 位小数"
     if amount is None:
-        raise HTTPException(400, "包量计价产品的销售金额须为整数元")
+        raise HTTPException(400, msg)
     amt = _dec(amount)
-    if amt <= 0 or amt != amt.to_integral_value():
-        raise HTTPException(400, "包量计价产品的销售金额须为整数元")
-    return amt
+    if amt <= 0 or amt != amt.quantize(AMOUNT_QUANT):
+        raise HTTPException(400, msg)
+    return amt.quantize(AMOUNT_QUANT)
 
 
 def _derived_price(amt: Decimal, qty: int) -> float:
     """ADR-008：amount 模式派生展示单价 price = round(amount / qty, 6)（不参与金额计算）"""
-    return float((amt / qty).quantize(Decimal("0.000001")))
+    return float((amt / qty).quantize(AMOUNT_QUANT))
 
 
 def _validate_price_range(price_min: float | None, price_max: float | None) -> None:
@@ -380,22 +393,24 @@ def _check_discount_range(asset: models.Asset | None, qty: int, amount,
     内部**没有任何「用折扣率推算金额」的路径**（入参里也没有 rate）；ADR-018/021/037 口径不变。
 
     - amount 为 None → 原价成交，返回 None（unit 行 salePrice×qty / 遥感行明细 price）；
-    - amount 须为非负整数元，否则 400；
-    - 折扣单价 = amount ÷ qty（Decimal 保留 6 位）须落在参考区间 [priceMin, priceMax] 内：
+    - amount 须为非负、最多 6 位小数（ADR-048，原「非负整数元」），否则 400；
+    - **销售金额直接**须落在参考区间 [priceMin, priceMax] 内（2026-10-29：不再 ÷qty 折算单价）：
       未设置区间 = 不限制；单边区间按单边校验；超限 400
-      「单价超出该产品参考区间（{min}~{max} 元/{unit}）」（契约 §3 文案；NO-DISCOUNT-20261022
+      「销售金额超出该产品参考区间（{min}~{max} 元/{unit}）」（NO-DISCOUNT-20261022
       文案收口：去「折扣」字样，与 ADR-039 折扣下线一致）。
     - ADR-021（RSITEM-RANGE-20261020）：遥感明细行（rs 非空）区间取该 rs_item 自身的
       priceMin/priceMax（不再取父产品容器 assets 的区间）；普通产品行行为不变。
-    - ADR-037 §3（FORMS-20261022）：区间校验分角色——`enforce_max=False`（viewer/生态人员）
-      只校验下限（amount < priceMin → 400 原文案），上限放开（加价成交允许）；
-      editor/admin 维持双向（默认 True）。遥感明细行同口径分角色。
-    返回 Decimal 金额（元）。"""
+    - ADR-049（2026-10-29，部分取代 ADR-037 §3）：**购物车/结算入口固定 `enforce_max=False`**
+      （只校验下限 amount < priceMin → 400，上限不限制，任何角色一致）；
+      `enforce_max=True` 仅剩「商务手工建单」（POST /projects）路径使用（维持双向）。
+      **审核改价（POST /projects/{id}/review）不调用本函数**，金额不受区间约束。
+    返回 Decimal 金额（元，精度 1e-6）。"""
     if amount is None:
         return None
     amt = _dec(amount)
-    if amt < 0 or amt != amt.to_integral_value():
-        raise HTTPException(400, "销售金额须为非负整数元")
+    if amt < 0 or amt != amt.quantize(AMOUNT_QUANT):
+        raise HTTPException(400, "销售金额须为非负且最多保留 6 位小数")
+    amt = amt.quantize(AMOUNT_QUANT)
     if qty <= 0:
         return amt
     # ADR-021（RSITEM-RANGE-20261020）：区间来源按行类型区分——
@@ -408,11 +423,12 @@ def _check_discount_range(asset: models.Asset | None, qty: int, amount,
         return amt
     if lo is None and hi is None:
         return amt  # 未设置区间 = 不限制（ADR-018 §1 / ADR-021）
-    unit_price = (amt / qty).quantize(Decimal("0.000001"))
+    # 2026-10-29：判定**直接拿销售金额与区间比较**，不再除以数量折算单价
+    # （原 unit_price = amount / qty → qty>1 时金额被除小，低于下限误 400）
     u = unit or (asset.unit if asset else "")
-    # ADR-037 §3：enforce_max=False（viewer）只校验下限，上限放开
-    if (lo is not None and unit_price < _dec(lo)) or (enforce_max and hi is not None and unit_price > _dec(hi)):
-        raise HTTPException(400, f"单价超出该产品参考区间（{_range_label(lo, hi, u)}）")
+    # ADR-049：购物车链路固定 enforce_max=False（只校验下限，上限不限制）
+    if (lo is not None and amt < _dec(lo)) or (enforce_max and hi is not None and amt > _dec(hi)):
+        raise HTTPException(400, f"销售金额超出该产品参考区间（{_range_label(lo, hi, u)}）")
     return amt
 
 
@@ -432,8 +448,8 @@ def _check_unit_price_range(asset: models.Asset | None, price, qty: int = 1,
 
     单价 = price（元/{unit}）须落在 [priceMin, priceMax]；未设置区间 = 不限制，单边按单边校验。
     超限 400「销售单价超出该产品参考区间（…）」。
-    ADR-037 §3（FORMS-20261022）：`enforce_max=False`（viewer）只校验下限，上限放开；
-    editor/admin 维持双向（默认 True），与 `_check_discount_range` 同口径。
+    ADR-049（2026-10-29，部分取代 ADR-037 §3）：购物车/结算链路固定 `enforce_max=False`
+    （只校验下限）；`enforce_max=True` 仅剩商务手工建单路径，与 `_check_discount_range` 同口径。
     """
     if asset is None or qty <= 0:
         return
@@ -492,7 +508,7 @@ def _validate_service_period(start: str | None, end: str | None) -> tuple[str | 
 def _item_pricing(a: models.Asset | None, it: schemas.ProjectItemInput,
                   enforce_max: bool = True) -> tuple[float, float]:
     """销售明细计价分支（ADR-008），返回 (price, amount)：
-    - amount 模式：amount 为权威输入（整数元校验），跳过 price×qty 重算，price 为派生值；
+    - amount 模式：amount 为权威输入（> 0 且 ≤6 位小数校验），跳过 price×qty 重算，price 为派生值；
     - unit 模式：price×qty Decimal 权威重算，且**单价必须落在产品参考区间内**
       （BUG-07/08，ADR-029 §1：不再无条件采信前端 price）。
     ADR-037 §3（FORMS-20261022）：`enforce_max` 透传给 `_check_unit_price_range`
@@ -502,7 +518,7 @@ def _item_pricing(a: models.Asset | None, it: schemas.ProjectItemInput,
         return _derived_price(amt, it.qty), float(amt)
     if it.qty > 0:
         _check_unit_price_range(a, it.price, it.qty, enforce_max=enforce_max)
-    return float(it.price), float((_dec(it.price) * it.qty).quantize(CENT))
+    return float(it.price), float((_dec(it.price) * it.qty).quantize(AMOUNT_QUANT))
 
 
 def _validate_item_stock(a: models.Asset, qty: int, repeat_override: bool | None = None) -> None:
@@ -906,13 +922,14 @@ def _rs_item_dup(db: Session, asset_id: int, province: str, city: str,
 
 
 def _rs_item_fields(data: schemas.RsItemInput) -> tuple[str, str, float, str, float]:
-    """明细字段归一化 + 校验：省必填、price 整数元 > 0（saleMonth 格式/resolution>0 由 Pydantic 422）。"""
+    """明细字段归一化 + 校验：省必填、price > 0 且最多 6 位小数（ADR-048），
+    saleMonth 格式/resolution>0 由 Pydantic 422。"""
     province = (data.province or "").strip()
     if not province:
         raise HTTPException(400, "遥感数据明细必须填写省份")
     price = _dec(data.price)
-    if price <= 0 or price != price.to_integral_value():
-        raise HTTPException(400, "遥感数据明细单价须为整数元且大于 0")
+    if price <= 0 or price != price.quantize(AMOUNT_QUANT):
+        raise HTTPException(400, "遥感数据明细单价须大于 0 且最多保留 6 位小数")
     return province, (data.city or "").strip(), float(data.resolution), data.saleMonth, float(price)
 
 
@@ -1707,7 +1724,7 @@ def _normalize_contracts(db: Session, data: schemas.ProjectInput,
     - 不传（仅 items）：按**单合同**自动包装，customer 取项目 customer 字段，
       contractAmount 缺省=该组明细 amount 合计。
     返回的 contractAmount 为 Decimal（元口径，ADR-006），缺省时按明细计价合计：
-    amount 模式=Σ 权威 amount（整数元，ADR-008），unit 模式=Σ price×qty。
+    amount 模式=Σ 权威 amount（元，≤6 位小数，ADR-008/048），unit 模式=Σ price×qty。
     ADR-037 §3（FORMS-20261022）：`enforce_max` 透传给 `_rs_row_amount`
     （viewer 只校验下限，上限放开；editor/admin 双向不变）。
     """
@@ -1722,10 +1739,10 @@ def _normalize_contracts(db: Session, data: schemas.ProjectInput,
         a = get_asset(db, it.assetId)
         if a is not None and _is_amount_mode(a):
             return _validate_amount_yuan(it.amount)
-        return (_dec(it.price) * it.qty).quantize(CENT)
+        return (_dec(it.price) * it.qty).quantize(AMOUNT_QUANT)
 
     def _contract_total(items: list[schemas.ProjectItemInput]) -> Decimal:
-        return sum((_item_total(it) for it in items), Decimal("0")).quantize(CENT)
+        return sum((_item_total(it) for it in items), Decimal("0")).quantize(AMOUNT_QUANT)
 
     if data.contracts:
         out = []
@@ -1736,7 +1753,7 @@ def _normalize_contracts(db: Session, data: schemas.ProjectInput,
             if explicit > 0:
                 # BUG-18 / ADR-029 §2：金额不变量——客户端显式传入的合同金额必须等于 Σ 明细金额，
                 # 不一致直接 400（此前直接覆盖，pending 期报表与审批依据失真）
-                amt = explicit.quantize(CENT)
+                amt = explicit.quantize(AMOUNT_QUANT)
                 if amt != total:
                     raise HTTPException(400, "合同金额与明细合计不一致")
             else:
@@ -1767,8 +1784,8 @@ def _rs_row_amount(asset: models.Asset | None, rs: models.RsItem, amount_in,
                                     unit=asset.unit if asset is not None else "", rs=rs,
                                     enforce_max=enforce_max)
         if amt is not None:
-            return amt.quantize(CENT)
-    return _dec(rs.price).quantize(CENT)
+            return amt.quantize(AMOUNT_QUANT)
+    return _dec(rs.price).quantize(AMOUNT_QUANT)
 
 
 def _item_repeat(db: Session, asset: models.Asset | None,
@@ -1822,11 +1839,12 @@ def _create_project_core(db: Session, data: schemas.ProjectInput,
     """建项目核心（不提交）：归一化合同 → 逐合同校验同主体 → 按 assetId 聚合校验数量
     → 生成项目（状态 = initial_status）+ 合同（HT-xxxx）+ 明细（挂 contractId）→ 锁定。
 
-    ADR-037 §3（FORMS-20261022）：`enforce_max` = 参考区间**上限是否生效**——
-    viewer（生态人员）结算传 False（只校验下限，上限放开）；editor/admin 入口默认 True
-    （双向校验不变）。透传至 `_normalize_contracts` / `_rs_row_amount` / `_item_pricing`，
-    与改价入口（PUT/PATCH /cart/{id}）复用同一校验函数（`_check_discount_range` /
-    `_check_unit_price_range`），禁止复制第二套规则。
+    `enforce_max` = 参考区间**上限是否生效**（默认 True = 双向校验，仅商务手工建单使用）：
+    ADR-049（2026-10-29）起**购物车结算固定传 False**（只校验下限，上限不限制，任何角色一致），
+    原 ADR-037 §3「viewer 只下限 / editor-admin 双向」分角色口径作废。
+    透传至 `_normalize_contracts` / `_rs_row_amount` / `_item_pricing`，与购物车行更新
+    （PUT/PATCH /cart/{id}）复用同一校验函数（`_check_discount_range` /
+    `_check_unit_price_range`），禁止复制第二套规则。**审核改价不走本链路，不受区间约束**。
 
     initial_status（ADR-012 修订 2026-10-19）：**所有角色/入口统一 "pending"（待审核）**——
     生态/商务/管理员 的购物车结算、直接下单、手动建单均进「待审核」流程：
@@ -1956,7 +1974,7 @@ def _create_project_core(db: Session, data: schemas.ProjectInput,
                                 repeat_override=eff_repeat)
             # ⑤ 计价分支（与 _normalize_contracts 的 Σ 口径同源，否则合同金额校验会误报）：
             # - ADR-011 明细行：金额 = 明细挂牌价（或显式>0 的折扣金额，过明细区间）→ _rs_row_amount
-            # - ADR-008 amount 模式：amount 权威（整数元）+ price 派生
+            # - ADR-008 amount 模式：amount 权威（元，≤6 位小数）+ price 派生
             # - unit 模式：price×qty 后端权威重算 + 单价过产品参考区间（_item_pricing）
             if rs is not None:
                 amount_dec = _rs_row_amount(asset, rs, it.amount, enforce_max=enforce_max)
@@ -1969,10 +1987,10 @@ def _create_project_core(db: Session, data: schemas.ProjectInput,
             # 普通行（unit/amount 模式）= asset.salePrice / salePrice×qty
             if rs is not None:
                 orig_price = float(_dec(rs.price))
-                orig_amount = float(_dec(rs.price).quantize(CENT))
+                orig_amount = float(_dec(rs.price).quantize(AMOUNT_QUANT))
             elif asset is not None:
                 orig_price = float(asset.salePrice)
-                orig_amount = float((_dec(asset.salePrice) * it.qty).quantize(CENT))
+                orig_amount = float((_dec(asset.salePrice) * it.qty).quantize(AMOUNT_QUANT))
             else:
                 orig_price, orig_amount = None, None  # 未关联产品行（pending_asset）无原价
             # ADR-020：服务期限取校验链④的结果（不重复校验，避免两套口径）
@@ -2134,8 +2152,8 @@ def _recompute_project(p: models.Project) -> None:
     contracts = p.contracts
     p.status = _derive_project_status(p)
     total = sum((_dec(c.contractAmount) for c in contracts), Decimal("0"))
-    p.expectedAmount = float(total.quantize(CENT))
-    p.contractAmount = float(total.quantize(CENT))  # 项目级 contractAmount 兼容口径同 expectedAmount
+    p.expectedAmount = float(total.quantize(AMOUNT_QUANT))
+    p.contractAmount = float(total.quantize(AMOUNT_QUANT))  # 项目级 contractAmount 兼容口径同 expectedAmount
     if contracts:
         # ADR-013：多记录（一资产一记录）但客户/主体全一致时仍取该值，避免误显「N 位客户」
         customers = {c.customer for c in contracts if c.customer}
@@ -2411,7 +2429,7 @@ def review_project(db: Session, project_id: int, data: schemas.ReviewInput,
     确认下单（可带改价 + 服务期限）或驳回（释放锁定 + 留痕）。
 
     confirm：改价只改合同行——unit 行传实际单价（amount = price×qty 重算）、
-    amount 行传实际合同金额（整数元，price 派生反算）；遥感明细行仅可改本行销售金额
+    amount 行传实际合同金额（元，≤6 位小数，price 派生反算）；遥感明细行仅可改本行销售金额
     （2026-10-20 放开，不回写 rs_items 明细单价）；
     ADR-018 §4（PRICING-20261020）：**删除**终审改价回写 assets.salePrice 的逻辑——
     挂牌价与参考区间仅由产品管理维护，改价只写 ProjectItem.price/amount（orig 快照不动）；
@@ -2478,7 +2496,7 @@ def review_project(db: Session, project_id: int, data: schemas.ReviewInput,
             if ri is None:
                 continue
             if it.itemId is not None:
-                # 2026-10-20：遥感明细行放开审核改价——仅改**本行**销售金额（整数元，price 派生反算）；
+                # 2026-10-20：遥感明细行放开审核改价——仅改**本行**销售金额（元，≤6 位小数，price 派生反算）；
                 # 不回写 rs_items.price（明细单价属产品「可售明细」主数据）也不进 price_changes_by_asset
                 #（不污染平台挂牌价）——订单级一次性价调整，其他订单不受影响
                 if ri.amount is None:
@@ -2508,15 +2526,19 @@ def review_project(db: Session, project_id: int, data: schemas.ReviewInput,
                     continue
                 if ri.price <= 0:
                     raise HTTPException(400, "单价须大于 0")
-                it.price = float(ri.price)
-                it.amount = float((_dec(ri.price) * it.qty).quantize(CENT))
+                # ADR-048：审核改价单价同样限 ≤6 位小数（直连接口兜底）
+                price_dec = _dec(ri.price)
+                if price_dec != price_dec.quantize(AMOUNT_QUANT):
+                    raise HTTPException(400, "单价须最多保留 6 位小数")
+                it.price = float(price_dec)
+                it.amount = float((_dec(ri.price) * it.qty).quantize(AMOUNT_QUANT))
                 # ADR-018 §4：不再回写 assets.salePrice（orig 快照永不触碰）
                 name = a.name if a else f"产品 #{it.assetId}"
                 diffs.append(f"{name} 单价 {_fmt_money(old_price)} → {_fmt_money(it.price)} 元")
     # 合同合计重算（派生 = Σ 行 amount）
     for c in contracts:
         c.contractAmount = float(
-            sum((_dec(it.amount) for it in c.items), Decimal("0")).quantize(CENT))
+            sum((_dec(it.amount) for it in c.items), Decimal("0")).quantize(AMOUNT_QUANT))
     # 确认守卫：防 0 元单生效（覆盖参考价未设的极端路径）
     all_items = [it for c in contracts for it in c.items]
     # 2026-10-19 排查修复（S1）：空草稿项目（0 明细）不可 confirm——否则产生 0 元 0 明细的
@@ -2977,7 +2999,7 @@ def create_outbound(db: Session, data: schemas.OutboundInput, operator: str = ""
         projectName=p.name if p else (f"补录-{data.customer}" if data.customer else "补录"),
         customer=p.customer if p else data.customer,
         assetId=a.id, assetName=a.name, qty=data.qty, unit=a.unit,
-        amount=float(_dec(data.amount).quantize(CENT)),  # 元口径，精确到分（ADR-006）
+        amount=float(_dec(data.amount).quantize(AMOUNT_QUANT)),  # 元口径，精度 1e-6（ADR-006/048）
         type=data.type, mode=data.mode, date=data.date,
         # 操作人取路由层真实登录账号（require_editor 已保证非空），
         # 不再采信前端入参 data.operator（可伪造，导致业务表与审计表操作人不一致）
@@ -3330,7 +3352,7 @@ DEFAULT_USER = "admin"
 
 
 def _cart_amount(a: models.Asset | None, amount: float | None) -> float | None:
-    """购物车行级合同金额（ADR-008）：amount 模式产品校验整数元后返回；
+    """购物车行级合同金额（ADR-008）：amount 模式产品校验（> 0 且 ≤6 位小数）后返回；
     未传返回 None（结算时再强制必填）；unit 模式忽略（不采信、不落库）。"""
     if amount is None:
         return None
@@ -3459,13 +3481,15 @@ def _cart_add_inner(db: Session, data: schemas.CartItemInput, user_id: str = DEF
                 f"「{a.name}」可用数量仅 {_avail(a)}{a.unit}，无法加入/设置为 {total_in_cart + delta}{a.unit}，请调整数量",
             )
     # 行级金额（ADR-008 / ADR-018 §3，PRICING-20261020）：
-    # - amount 模式：整数元权威（_cart_amount）；
-    # - unit / 遥感明细行：折扣金额传入即采信（过参考区间校验，超限 400），不传 = 原价成交
+    # - amount 模式：元（≤6 位小数）权威（_cart_amount）；
+    # - unit / 遥感明细行：销售金额传入即采信（只过参考区间**下限**校验，ADR-049 起上限不限制），
+    #   不传 = 原价成交
     if _is_amount_mode(a):
         amount = _cart_amount(a, data.amount)
     else:
         # ADR-021（RSITEM-RANGE-20261020）：遥感明细行传 rs，区间取明细自身 priceMin/priceMax
-        amt = _check_discount_range(a, qty, data.amount, unit=a.unit, rs=rs)
+        # ADR-049（2026-10-29）：购物车入口固定只校验下限（enforce_max=False）
+        amt = _check_discount_range(a, qty, data.amount, unit=a.unit, rs=rs, enforce_max=False)
         amount = float(amt) if amt is not None else None
     # ADR-020（PRICING-20261020）：服务期限校验（YYYY-MM-DD + start ≤ end，否则 400）
     service_start, service_end = _validate_service_period(data.serviceStart, data.serviceEnd)
@@ -3529,15 +3553,16 @@ def patch_cart_item(db: Session, cart_id: int, customer: str, user_id: str = DEF
                     viewer: bool = False) -> models.CartItem:
     """修改购物车行级客户（ADR-007）；可选携带合同金额（ADR-008）、服务期限（ADR-020）。
 
-    ADR-037 §3（FORMS-20261022）：`viewer`（生态人员）行金额只校验参考区间**下限**
-    （上限放开），与 PUT /cart/{id} / checkout 复用同一校验函数。
+    ADR-049（2026-10-29）：行金额**只校验参考区间下限**（上限不限制，任何角色一致）；
+    `viewer` 参数保留仅为调用签名兼容（不再影响区间口径），与 PUT /cart/{id} / checkout
+    复用同一校验函数。
 
     **PATCH 语义（CART-PATCH-20261021）**：任一字段「未传（UNSET）= 保持原值不改」，
     显式传 null = 清空。修复「改客户时金额/服务期限被清空」。
 
     金额语义（ADR-018 §3，PRICING-20261020）：
     - unit / 遥感明细行：amount 传入即采信（过参考区间校验，超限 400）；显式 null = 清空；
-    - amount 模式行：整数元权威（不传保持原值，结算时必填兜底不变）。
+    - amount 模式行：元（≤6 位小数）权威（不传保持原值，结算时必填兜底不变）。
     折扣率（NO-DISCOUNT-20261022 / ADR-039）：**已下线**——入参 `discountRate` 由路由层
     直接丢弃（不入参本函数），`cart_items.discountRate` 保持原值不动（历史快照，不覆盖不清空）。
     目标 (userId, assetId, customer) 已存在其它行时 400（避免静默合并产生歧义，前端可先删除原行）。"""
@@ -3548,8 +3573,9 @@ def patch_cart_item(db: Session, cart_id: int, customer: str, user_id: str = DEF
     is_discount_row = c.itemId is not None or (a is not None and not _is_amount_mode(a))
     # ADR-021（RSITEM-RANGE-20261020）：遥感明细行区间取该 rs_item 自身（不再取父产品容器区间）
     rs = db.get(models.RsItem, c.itemId) if c.itemId is not None else None
-    # ADR-037 §3（FORMS-20261022）：viewer 只校验下限（上限放开）；editor/admin 双向
-    enforce_max = not viewer
+    # ADR-049（2026-10-29）：购物车行金额**只校验参考区间下限**（上限放开，任何角色一致）
+    # ——原 ADR-037 §3 的「viewer 只下限 / editor-admin 双向」分角色口径作废
+    enforce_max = False
     # 行级金额（ADR-008 / ADR-018 §3）
     if amount is not UNSET:
         if amount is None:
@@ -3646,8 +3672,9 @@ def set_cart_qty(db: Session, cart_id: int, qty: int, user_id: str = DEFAULT_USE
                  viewer: bool = False) -> models.CartItem:
     """PUT /cart/{id}：改数量；可选携带合同金额（ADR-008）、服务期限（ADR-020）。
 
-    ADR-037 §3（FORMS-20261022）：`viewer`（生态人员）行金额只校验参考区间**下限**
-    （上限放开），与 checkout 权威链复用同一校验函数（`_check_discount_range`）。
+    ADR-049（2026-10-29）：行金额**只校验参考区间下限**（上限不限制，任何角色一致）；
+    `viewer` 参数保留仅为调用签名兼容，与 checkout 权威链复用同一校验函数
+    （`_check_discount_range`）。
     NO-DISCOUNT-20261022 / ADR-039：入参 `discountRate` **已下线**——路由层不读取、本函数
     无该入参；`cart_items.discountRate` 列保留且**保持原值不动**（历史快照，不清空不覆盖）。
 
@@ -3657,7 +3684,7 @@ def set_cart_qty(db: Session, cart_id: int, qty: int, user_id: str = DEFAULT_USE
 
     金额语义（ADR-018 §3，PRICING-20261020）：
     - unit / 遥感明细行：amount 传入即采信（过参考区间校验，超限 400）；显式 null = 清空（原价成交）；
-    - amount 模式行：整数元权威（不传保持原值）。
+    - amount 模式行：元（≤6 位小数）权威（不传保持原值）。
     折扣率语义（NO-DISCOUNT-20261022 / ADR-039）：**已下线**——入参 `discountRate` 容忍但忽略
     （不校验、不 400、不落库），`cart_items.discountRate` 保持原值不动。
     删除行仅走 DELETE /cart/{id}——PUT 语义不再兼作删除（qty<=0 直接 400，
@@ -3684,8 +3711,9 @@ def set_cart_qty(db: Session, cart_id: int, qty: int, user_id: str = DEFAULT_USE
     is_discount_row = c.itemId is not None or (a is not None and not _is_amount_mode(a))
     # ADR-021（RSITEM-RANGE-20261020）：遥感明细行区间取该 rs_item 自身（不再取父产品容器区间）
     rs = db.get(models.RsItem, c.itemId) if c.itemId is not None else None
-    # ADR-037 §3（FORMS-20261022）：viewer 只校验下限（上限放开）；editor/admin 双向
-    enforce_max = not viewer
+    # ADR-049（2026-10-29）：购物车行金额**只校验参考区间下限**（上限放开，任何角色一致）
+    # ——原 ADR-037 §3 的「viewer 只下限 / editor-admin 双向」分角色口径作废
+    enforce_max = False
     if amount is not UNSET:
         if amount is None:
             if is_discount_row:
@@ -3780,31 +3808,32 @@ def _order_core(
                     # ADR-021（RSITEM-RANGE-20261020）：区间取该 rs_item 自身（不再取父产品容器区间）
                     amt = _check_discount_range(a, 1, in_amount, unit=a.unit, rs=rs)
                     price = _derived_price(amt, 1)
-                    amount = amt.quantize(CENT)
+                    amount = amt.quantize(AMOUNT_QUANT)
                 else:
-                    # ADR-011：明细行金额权威 = 明细 price × 1（Decimal 重算，整数元天然成立）
+                    # ADR-011：明细行金额权威 = 明细 price × 1（Decimal 重算，≤6 位小数同样成立）
                     price = float(_dec(rs.price))
-                    amount = _dec(rs.price).quantize(CENT)
+                    amount = _dec(rs.price).quantize(AMOUNT_QUANT)
             elif _is_amount_mode(a):
-                # ADR-008：amount 权威（整数元校验），price 派生展示值
+                # ADR-008：amount 权威（> 0 且 ≤6 位小数），price 派生展示值
                 amount = _validate_amount_yuan(in_amount)
                 price = _derived_price(amount, qty)
             elif in_amount is not None:
                 # ADR-018 §3（PRICING-20261020）：unit 行折扣金额采信（过区间校验）
+                # 2026-10-29：in_amount 是**单价**，行总价 = 单价 × 数量
                 amt = _check_discount_range(a, qty, in_amount, unit=a.unit)
-                price = _derived_price(amt, qty)
-                amount = amt.quantize(CENT)
+                price = float(amt.quantize(AMOUNT_QUANT))  # 单价
+                amount = (amt * qty).quantize(AMOUNT_QUANT)  # 总价
             else:
                 # 契约 5：与项目创建路径完全一致，Decimal 精确到分（元口径，ADR-006）
                 price = a.salePrice or 0
-                amount = (_dec(price) * qty).quantize(CENT)
+                amount = (_dec(price) * qty).quantize(AMOUNT_QUANT)
             total += amount
             items.append(
                 schemas.ProjectItemInput(assetId=a.id, qty=qty, price=price, amount=float(amount),
                                          deliveryReq=data.deliveryReq, itemId=item_id)
             )
         contracts_in.append(schemas.ContractInput(
-            customer=data.customer, items=items, contractAmount=float(total.quantize(CENT)), remark="", 
+            customer=data.customer, items=items, contractAmount=float(total.quantize(AMOUNT_QUANT)), remark="", 
         ))
     project_input = schemas.ProjectInput(
         name=data.projectName,
@@ -3867,14 +3896,15 @@ def checkout(db: Session, data: schemas.CheckoutInput, user_id: str = DEFAULT_US
     不自动交付。customer 取分组键客户（同客户多产品=同项目多条记录）。
     ADR-012 修订（2026-10-19）：**所有角色**结算 → 项目/记录建 pending（待审核，锁定照常），
     商务接手后经审核（改价确认/驳回）生效。
-    ADR-022（REQUIRED-20261024）：逐行必填校验——客户非空 / 销售金额 > 0 整数元（所有行类型）；
+    ADR-022（REQUIRED-20261024）：逐行必填校验——客户非空 / 销售金额 > 0 且 ≤6 位小数（所有行类型，ADR-048）；
     缺项 400 一次报全（文案含行标识：产品名/遥感明细名）。
     取代 ADR-018 §3「留空=挂牌价成交」兜底（viewer 免填金额口径同步作废）；
     遥感明细行（itemId 非空）服务期限仍豁免（ADR-020：期数即服务时间）。
     ADR-047（OPTIONAL-SERVICEPERIOD-20261026）：普通产品行服务期限改为**选填**
     ——两端都空放行，只填一端仍按缺项 400（成对校验），两端都填时校验 start ≤ end。
-    ADR-037 §3（FORMS-20261022）：区间校验分角色——viewer（`viewer=True`）行金额
-    只校验参考区间下限（上限放开，加价成交允许）；editor/admin 双向不变。
+    ADR-049（2026-10-29，部分取代 ADR-037 §3）：结算金额**只校验参考区间下限**
+    （上限不限制，任何角色一致）；`viewer` 参数保留仅为调用签名兼容。
+    该口径同时透传 `_create_project_core(enforce_max=False)`，避免「购物车放行、结算 400」。
     NO-DISCOUNT-20261022 / ADR-039：折扣率已下线——购物车行的历史 `discountRate`
     **不读、不校验、不落库**（新 `project_items.discountRate` 恒 null，存量单历史值不动）。
     ADR-013：不再校验同主体（记录粒度=单资产，天然单主体；同客户多主体=多条记录并列）。
@@ -3897,7 +3927,7 @@ def checkout(db: Session, data: schemas.CheckoutInput, user_id: str = DEFAULT_US
     # ADR-022（REQUIRED-20261024）：逐行必填校验——收集全部缺项一次报全（400），
     # 文案含行标识（产品名 / 遥感明细名），便于前端逐行标红定位：
     # - 客户非空（现状保留）；
-    # - 销售金额 > 0 整数元（**所有行类型**：unit/amount/遥感明细行）——
+    # - 销售金额 > 0 且 ≤6 位小数（**所有行类型**：unit/amount/遥感明细行，ADR-048）——
     #   取代 ADR-018 §3「留空=原价成交」兜底（amount 为空回退 salePrice×qty 的分支已删除）；
     # - 普通产品行：serviceStart/serviceEnd **选填**（ADR-047）——两端都空放行，
     #   只填一端按成对缺失计入缺项，两端都填时校验格式与 start ≤ end（ADR-020 口径保留）；
@@ -3915,10 +3945,10 @@ def checkout(db: Session, data: schemas.CheckoutInput, user_id: str = DEFAULT_US
             label = f"{a.name}·{_rs_item_desc(rs)}"
         if not (c.customer or "").strip():
             missing.append(f"{label}：客户")
-        # 销售金额：所有行类型必填（ADR-022），> 0 整数元
+        # 销售金额：所有行类型必填（ADR-022 / ADR-048），> 0 且最多 6 位小数
         amt = _dec(c.amount) if c.amount is not None else None
-        if amt is None or amt <= 0 or amt != amt.to_integral_value():
-            missing.append(f"{label}：销售金额（整数元，大于 0）")
+        if amt is None or amt <= 0 or amt != amt.quantize(AMOUNT_QUANT):
+            missing.append(f"{label}：销售金额（元，最多 6 位小数，大于 0）")
         if c.itemId is None:
             # 普通产品行：服务期限**选填**（ADR-047，取代 ADR-022 §1 的「起止均必填」）；
             # 口径：两端都空 = 合法（不填期限）；只填一端 = 成对缺失，仍计入缺项；
@@ -3934,10 +3964,12 @@ def checkout(db: Session, data: schemas.CheckoutInput, user_id: str = DEFAULT_US
         raise HTTPException(400, "购物车存在必填缺项，请补齐后再结算：" + "；".join(missing))
     # 按 (产品, 客户) 分组（保持购物车行序）；七元组
     # (产品, 数量, 权威金额, itemId, 行级客户, serviceStart, serviceEnd)
-    # 明细行 qty 恒 1（ADR-011）；ADR-022 后 amount 恒非空且为合法整数元（上方必填校验保证）
-    # ADR-037 §3（FORMS-20261022）：区间校验分角色——viewer 只校验下限（上限放开），
-    # editor/admin 双向；角色取当前登录用户（路由层传 viewer），与改价入口同函数
-    enforce_max = not viewer
+    # 明细行 qty 恒 1（ADR-011）；ADR-022 后 amount 恒非空且为合法的 ≤6 位小数金额（上方必填校验保证）
+    # ADR-049（2026-10-29）：购物车结算金额**只校验参考区间下限**（上限放开，任何角色一致）；
+    # 原 ADR-037 §3 分角色口径（viewer 只下限 / editor-admin 双向）作废。
+    # ⚠️ 该值同时透传给 `_create_project_core`（结算会经 `_normalize_contracts` 再校验一次），
+    # 两处必须一致，否则「购物车放行、结算 400」。
+    enforce_max = False
     # ADR-018 §3（PRICING-20261020）：unit/遥感行金额 checkout 时再过一次区间校验
     #（行更新时已校验，此处防绕过行更新接口直接改库/旧客户端）
     # NO-DISCOUNT-20261022 / ADR-039：**不再带 discountRate**（购物车列的历史值也不再透传；
@@ -3959,7 +3991,7 @@ def checkout(db: Session, data: schemas.CheckoutInput, user_id: str = DEFAULT_US
                 (a, 1, amt, c.itemId, customer, c.serviceStart, c.serviceEnd))
             continue
         if _is_amount_mode(a):
-            amt = _validate_amount_yuan(c.amount)  # 整数元校验（必填校验已过，幂等兜底）
+            amt = _validate_amount_yuan(c.amount)  # 精度校验（必填校验已过，幂等兜底）
         else:
             # ADR-018 §3：unit 行折扣金额采信（过区间校验）
             amt = _check_discount_range(a, c.qty, c.amount, unit=a.unit,
@@ -3973,10 +4005,22 @@ def checkout(db: Session, data: schemas.CheckoutInput, user_id: str = DEFAULT_US
         items: list[schemas.ProjectItemInput] = []
         total = Decimal("0")
         for a, qty, amt, item_id, _cust, s_start, s_end in rows:
-            # ADR-022（REQUIRED-20261024）：amt 经上方必填校验恒非空（> 0 整数元）——
+            # ADR-022（REQUIRED-20261024）：amt 经上方必填校验恒非空（> 0 且 ≤6 位小数，ADR-048）——
             # 「留空=原价成交」兜底已删除（unit 行 salePrice×qty / 遥感行明细 price 分支作废）
-            price = _derived_price(amt, qty)  # 派生展示值（遥感明细行 qty 恒 1）
-            amount = amt.quantize(CENT)  # 元口径，Decimal 精确到分
+            # 2026-10-29 语义修正：unit 模式 cart_items.amount = **单价**（非总价）——
+            # 合同行金额 = 单价 × 数量；amount 模式（卫星 Token）amount = 总价（ADR-008）
+            if item_id is not None:
+                # 遥感明细行（qty 恒 1）：单价 = 总价 = amt
+                price = float(amt.quantize(AMOUNT_QUANT))
+                amount = amt.quantize(AMOUNT_QUANT)
+            elif _is_amount_mode(a):
+                # amount 模式：amt 是合同总价（元），price 派生展示
+                price = float((amt / qty).quantize(AMOUNT_QUANT))
+                amount = amt.quantize(AMOUNT_QUANT)
+            else:
+                # unit 模式：amt 是单价（元/{unit}），行总价 = 单价 × 数量
+                price = float(amt.quantize(AMOUNT_QUANT))
+                amount = (amt * qty).quantize(AMOUNT_QUANT)
             total += amount
             items.append(schemas.ProjectItemInput(
                 assetId=a.id, qty=qty, price=price, amount=float(amount),
@@ -3985,7 +4029,7 @@ def checkout(db: Session, data: schemas.CheckoutInput, user_id: str = DEFAULT_US
                 # NO-DISCOUNT-20261022 / ADR-039：不传 discountRate（_create_project_core 写 null）
             ))
         contracts_in.append(schemas.ContractInput(
-            customer=_customer, items=items, contractAmount=float(total.quantize(CENT)), remark="",
+            customer=_customer, items=items, contractAmount=float(total.quantize(AMOUNT_QUANT)), remark="",
         ))
     project_input = schemas.ProjectInput(
         name=data.projectName or f"销售项目-{today()}",

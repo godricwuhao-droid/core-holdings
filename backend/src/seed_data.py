@@ -33,7 +33,7 @@ ASSETS = [
      "spec": "数据采集全链路管理平台", "remark": "", "updatedAt": "2026-09-01"},
 
     # ================= 卫星 Token =================
-    # ADR-008：卫星 Token 为包量计价（pricingMode='amount'，合同金额整数元权威；salePrice 仅参考值）
+    # ADR-008：卫星 Token 为包量计价（pricingMode='amount'，合同金额元（最多 6 位小数）权威；salePrice 仅参考值）
     # BUG-34（FIX-20261022）：单位统一为「个」（ADR-025；当前库 `unit like '%颗%'` 已为 0 条，
     # 此处修正只影响**空库重建**，不迁移存量库）。
     # 数量口径自洽：非 repeatSale 且 soldCount=1 ⇒ 必须有对应已交付口径（shippedQty=1，
@@ -197,7 +197,7 @@ CATEGORY_UNITS = [
     {"board": "embodied", "type": "机器人", "unit": "套 / 台", "note": "整机交付，可选序列号交付"},
     {"board": "embodied", "type": "数采设备", "unit": "套", "note": "数采软件及设备接入"},
     {"board": "embodied", "type": "平台软件", "unit": "套", "note": "管理平台类"},
-    {"board": "satellite", "type": "卫星Token", "unit": "个", "note": "按 Token 额度与有效期售卖（包量计价，合同金额整数元权威，ADR-008）"},
+    {"board": "satellite", "type": "卫星Token", "unit": "个", "note": "按 Token 额度与有效期售卖（包量计价，合同金额元（最多 6 位小数）权威，ADR-008）"},
     {"board": "satellite", "type": "卫星数据", "unit": "轨 / 期 / 条", "note": "默认可重复售卖，不扣减数量"},
     {"board": "satellite", "type": "遥感数据", "unit": "份（区域·精度·日期）", "note": "按 省/精度/日期 三维唯一售卖（ADR-010）"},
     {"board": "software", "type": "软件", "unit": "套", "note": "永久 / 年限 / 并发 / 账号授权"},

@@ -619,7 +619,7 @@ def set_cart_qty(cart_id: int, data: schemas.CartQtyUpdate, db: Session = Depend
                  user: models.User = Depends(security.require_order)):
     """改数量（`qty` 必传）+ 可选金额/服务期限（BUG-20：裸 dict → Pydantic，非法入参 422）。
 
-    - ADR-008/ADR-018 §3：可选携带 amount（unit/遥感行=销售金额过区间校验；amount 行=整数元权威）；
+    - ADR-008/ADR-018 §3：可选携带 amount（unit/遥感行=销售金额过区间校验；amount 行=元（最多 6 位小数）权威）；
     - ADR-020：可选携带 serviceStart/serviceEnd（服务期限）；
     - NO-DISCOUNT-20261022 / ADR-039：`discountRate` **已下线**——入参容忍但忽略
       （不读取、不校验、不落库，不会因 0/1.5/999 返回 400）；`cart_items.discountRate`
@@ -686,7 +686,7 @@ def checkout(data: schemas.CheckoutInput, db: Session = Depends(get_db),
     """购物车结算：按产品分组 → 每个产品一条销售记录（ADR-013）。
     【核心业务规则 ADR-012 修订 2026-10-19】所有角色结算统一建 **pending（待审核）**
     （数量锁定照常）→ 商务接手审核（改价确认/驳回）后生效。
-    ADR-022（REQUIRED-20261024）：逐行必填校验（客户/销售金额>0整数元），
+    ADR-022（REQUIRED-20261024）：逐行必填校验（客户/销售金额>0元（最多 6 位小数）），
     缺项 400 一次报全（文案含行标识）；「留空=挂牌价」兜底与 viewer 金额免填口径已作废。
     ADR-047（OPTIONAL-SERVICEPERIOD-20261026）：普通行服务期限改**选填**——两端都空放行、
     只填一端仍 400（成对校验）、两端都填时校验 start ≤ end。

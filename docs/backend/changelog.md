@@ -1626,3 +1626,63 @@ repeatSale 明细短路，交付/终止都不再触碰它）。此时 `available
 > 安全措施：执行前用 **SQLite 在线备份 API** 备份到 `backend/core_holdings.db.bak.20261027-094358-price-up-1pct`（服务在线运行，未用 `cp`）；单事务 UPDATE + 事务内回读校验（19 行逐行比对预览值），异常即回滚；`priceMin > priceMax` 前置拦截（本次无命中）。
 > 校验结果：`min <= max` 全部合法（无违规行）；`priceMin == salePrice` 全部成立；`logs` 719 → 738（+19），样例 `智元机器人-G1 / 调整价格 / 销售单价 3006700.0 → 3036767.00；区间最低价 3006700.0 → 3036767.00（统一上调 1%）`。
 > 前端需知：产品列表/表单/购物车读 bootstrap 实时值，**刷新页面即生效**；无需重启服务（未改代码、未构建、未 commit）。回滚方式：用上述备份文件覆盖 `core_holdings.db`。
+
+## 2026-10-27 ｜ 新增：每日数据备份脚本 + cron 定时任务（BACKUP-DAILY-20261027）
+
+**关联任务**：BACKUP-DAILY-20261027。数据只有三处：SQLite 库 + `uploads/` 附件 + `.jwt_secret`，合计约 11.5 MB，采用「每天全量、保留 30 天」策略。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-27 | 新增 | 备份脚本 `backend/scripts/backup.sh`：① `core_holdings.db` 走 SQLite 在线备份 API（服务不停机、不产生半写文件）；② `uploads/` 打 tar.gz（83 个文件 / 10 MB）；③ `.jwt_secret`；④ `manifest.txt`（md5 + 行数 + 恢复步骤） | `backend/scripts/backup.sh` | BACKUP-DAILY-20261027 | 目标 `/backup/core-holdings/<YYYYMMDD-HHMMSS>/`，`KEEP_DAYS=30` 自动清理，`BACKUP_ROOT` / `KEEP_DAYS` 可用环境变量覆盖 |
+| 2026-10-27 | 新增 | 校验链（任一失败即回滚清理，非零退出）：`pragma integrity_check`、表集合与源库一致（18 张）、12 张关键表行数逐表比对、**附件引用完整性**（`file_meta.storedName` + `assets.contractFile/featureDoc` + `asset_deliverables.file` 去重后必须在 tar 内）、搬运后 **md5 逐个比对** | 同上 | BACKUP-DAILY-20261027 | 当前实测：DB 引用 67 个附件 0 缺失；uploads 另有 16 个未被引用的孤儿文件（全量带上） |
+| 2026-10-27 | 新增 | cron 定时任务（`crontab -l`）：`0 2 * * * /data/core-holdings/backend/scripts/backup.sh >> /var/log/core-holdings-backup.log 2>&1`，每日 02:00 执行 | 系统 crontab（root） | BACKUP-DAILY-20261027 | 日志写**本地** `/var/log/core-holdings-backup.log`（不写 NFS，避免掉线时卡住）；已用 `env -i` 模拟 cron 极简环境验证通过 |
+
+### 踩坑记录（NFS 目标盘）
+
+目标 `/backup` 是 NFS4 挂载（`192.168.180.50:/kubernetes`，`hard`、`local_lock=none`），有三个必须规避的行为：
+
+1. **SQLite 不能直接建库在 NFS 上**：`sqlite3.connect('/backup/.../core_holdings.db')` 直接报 `unable to open database file`（POSIX 锁语义不兼容）。
+   → 解法：**先在本地 `/tmp` 工作区生成 + 校验，再整目录 `cp -a` 到 NFS**，搬运后比对 md5。
+2. **NFS 会瞬时 `Remote I/O error`**：首次执行时 db/tar 写入看似成功，随后读取即报错（服务端 ping 通、`df` 也正常）。
+   → 解法：写入-回读**探测文件** + 全链路 `timeout`（`IO_TIMEOUT=300`）+ 事后 md5 校验；任一步失败即清理半成品并退出非零。
+3. **刚写入后 `stat`/`du` 返回 0 或 512 字节**（属性缓存未刷新），日志里的体积会显示成 `1.0K` / `512`。
+   → 解法：日志体积取自**本地工作区**字节汇总，不用 NFS 上的 `du`。
+
+### 恢复步骤（务必先停服务）
+
+1. 停掉 uvicorn（8000）
+2. `cp /backup/core-holdings/<时间戳>/core_holdings.db  backend/core_holdings.db`
+3. `tar -xzf /backup/core-holdings/<时间戳>/uploads.tar.gz -C /data/core-holdings/backend`（还原 `uploads/` 全量）
+4. `cp .jwt_secret` 并 `chmod 600`（不恢复则已登录会话全部失效，用户需重新登录）
+5. 启动服务，前端刷新（数据来自 `/api/bootstrap`）
+
+> 手工执行：`/data/core-holdings/backend/scripts/backup.sh`（默认目标 `/backup/core-holdings`）；改了别的目录：`BACKUP_ROOT=/xxx ./backup.sh`。
+> 已验证：完整跑通 4 次（本地目录 1 次、NFS 2 次、`env -i` 模拟 cron 1 次），均 `EXIT=0` 且四项校验全通过。未构建、未部署、未 commit。
+
+## 2026-10-29 ｜ 金额精度放开到最多 6 位小数（ADR-048，全量页面与销售明细价格）
+
+**关联任务**：ADR-048（用户反馈「购物车下单手动填入金额不支持输入小数点」→ 业务拍板全量放开多位小数）。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-29 | 新增 | `docs/adr/ADR-048.md`：金额精度 = 最多 6 位小数（1e-6 元），展示「最少两位、最多六位、尾随 0 截到两位」；部分取代 ADR-008/ADR-022 的「整数元」条款，业务规则（必填/区间/分组/锁定）不变 | `docs/adr/ADR-048.md`、`docs/architecture.md` | ADR-048 | 无 DB 迁移（金额列本就是 Float） |
+| 2026-10-29 | 修改 | 后端金额精度统一：新增 `AMOUNT_QUANT = Decimal("0.000001")`，全部金额 `quantize(CENT)` 改为 `quantize(AMOUNT_QUANT)`（行金额/合同金额/项目金额/流水/原价快照/审核改价/交付补录），保证 Σ明细 = 合同金额 | `backend/src/services.py` | ADR-048 | 取消「强制到分」后，3~6 位小数不再被静默舍入；`CENT` 保留为历史常量 |
+| 2026-10-29 | 修改 | 校验放宽：`_validate_amount_yuan`（>0 且 ≤6 位小数）、`_check_discount_range`（非负且 ≤6 位小数）、checkout 缺项校验同口径；`_rs_item_fields` 遥感明细单价由「整数元」改为「>0 且 ≤6 位小数」；`_derived_price`/`_fmt_money` 同精度 | `backend/src/services.py` | ADR-048 | 7 位及以上直连接口仍 400（Float 落地失真） |
+| 2026-10-29 | 修改 | 前端公共金额函数：`formatMoney`/`formatYuan`/`derivedUnitPrice` 改为「千分位 + 最少两位 / 最多六位 / 尾随 0 截断」（去掉 Intl 的 2 位四舍五入）；新增 `roundAmount`、`amountInputFormatter`/`amountInputParser`、`sanitizeAmountInput`、`isAmountTextValid`、`isAmountPrecisionValid` | `frontend/src/types.ts` | ADR-048 | 30+ 处 `formatMoney` 调用点自动生效 |
+| 2026-10-29 | 修改 | 各页面金额/单价输入放开到 6 位小数（inputs 用 formatter/parser，去掉 `:precision="0"/"2"`）：购物车行金额、结算弹窗合计（去 `Math.round`）、销售建单单价与包量金额、审核改价单价/金额（原步进 1000 一并去掉）、产品登记销售单价与参考区间（区间自动同步改 `roundAmount`）、遥感明细单价与区间、交付补录金额；行合计统一 `roundAmount` 规整 | `frontend/src/views/cart/index.vue`、`components/SalesOrderDialog.vue`、`views/sales/projects/create.vue`、`views/sales/projects/review.vue`、`views/sales/outbound/index.vue`、`views/assets/create.vue`、`views/assets/detail.vue`、`components/RsItemPicker.vue` | ADR-048 | 文案「整数元」全量改为「元（最多 6 位小数）」；数量类输入（`:precision="0"`）不受影响 |
+
+> 验证（副本库 `/tmp` 副本 + 服务层直调，不触碰生产库）：`100.123456 / 1234.5 / 0.000001 / 0.5` 加购→改价→结算→审核改价→交付全链路往返一致；`1.1234567 / 0.0000001` 均 400；合同金额、项目 `expectedAmount`、行金额三者相等；`python3 -m py_compile` 与前端 `read_lints` 通过。
+> 未构建、未部署、未 commit。
+
+## 2026-10-29 ｜ 参考区间只约束下单下限、审核改价不受区间限制（ADR-049）
+
+**关联任务**：ADR-049（用户反馈「购物车订单输入允许超过最高区间，商务审核填入金额不限制区间范围」）。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-10-29 | 新增 | `docs/adr/ADR-049.md`：参考区间只约束**下限**；购物车/结算任何角色金额可高于区间上限；审核改价不受区间限制；商务手工建单保留双向校验（部分取代 ADR-037 §3） | `docs/adr/ADR-049.md`、`docs/architecture.md` | ADR-049 | 无数据结构变更 |
+| 2026-10-29 | 修改 | 购物车链路 `enforce_max` 统一为 `False`：`_cart_add_inner` 显式传 `False`；`patch_cart_item` / `set_cart_qty` / `checkout` 的 `enforce_max = not viewer` → `False`（`viewer` 参数保留仅兼容签名）；结算透传 `_create_project_core(enforce_max=False)`，避免「购物车放行、结算 400」 | `backend/src/services.py` | ADR-049 | 低于下限仍 400 原文案 |
+| 2026-10-29 | 修改 | 审核改价补精度兜底：`items[].price` 增加「≤6 位小数」校验（ADR-048 口径），并明确该入口**不调用**区间校验函数、不回写挂牌价 | `backend/src/services.py` | ADR-048/049 | 审核改价仍只受「>0 + 精度」约束 |
+
+> 验证（副本库）：区间 `[3,036,767, 3,066,834]` 下金额 3,680,200.80（超上限 20%）PATCH/PUT/checkout 全部通过且金额一致；2,429,413.60（低于下限）400；审核改价 9,200,502（3 倍上限）通过、7 位小数 400。`py_compile` + `vue-tsc` 通过，临时脚本已清理。
+> 未构建、未 commit；后端 `--reload` 已热加载。

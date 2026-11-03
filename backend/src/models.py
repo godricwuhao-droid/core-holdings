@@ -35,7 +35,7 @@ class Asset(Base):
     priceMax: Mapped[float | None] = mapped_column(Float, nullable=True)
     soldAmount: Mapped[float] = mapped_column(Float, default=0)  # 元
     soldCount: Mapped[int] = mapped_column(Integer, default=0)
-    # 计价模式（ADR-008）：'unit'（默认，单价×数量）| 'amount'（包量金额整数元权威）。
+    # 计价模式（ADR-008）：'unit'（默认，单价×数量）| 'amount'（包量金额权威，元、最多 6 位小数）。
     # 卫星 Token 类型登记时置 'amount'（salePrice 仅作参考值，不参与金额计算）。
     pricingMode: Mapped[str] = mapped_column(String(16), default="unit")
     # 遥感数据三维字段（ADR-010，⚠️ 已废弃 ADR-011）：列保留不删（技术债），
@@ -448,7 +448,7 @@ class CartItem(Base):
 class RsItem(Base):
     """遥感数据可售明细（ADR-011）：父产品（assets 行，容器）下的真正售卖单位。
 
-    维度 = 省（可含市）× 精度（米）× 月份（YYYY-MM），每份一个单价（整数元/份），
+    维度 = 省（可含市）× 精度（米）× 月份（YYYY-MM），每份一个单价（元/份，最多 6 位小数），
     默认**单次售卖**（ADR-038：一期通常只卖一次；需要重复售卖的可逐条打开）。
     唯一性 (assetId, province, city, resolution, saleMonth)
     双防线：服务层判重（Python 层，含浮点容差）+ DB 唯一索引（uq_rs_items_dim，
@@ -467,7 +467,8 @@ class RsItem(Base):
     city: Mapped[str] = mapped_column(String(64), default="")  # 市，可空（默认 ''）
     resolution: Mapped[float] = mapped_column(Float, default=0)  # 精度，单位米（如 1.5）
     saleMonth: Mapped[str] = mapped_column(String(7), default="")  # 售卖月份 YYYY-MM
-    price: Mapped[float] = mapped_column(Float, default=0)  # 单价，整数元/份（元口径，ADR-006）
+    # 单价（元/份，最多 6 位小数，ADR-048）；元口径 ADR-006
+    price: Mapped[float] = mapped_column(Float, default=0)
     # 参考区间（ADR-021，RSITEM-RANGE-20261020）：元/份，可空=不限制（同 ADR-018 产品区间口径）；
     # 生态下单遥感行折扣金额校验改用本明细自身区间（不再取父产品容器区间）
     priceMin: Mapped[float | None] = mapped_column(Float, nullable=True)

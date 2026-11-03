@@ -26,6 +26,8 @@ import {
   Setting,
 } from '@element-plus/icons-vue'
 import {
+  amountInputFormatter,
+  amountInputParser,
   availableQty,
   boardLabel,
   derivedUnitPrice,
@@ -33,9 +35,13 @@ import {
   formatAssetQty,
   formatMoney,
   formatTokens,
+  formatYuan,
   isAmountMode,
+  isAmountPrecisionValid,
   PROJECT_STATUS,
+  roundAmount,
   rsItemName,
+  sanitizeAmountInput,
   tagInfo,
   // formatWan 已由 formatAssetQty 覆盖（ADR-008 数量口径统一）
   type Asset,
@@ -93,6 +99,8 @@ interface ContractDraftItem {
   qty: number
   price: number
   amount: number
+  /** ADR-048：包量定价行金额输入草稿（保留「12.」中间态），失焦后清空、显示回落 amount 格式化值 */
+  amountText?: string
   deliveryReq: string
   // 服务期限（ADR-020，PRICING-20261020）：YYYY-MM-DD，普通行填写；遥感行不展示（期数即服务时间）
   serviceStart: string
@@ -154,34 +162,43 @@ function itemMax(it: ContractDraftItem): number | undefined {
 }
 
 /**
- * 明细金额计算（ADR-008 双模式）：
- *  - unit 模式：销售金额 = 数量 × 单价（元值，保留 2 位小数），空/非法按 0
- *  - amount 模式（包量定价）：合同金额（整数元）为权威输入，单价派生 = 金额 ÷ 数量（元/份，6 位小数，ADR-017）
+ * 明细金额计算（ADR-008 双模式 / ADR-048 精度 = 6 位小数）：
+ *  - unit 模式：销售金额 = 数量 × 单价（元值，按 1e-6 规整），空/非法按 0
+ *  - amount 模式（包量定价）：合同金额（元，最多 6 位小数）为权威输入，
+ *    单价派生 = 金额 ÷ 数量（元/份，6 位小数，ADR-017）
  */
 function calcItemAmount(c: ContractDraft, it: ContractDraftItem) {
   const a = itemAsset(it)
   if (a && isAmountMode(a)) {
-    it.price = it.qty && it.amount ? Math.round((it.amount / it.qty) * 1e6) / 1e6 : 0
+    it.price = it.qty && it.amount ? roundAmount(it.amount / it.qty) : 0
   } else {
-    it.amount = Math.round((it.qty || 0) * (it.price || 0) * 100) / 100
+    it.amount = roundAmount((it.qty || 0) * (it.price || 0))
   }
   recalcContractAmount(c)
 }
 
-/** ADR-008：包量定价行合同金额输入——仅保留整数位（元口径） */
+/** ADR-008/ADR-048：包量定价行合同金额输入——允许最多 6 位小数；
+ *  草稿字符串保留「12.」中间态（否则输入小数点会被数字回写吞掉），合法值同步到 it.amount */
 function onItemAmountInput(it: ContractDraftItem, v: string) {
-  const digits = (v ?? '').replace(/[^\d]/g, '')
-  it.amount = digits === '' ? 0 : Number(digits)
+  const text = sanitizeAmountInput(v)
+  it.amountText = text
+  it.amount = text === '' || text === '.' ? 0 : Number(text)
 }
 
-/** 合同金额 = 该合同明细金额合计（元），实时重算（2026-10-20 问题12d：只读展示，无手改；
+/** ADR-048：失焦清草稿并重算（显示回落到 it.amount 的「最少两位」格式化值） */
+function onItemAmountChange(c: ContractDraft, it: ContractDraftItem) {
+  it.amountText = undefined
+  calcItemAmount(c, it)
+}
+
+/** 合同金额 = 该合同明细金额合计（元，按 1e-6 规整），实时重算（2026-10-20 问题12d：只读展示，无手改；
  *  后端审核确认时同样按 Σ 明细重算，口径一致） */
 function recalcContractAmount(c: ContractDraft) {
-  c.contractAmount = Math.round(c.items.reduce((s, it) => s + (it.amount || 0), 0) * 100) / 100
+  c.contractAmount = roundAmount(c.items.reduce((s, it) => s + (it.amount || 0), 0))
 }
 
 function contractItemsTotal(c: ContractDraft): number {
-  return Math.round(c.items.reduce((s, it) => s + (it.amount || 0), 0) * 100) / 100
+  return roundAmount(c.items.reduce((s, it) => s + (it.amount || 0), 0))
 }
 
 /**
@@ -447,10 +464,10 @@ function validateContracts(): boolean {
         ElMessage.warning('遥感数据明细行数量固定为 1')
         return false
       }
-      // ADR-008：包量定价行合同金额必须为正整数元
+      // ADR-008/ADR-048：包量定价行合同金额必须 > 0 且最多 6 位小数
       const a = itemAsset(it)
-      if (a && isAmountMode(a) && (!it.amount || !Number.isInteger(it.amount) || it.amount <= 0)) {
-        ElMessage.warning('销售金额须为整数元')
+      if (a && isAmountMode(a) && (!it.amount || it.amount <= 0 || !isAmountPrecisionValid(it.amount))) {
+        ElMessage.warning('销售金额须大于 0，且最多 6 位小数')
         return false
       }
       // ADR-020（PRICING-20261020）：服务期限 start ≤ end（后端同口径 400，前端先拦）
@@ -668,7 +685,7 @@ function handleCancel() {
             {{
               isEdit
                 ? '仅可修改项目基本信息；销售记录与明细在创建后不可修改。'
-                : '每客户一份销售记录，销售记录内选择待售产品，销售金额按 数量 × 单价 自动计算；包量定价（Token）产品以销售金额（整数元）为准。'
+                : '每客户一份销售记录，销售记录内选择待售产品，销售金额按 数量 × 单价 自动计算；包量定价（Token）产品以销售金额（元，最多 6 位小数）为准。'
             }}
           </div>
         </div>
@@ -900,12 +917,13 @@ function handleCancel() {
               <div class="cf-item">
                 <span class="cf-label">销售金额（元）</span>
                 <!-- 2026-10-20（问题12d）：合同金额只读 = Σ 明细金额实时值——
-                     原手改值在审核确认时会被后端按 Σ 明细重算静默丢弃，删除手改入口 -->
+                     原手改值在审核确认时会被后端按 Σ 明细重算静默丢弃，删除手改入口
+                     ADR-048：展示走 formatter（最少两位/最多六位），不再用 :precision 补零 -->
                 <el-input-number
                   :model-value="c.contractAmount"
                   :min="0"
-                  :precision="2"
                   :controls="false"
+                  :formatter="amountInputFormatter"
                   disabled
                   style="width: 180px;"
                 />
@@ -976,12 +994,15 @@ function handleCancel() {
                       {{ derivedUnitPrice(row.amount, row.qty, itemAsset(row)?.unit) }}
                     </span>
                     <!-- FIX-20261022 / BUG-44（§6 硬约束）：金额类 el-input-number 一律 :controls="false"（无步进按钮） -->
+                    <!-- ADR-048：单价支持最多 6 位小数——不用 :precision（会强行补零/舍入），
+                         改用 formatter（失焦展示「最少两位」）+ parser（聚焦原文、截断到 6 位） -->
                     <el-input-number
                       v-else
                       v-model="row.price"
                       :min="0"
-                      :precision="2"
                       :controls="false"
+                      :formatter="amountInputFormatter"
+                      :parser="amountInputParser"
                       style="width: 100%;"
                       @change="calcItemAmount(c, row)"
                     />
@@ -989,14 +1010,15 @@ function handleCancel() {
                 </el-table-column>
                 <el-table-column label="金额" width="190" align="right">
                   <template #default="{ row }">
-                    <!-- ADR-008：包量定价行销售金额（整数元）为权威输入；unit 模式保持只读自动计算 -->
+                    <!-- ADR-008/ADR-048：包量定价行销售金额（元，最多 6 位小数）为权威输入；
+                         草稿字符串保留中间态，unit 模式保持只读自动计算 -->
                     <el-input
                       v-if="itemAsset(row) && isAmountMode(itemAsset(row)!)"
-                      :model-value="row.amount || ''"
-                      placeholder="整数元"
+                      :model-value="row.amountText ?? (row.amount ? formatYuan(row.amount) : '')"
+                      placeholder="最多 6 位小数"
                       size="small"
                       @input="onItemAmountInput(row, $event)"
-                      @change="calcItemAmount(c, row)"
+                      @change="onItemAmountChange(c, row)"
                     />
                     <span v-else class="item-amount">{{ formatMoney(row.amount) }}</span>
                     <!-- ADR-018 §2（PRICING-20261020）：原价快照——仅重新提交预填（旧单有 orig）时展示；

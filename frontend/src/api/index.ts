@@ -277,7 +277,7 @@ export interface RsItemInput {
   city?: string // 选填，默认 ""
   resolution: number // 米
   saleMonth: string // YYYY-MM
-  price: number // 整数元/份
+  price: number // 元/份，最多 6 位小数（ADR-048）
   // 参考价格区间（ADR-021，RSITEM-RANGE-20261020）：元/份，选填（可单边）；未设为 null
   priceMin?: number | null
   priceMax?: number | null
@@ -629,7 +629,7 @@ export async function changeProjectStatus(
 /**
  * 订单审核（ADR-012，仅商务/管理员；生态人员 403）：
  * - confirm = 确认下单（items 可带行级改价：unit 行传 price 实际单价、amount/遥感行传 amount 实际合同金额，
- *   整数元；ADR-018 §4：改价只写 ProjectItem，**不再回写平台挂牌价**；
+ *   元，最多 6 位小数（ADR-048）；ADR-018 §4：改价只写 ProjectItem，**不再回写平台挂牌价**；
  *   ADR-020 PRICING-20261020：行级可改服务期限 serviceStart/serviceEnd，不传 = 保持原值）；
  * - reject = 驳回（reason 必填，释放锁定、项目终止并留痕）。
  */
@@ -902,15 +902,17 @@ export async function addCartBatch(
   return data
 }
 
-/** CART-PERF-20261021（2026-10-21）：行级写改本地打补丁——成功后用响应 CartItemOut 替换本地行，不再全量刷新 */
-export async function setCartQty(id: number, qty: number): Promise<void> {
-  const { data } = await http.put(`/cart/${id}`, { qty })
+/** CART-PERF-20261021（2026-10-21）：行级写改本地打补丁——成功后用响应 CartItemOut 替换本地行，不再全量刷新
+ *  2026-10-29：改数量时同时携带当前金额（后端有 amount 时保留不清空），避免「先填金额再改数量 → 金额丢失」 */
+export async function setCartQty(id: number, qty: number, amount?: number | null): Promise<void> {
+  const { data } = await http.put(`/cart/${id}`, { qty, amount: amount ?? null })
   await patchCartRow(id, data)
 }
 
 /**
- * 修改购物车行销售金额（ADR-008/ADR-018 §3，PRICING-20261020）：整数元。
- * - amount 模式行：权威输入，后端校验 int > 0；
+ * 修改购物车行销售金额（ADR-008/ADR-018 §3，PRICING-20261020）：元，最多 6 位小数
+ * （2026-10-29 ADR-048 精度放宽，原仅整数元）。
+ * - amount 模式行：权威输入，后端校验 > 0 且最多 6 位小数；
  * - unit/遥感明细行：行内成交金额，过产品参考区间校验（超区间 400，文案由后端给出）。
  * ⚠️ 必须同时回传该行当前 qty（后端 PUT 对 qty<=0 直接 400，且区间校验按新 qty 重算）。
  * ADR-039（NO-DISCOUNT-20261022）：购物车换算率功能下线——入参不再带 discountRate

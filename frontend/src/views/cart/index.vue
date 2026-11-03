@@ -12,9 +12,8 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Delete, InfoFilled, ShoppingCart, WarningFilled } from '@element-plus/icons-vue'
-import { availableQty, displayUnitPrice, entityShort, formatMoney, formatTokens, isAmountMode, priceRangeText, rsItemName, type Asset, type CartItem, type RsItem } from '@/types'
+import { availableQty, displayUnitPrice, entityShort, formatMoney, formatTokens, isAmountMode, isAmountTextValid, priceRangeText, roundAmount, rsItemName, sanitizeAmountInput, type Asset, type CartItem, type RsItem } from '@/types'
 import { checkoutCart, clearCart, db, genRequestId, getAsset, patchCartItem, refresh, removeCartItem, rsItemById, setCartAmount, setCartQty, setCartService, showError, type OrderFields } from '@/api'
-import { isViewer } from '@/auth'
 import SalesOrderDialog from '@/components/SalesOrderDialog.vue'
 import type { OrderItem } from '@/components/SalesOrderDialog.vue'
 
@@ -63,12 +62,15 @@ const cartRows = computed<CartRow[]>(() => {
       const asset = getAsset(c.assetId)
       const rsItem = c.itemId != null ? rsItemById(c.itemId) : undefined
       const isAmount = !!asset && !rsItem && isAmountMode(asset)
-      // ADR-018 §3（PRICING-20261020）：行内销售金额（整数元）优先——
-      // amount 模式行 = 权威合同金额；unit/遥感明细行 = 行内成交金额；
-      // 未填 = 原价成交：遥感行 = 明细单价（qty 恒 1）、amount 行回退「挂牌价×数量」取整
-      //（与后端 checkout 回退口径一致，ADR-012）、unit 行 = 单价×数量
-      const amountFallback = Math.round((asset?.salePrice ?? 0) * c.qty)
-      const subtotal = c.amount ?? (rsItem ? rsItem.price : isAmount ? amountFallback : (asset?.salePrice ?? 0) * c.qty)
+      // ADR-018 §3 + 2026-10-29 语义修正：
+      // unit 模式 cart_items.amount = **单价**（元/单位），行总价 = 单价 × 数量；
+      // amount 模式（卫星 Token）amount = 合同总价（ADR-008）；
+      // 遥感明细行（rsItem）amount = 单价 = 总价（qty 恒 1）。
+      // 未填 = 原价成交：遥感行 = 明细单价、amount 行回退「挂牌价×数量」、unit 行 = 挂牌价×数量
+      const amountFallback = roundAmount((asset?.salePrice ?? 0) * c.qty)
+      const subtotal = c.amount != null
+        ? (rsItem || isAmount ? c.amount : roundAmount(c.amount * c.qty))
+        : (rsItem ? rsItem.price : isAmount ? amountFallback : (asset?.salePrice ?? 0) * c.qty)
       return {
         cart: c,
         asset,
@@ -94,7 +96,8 @@ const cartRows = computed<CartRow[]>(() => {
 })
 
 const totalQty = computed(() => db.cart.reduce((s, c) => s + c.qty, 0))
-const totalAmount = computed(() => cartRows.value.reduce((s, r) => s + r.subtotal, 0))
+// ADR-048：多位小数累加按 1e-6 规整，避免 JS 浮点尾巴导致前端合计与后端 Decimal 求和不等
+const totalAmount = computed(() => roundAmount(cartRows.value.reduce((s, r) => s + r.subtotal, 0)))
 
 // ==================== 行级客户（ADR-007/ADR-016：结算时按（产品, 客户）双键分组拆合同） ====================
 // 2026-10-24（ADR-022）：客户/金额必填口径——缺项标红改为值驱动；2026-10-26（ADR-047）服务期限改选填
@@ -149,19 +152,20 @@ function amountValue(row: CartRow): number | undefined {
   return t === '' ? undefined : Number(t)
 }
 
-/** 金额输入：仅保留整数位（元口径，禁止小数）——CART-PERF-20261021：只写草稿，不再碰 row.cart.amount
+/** 金额输入：允许最多 6 位小数（元口径，ADR-048）——只写草稿，不再碰 row.cart.amount。
+ *  过滤复用 `sanitizeAmountInput`（非数字/小数点丢弃、多余小数点丢弃、小数位截断到 6 位）。
  *  ADR-039（NO-DISCOUNT-20261022）：折扣快捷入口下线后，金额是唯一输入路径，
  *  原「手改金额 → 折扣镜像作废」的 amountManualDrafts 标记 / 清折扣草稿分支一并删除 */
 function onAmountInput(row: CartRow, v: string) {
-  const digits = (v ?? '').replace(/[^\d]/g, '')
-  amountDrafts[row.cart.id] = digits
+  amountDrafts[row.cart.id] = sanitizeAmountInput(v)
 }
 
-/** 2026-10-24（ADR-022）：金额缺项（空 / 0 / 非整数）→ 标红，与客户列同一「必填缺项」样式
+/** 金额缺项（空 / 0 / 格式非法 / 超 6 位小数）→ 标红，与客户列同一「必填缺项」样式
  *  CART-PERF-20261021：改读「草稿或已提交值」合并口径（amountValue），标红跟随输入草稿实时变化 */
 function amountInvalid(row: CartRow): boolean {
+  const t = amountDraft(row).trim()
   const n = amountValue(row)
-  return n === undefined || !Number.isInteger(n) || n <= 0
+  return t === '' || !isAmountTextValid(t) || n === undefined || !Number.isFinite(n) || n <= 0
 }
 
 /** 2026-10-26（ADR-047，OPTIONAL-SERVICEPERIOD-20261026）：服务期限改为**选填**，标红口径同步：
@@ -178,7 +182,7 @@ function serviceMissing(row: CartRow): boolean {
 }
 
 // 2026-10-25：金额输入框 tooltip 文案 amountTip() 随输入框 hover 提示删除（用户反馈「太碍事」）——
-// 必填/整数元口径见列头红星 + 顶部提示条，参考区间见金额下方提示行，无信息死角
+// 必填/两位小数口径见列头红星 + 顶部提示条，参考区间见金额下方提示行，无信息死角
 
 /** 行参考区间文案（ADR-021，RSITEM-RANGE-20261020）：
  *  遥感明细行（rsItem 非空）读该明细自身区间（不再取父产品容器区间）；普通行读产品区间；未设返回空串不显示 */
@@ -188,16 +192,19 @@ function rowRangeText(row: CartRow): string {
 
 /** 失焦/回车提交（ADR-018 §3，PRICING-20261020；2026-10-24 ADR-022 必填口径；
  *  CART-PERF-20261021 改读草稿）：
- *  - 所有行（unit/amount/遥感）：整数元 > 0 才提交；缺项（空/0/非整数）不提交，保留草稿，输入框值驱动标红
+ *  - 所有行（unit/amount/遥感）：最多 6 位小数的元值 > 0 才提交（ADR-048，原仅整数元）；
+ *    缺项（空/0/超 6 位小数）不提交，保留草稿，输入框值驱动标红
  *  - 合法草稿在 await 前的**同步段**即写入镜像并清草稿——点「结算下单」按钮会先触发本输入框 blur
  *    （浏览器行为：mousedown → blur/change 先于 click），openOrder 校验运行时镜像已是最新值，
  *    天然失焦链路成立，无需额外合并处理（amountInvalid 的草稿合并口径作双保险）
- *  - 超参考区间由后端 400（文案走 showError），400 时回滚到后端值并重置草稿
+ *  - 低于参考区间下限由后端 400（文案走 showError），400 时回滚到后端值并重置草稿；
+ *    ADR-049：高于区间上限不拦截（金额可超上限成交）
  *  ADR-039（NO-DISCOUNT-20261022）：折扣快捷入口下线——原「手改金额 → 折扣镜像作废 / 无手改则回传 rate」
  *  两分支整体删除，payload 只剩 qty + amount（金额是唯一权威，后端也不再读取折扣字段） */
 async function onAmountChange(row: CartRow) {
-  const n = amountValue(row)
-  if (n === undefined || !Number.isInteger(n) || n <= 0) return // 缺项不提交（标红由值驱动，草稿保留）
+  if (amountInvalid(row)) return // 缺项/非法不提交（标红由值驱动，草稿保留）
+  const n = roundAmount(amountValue(row) ?? 0) // 按 1e-6 规整：规避 JS 浮点尾巴（如 0.1+0.2）
+  if (n <= 0) return
   row.cart.amount = n
   // CART-PERF2-20261021（2026-10-21）：清草稿用 delete（而非置 ''）——'' 是合法草稿值（用户清空未失焦），
   // delete 后显示回退已提交值（镜像已写入 n）
@@ -218,7 +225,7 @@ async function onAmountChange(row: CartRow) {
 // 敲字只失效本行依赖，cartRows computed（:data）不重算，el-table 无整表重建（无固定列双渲染重建）。
 // 遍历 cartRows 的 previewGroups/orderItems 仅用于结算栏/弹窗，不在表格单元格渲染路径上。
 // ADR-039（NO-DISCOUNT-20261022）：本页原「行级快捷换算率」整段（草稿/校验/摘要/placeholder 预览/
-// 失焦回填）已全部删除，金额输入是唯一路径，placeholder 固定「必填，整数元」。
+// 失焦回填）已全部删除，金额输入是唯一路径，placeholder 固定「必填，最多 6 位小数」。
 
 // ==================== 行级服务期限（ADR-020，PRICING-20261020：普通产品行填写，遥感行不展示） ====================
 /** 服务期限变更：PUT /cart/{id} 提交（回传 qty）；start > end 前端先拦，其余校验（格式/顺序）由后端 400 兜底 */
@@ -260,7 +267,8 @@ const previewGroups = computed(() => {
       svcSets.set(i, new Set())
     }
     groups[i].qty += r.cart.qty
-    groups[i].amount += r.subtotal
+    // ADR-048：分组小计按 1e-6 规整累加（与后端 checkout 的 Decimal 求和同口径）
+    groups[i].amount = roundAmount(groups[i].amount + r.subtotal)
     // ADR-020（PRICING-20261020）：组内行服务期限一致时在预览行简短展示（不影响分组逻辑）
     if (r.cart.serviceStart || r.cart.serviceEnd) {
       svcSets.get(i)!.add(`${r.cart.serviceStart || '-'} ~ ${r.cart.serviceEnd || '-'}`)
@@ -346,7 +354,8 @@ async function onQtyChange(row: CartRow): Promise<boolean> {
     return false
   }
   try {
-    await setCartQty(row.cart.id, row.cart.qty)
+    // 2026-10-29：携带当前金额（后端有 amount 时保留不清空），解决「先填金额再改数量 → 金额丢失」
+    await setCartQty(row.cart.id, row.cart.qty, row.cart.amount)
     return true
   } catch (e) {
     showError(e, '数量更新失败')
@@ -427,8 +436,11 @@ async function applyQty(row: CartRow, next: number, clampMax = false) {
     // 前端必须显式提示重填；该行标红由 amountInvalid 值驱动（镜像 amount 已为 null → 输入框立即标红）
     // ADR-039（NO-DISCOUNT-20261022）：原「按旧换算率重算金额并回写」分支已删除——
     // 改数量后金额不自动重算（金额是权威，保持用户填的值；被后端清空则提示重填，绝不回填推算值）
+    // 2026-10-29 修复：草稿态（amountDrafts 有值但 row.cart.amount 仍 null）也需清草稿并提示，
+    // 否则页面金额框残留旧草稿但后端已无值，合计/结算不一致
     const fresh = db.cart.find((c) => c.id === row.cart.id)
-    if (prevAmount != null && fresh && fresh.amount == null) {
+    const hadValue = prevAmount != null || amountDrafts[row.cart.id] != null
+    if (hadValue && fresh && fresh.amount == null) {
       delete amountDrafts[row.cart.id]
       ElMessage.warning(`「${row.asset.name}」数量已变更，请重新填写销售金额`)
     }
@@ -492,7 +504,7 @@ const orderItems = computed<OrderItem[]>(() =>
 )
 
 /** 结算前置校验（2026-10-24 ADR-022 / 2026-10-26 ADR-047，与后端 checkout 400 同口径）：
- *  客户非空 / 金额整数元 > 0（所有行类型，含遥感行）为必填；普通行服务期限为**选填**
+ *  客户非空 / 金额最多 6 位小数且 > 0（所有行类型，含遥感行）为必填；普通行服务期限为**选填**
  *  ——两端都空放行，只填一端或 start > end 才拦（成对校验）；遥感明细行期限豁免（ADR-020）。
  *  有缺项不弹结算窗——提示点明缺项类别，
  *  缺项输入框本身已值驱动标红（amountInvalid / serviceMissing / 客户空值），用户可直接定位
@@ -511,7 +523,7 @@ function openOrder() {
   if (missingCount) {
     const parts: string[] = []
     if (missingCustomer.length) parts.push('客户')
-    if (missingAmount.length) parts.push('销售金额（整数元）')
+    if (missingAmount.length) parts.push('销售金额（元，最多 6 位小数）')
     if (missingService.length) parts.push('服务期限（开始/结束日期需成对填写，或都留空）')
     ElMessage.warning(`${missingCount} 行信息未填齐：请填写${parts.join('、')}`)
     return
@@ -594,8 +606,8 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
         <div>
           <b>下单前请完善关键信息</b>
           <!-- 2026-10-24（ADR-022）：必填口径——客户/销售金额必填；2026-10-26（ADR-047）服务期限改选填 -->
-          <!-- ADR-037（FORMS-20261022）：区间校验分角色——viewer 仅下限（上限放开，加价成交允许），editor/admin 双向 -->
-          <span>每件产品必填客户、销售金额（整数元 &gt; 0），服务期限为选填（填则开始/结束日期须成对且开始不晚于结束；遥感明细行按期数售卖，不填期限）；设参考区间时金额须{{ isViewer ? '不低于区间下限（上限不限）' : '落在区间内' }}；数量受产品可用数量约束（可重复售卖不受限）。下单后按「产品 + 客户」分组各生成一条销售记录，销售项目进入「待审核」并锁定数量，商务确认（可改价）后生效，再执行「交付」生成交付记录。</span>
+          <!-- ADR-049（2026-10-29）：参考区间只约束下限——金额可高于上限成交（任何角色一致） -->
+          <span>每件产品必填客户、销售金额（元，最多 6 位小数且 &gt; 0），服务期限为选填（填则开始/结束日期须成对且开始不晚于结束；遥感明细行按期数售卖，不填期限）；设参考区间时金额不得低于区间下限（<b>上限不限制，可高于上限成交</b>）；数量受产品可用数量约束（可重复售卖不受限）。下单后按「产品 + 客户」分组各生成一条销售记录，销售项目进入「待审核」并锁定数量，商务确认（可改价）后生效，再执行「交付」生成交付记录。</span>
         </div>
       </div>
 
@@ -760,9 +772,10 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
               </div>
             </template>
           </el-table-column>
-          <!-- ADR-018 §3（PRICING-20261020）：所有行（unit/amount/遥感）均可输销售金额（整数元）；
-               2026-10-24（ADR-022）：所有行必填（整数元 > 0）——amount 行 = 权威输入，
+          <!-- ADR-018 §3（PRICING-20261020）：所有行（unit/amount/遥感）均可输销售金额（元）；
+               2026-10-24（ADR-022）：所有行必填（> 0）——amount 行 = 权威输入，
                unit/遥感行 = 行内成交金额（超参考区间后端 400）；原「选填 / 留空回退」口径废弃
+               2026-10-29（ADR-048）精度放宽：支持最多 6 位小数（原仅整数元），后端同步放开
                ADR-039（NO-DISCOUNT-20261022）：本列原并排的快捷换算输入删除，金额输入独占主内容区 -->
           <!-- 2026-10-20 修复：列宽 190→200，保证下方参考区间小字（如「参考区间 5100000~5100000 元/套」）不挤压换行 -->
           <el-table-column label="销售金额（元）" width="200" align="center" header-align="center">
@@ -770,7 +783,7 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
             <template #header><span>销售金额（元）<i class="req-star">*</i></span></template>
             <template #default="{ row }">
               <!-- 2026-10-23 修复①：统一单元格结构——输入框进主内容区，参考区间小字进 18px 副提示区
-                   2026-10-24（ADR-022）：placeholder 统一「必填，整数元」；缺项（空/0/非整数）值驱动标红
+                   2026-10-24（ADR-022）：缺项（空/0/非法）值驱动标红
                    （复用 .cart-customer-error 同一「必填缺项」样式）；原留空兜底口径小字整体移除 -->
               <div class="cart-cell">
                 <!-- ADR-039（NO-DISCOUNT-20261022）：主内容区只剩金额输入——原并排的 68px 窄输入已删除，
@@ -779,11 +792,11 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
                   <!-- CART-PERF-20261021（2026-10-21）：金额输入改本地草稿——
                        :model-value 草稿优先（无草稿读已提交值），敲字只写草稿不碰 db.cart 镜像 -->
                   <!-- 2026-10-25：用户反馈输入框 hover 提示「太碍事」，删除金额输入框 tooltip
-                       （必填/整数元口径见列头红星 + 顶部提示条，参考区间见下方提示行）
-                       ADR-039（NO-DISCOUNT-20261022）：placeholder 固定「必填，整数元」（原预计金额预览随快捷换算下线） -->
+                       （必填口径见列头红星 + 顶部提示条，参考区间见下方提示行）
+                       2026-10-29（ADR-048）：placeholder 改「必填，最多 6 位小数」（原「必填，整数元」） -->
                   <el-input
                     :model-value="amountDraft(row)"
-                    placeholder="必填，整数元"
+                    placeholder="必填，最多 6 位小数"
                     size="small"
                     class="cart-amount-input"
                     :class="{ 'cart-customer-error': amountInvalid(row) }"
@@ -792,7 +805,8 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
                   />
                 </div>
                 <div class="cell-hint">
-                  <!-- ADR-018：产品设了参考区间时展示区间提示（超区间提交由后端 400，文案走 showError）
+                  <!-- ADR-018：产品设了参考区间时展示区间提示（低于下限由后端 400，文案走 showError）
+                       ADR-049（2026-10-29）：高于区间上限不拦截（金额可超上限成交）
                        ADR-021（RSITEM-RANGE-20261020）：遥感明细行改读该明细自身区间，普通行仍读产品区间
                        2026-10-20 修复：提示可见性——显式辅助色 #71829A（原 .muted #9aa9bf 过淡）、11px；
                        遥感行单位按 ADR-021 口径展示「份」（父产品 unit 为「份（可售明细）」容器口径，不宜直接展示）
@@ -856,10 +870,12 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
             </template>
           </el-table-column>
           <!-- 2026-10-22 微调：小计列宽 130→110（次要列收窄，缓解横向滚动压力，信息完整保留） -->
-          <!-- FT-20261022-F：小计列宽 110→150——formatMoney 最长输出 17 字符（¥1,000,000,000.00），
+          <!-- FT-20261022-F：小计列宽 110→150——formatMoney 常规输出 17 字符（¥1,000,000,000.00），
                13px tabular-nums 下内容宽 ≈119px，加 EP .cell 左右 padding 12×2 后需 ≈143px；
                原 110px 可用仅 ≈86px，右对齐时左侧被 .el-table .cell 的 overflow:hidden 裁切（用户截图红框）。
-               表头同步改居中（原表头右对齐已删），金额单元格仍 align="right" -->
+               表头同步改居中（原表头右对齐已删），金额单元格仍 align="right"。
+               ADR-048：金额支持最多 6 位小数，极少数超长值（如 ¥1,000.00 后带 6 位小数）可能被裁切，
+               常规（≤2 位有效小数）宽度不变，不为此整体加宽表格 -->
           <el-table-column label="小计" width="150" align="right" header-align="center">
             <template #default="{ row }">
               <!-- 2026-10-23 修复①：统一单元格结构——小计进主内容区（formatMoney 已含 ¥，模板不再叠加前缀），副提示区空占位 -->

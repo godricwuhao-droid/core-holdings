@@ -22,7 +22,7 @@ export const CATEGORY_UNITS: CategoryUnit[] = [
   { board: 'embodied', type: '机器人', unit: '套 / 台', note: '整机交付，可选序列号交付' },
   { board: 'embodied', type: '数采设备', unit: '套', note: '数采软件及设备接入' },
   { board: 'embodied', type: '平台软件', unit: '套', note: '管理平台类' },
-  { board: 'satellite', type: '卫星Token', unit: '个', note: '按 Token 额度与有效期售卖（包量计价，合同金额整数元权威）' },
+  { board: 'satellite', type: '卫星Token', unit: '个', note: '按 Token 额度与有效期售卖（包量计价，合同金额最多 6 位小数）' },
   { board: 'satellite', type: '卫星数据', unit: '轨 / 期 / 条', note: '默认可重复售卖，不扣减数量' },
   { board: 'satellite', type: '遥感数据', unit: '份（可售明细）', note: '父产品容器，按 省/精度/月份 维护可售明细，每份单独定价' },
   { board: 'software', type: '软件', unit: '套', note: '永久 / 年限 / 并发 / 账号授权' },

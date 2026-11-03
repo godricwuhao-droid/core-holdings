@@ -19,7 +19,7 @@
  *  - §1 登记时间：新建不再提供输入（提交传空，后端自动取当天）；编辑只读展示（文本行）
  *  - §2 术语「长期买断」→「产品有效期」（字段名 perpetual 不变）
  *  - §3 参考区间自动同步（仅新建、仅非容器）：salePrice>0 且区间未手改 →
- *    priceMin=salePrice、priceMax=round(salePrice×1.02,2)；手改置 touchedMin/touchedMax 后不再覆盖
+ *    priceMin=salePrice、priceMax=salePrice×1.02（ADR-048：按 1e-6 规整）；手改置 touchedMin/touchedMax 后不再覆盖
  *  - §4 重复售卖：移除「卫星数据自动勾选」，默认一律 false；容器恒关（禁用态 + 说明）
  */
 import { computed, onMounted, reactive, ref, watch } from 'vue'
@@ -35,7 +35,10 @@ import {
   Upload,
 } from '@element-plus/icons-vue'
 import {
+  amountInputFormatter,
+  amountInputParser,
   BOARDS,
+  roundAmount,
   today,
   type AssetStatus,
   type Board,
@@ -112,7 +115,7 @@ watch(
 )
 
 /** ADR-036 §3：参考区间自动同步（仅新建、仅非遥感容器）——
- *  salePrice > 0 且对应边界未被手动修改过 → priceMin = salePrice、priceMax = round(salePrice × 1.02, 2)；
+ *  salePrice > 0 且对应边界未被手动修改过 → priceMin = salePrice、priceMax = salePrice × 1.02（ADR-048：按 1e-6 规整）；
  *  手改区间输入（@change）置 touchedMin/touchedMax 后不再自动覆盖（以最后一次手改为准）；
  *  编辑模式不自动同步（loadAsset 回显存量值，watch 有 isEdit 守卫） */
 const touchedMin = ref(false)
@@ -122,7 +125,7 @@ watch(
   (v) => {
     if (isEdit.value || isRemote.value || !(v > 0)) return
     if (!touchedMin.value) form.priceMin = v
-    if (!touchedMax.value) form.priceMax = Math.round(v * 1.02 * 100) / 100
+    if (!touchedMax.value) form.priceMax = roundAmount(v * 1.02)
   },
 )
 
@@ -345,26 +348,28 @@ onMounted(async () => {
             </el-form-item>
             <!-- ADR-017（2026-10-20）：Token 产品单价口径与普通产品一致（元/份），删除「元/万Token」特判 -->
             <el-form-item label="销售单价（元）" prop="salePrice">
-              <!-- FIX-20261022 / BUG-44（§6 硬约束）：金额输入一律 :controls="false"（无步进按钮），数量类保留 -->
-              <el-input-number v-model="form.salePrice" :min="0" :precision="2" :controls="false" style="width: 100%;" />
+              <!-- FIX-20261022 / BUG-44（§6 硬约束）：金额输入一律 :controls="false"（无步进按钮），数量类保留
+                   ADR-048：单价支持最多 6 位小数（formatter 失焦展示「最少两位」，parser 截断到 6 位） -->
+              <el-input-number v-model="form.salePrice" :min="0" :controls="false" :formatter="amountInputFormatter" :parser="amountInputParser" style="width: 100%;" />
             </el-form-item>
-            <!-- ADR-018（PRICING-20261020）：参考价格区间——元/{unit}，选填（可单边），
-                 下单时单价（销售金额 ÷ 数量）须落在区间内，超区间后端 400
+            <!-- ADR-018（PRICING-20261020）：参考价格区间——元/{unit}，选填（可单边）；
+                 ADR-049（2026-10-29）：下单时**只校验下限**（低于下限 400，高于上限不拦截），
+                 商务审核改价不受区间约束
                  ADR-036 §3：新建时销售单价填写后自动同步（min=单价、max=单价×1.02）；
                  用户手改（@change）置 touchedMin/touchedMax 后不再自动覆盖（编辑模式不自动同步） -->
             <el-form-item label="参考价格区间（元）">
               <div class="price-range-row">
-                <el-input-number v-model="form.priceMin" :min="0" :precision="2" :controls="false" placeholder="下限（选填）" style="width: 100%;" @change="touchedMin = true" />
+                <el-input-number v-model="form.priceMin" :min="0" :controls="false" :formatter="amountInputFormatter" :parser="amountInputParser" placeholder="下限（选填）" style="width: 100%;" @change="touchedMin = true" />
                 <span class="muted price-range-sep">~</span>
-                <el-input-number v-model="form.priceMax" :min="0" :precision="2" :controls="false" placeholder="上限（选填）" style="width: 100%;" @change="touchedMax = true" />
+                <el-input-number v-model="form.priceMax" :min="0" :controls="false" :formatter="amountInputFormatter" :parser="amountInputParser" placeholder="上限（选填）" style="width: 100%;" @change="touchedMax = true" />
               </div>
               <div class="muted" style="font-size: 12px; margin-top: 4px;">
-                元/{{ form.unit || '单位' }}，选填（可只填一边）；下单时单价校验用，未设置则不限制
+                元/{{ form.unit || '单位' }}，选填（可只填一边）；下单时用于校验金额下限（上限不限制，可高于上限成交），未设置则不限制
               </div>
             </el-form-item>
             <!-- ADR-008：包量定价说明（浅蓝提示条） -->
             <div v-if="isAmount" class="info-bar soft">
-              Token 产品按包量售卖，下单时以销售金额（整数元）为准，参考单价不参与计价
+              Token 产品按包量售卖，下单时以销售金额（元，最多 6 位小数）为准，参考单价不参与计价
             </div>
             <el-form-item label="可重复售卖">
               <el-switch v-model="form.repeatSale" />

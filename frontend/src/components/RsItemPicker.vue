@@ -169,7 +169,7 @@ function onConfirm() {
     <template v-else>
       <div class="info-bar">
         <el-icon aria-hidden="true"><InfoFilled /></el-icon>
-        <span>按 省 → 精度 → 月份 勾选可售明细，每份明细独立计价（整数元/份）；<b>已售罄的单次售卖明细已置灰，不可再选</b>（可重复售卖的明细不置灰）。</span>
+        <span>按 省 → 精度 → 月份 勾选可售明细，每份明细独立计价（元/份，最多 6 位小数）；<b>已售罄的单次售卖明细已置灰，不可再选</b>（可重复售卖的明细不置灰）。</span>
       </div>
       <el-tree
         ref="treeRef"

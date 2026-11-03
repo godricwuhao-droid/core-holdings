@@ -19,6 +19,8 @@ import {
   entityShort,
   formatMoney,
   formatYuan,
+  isAmountMode,
+  roundAmount,
   type Asset,
 } from '@/types'
 import { rsItemById, type OrderFields } from '@/api'
@@ -27,7 +29,7 @@ import { currentUser } from '@/auth'
 export interface OrderItem {
   asset: Asset
   qty: number
-  /** 行内销售金额（整数元）：包量定价权威值 / unit 与遥感行折扣金额（ADR-018 §3）；未填不带 */
+  /** 行内销售金额（元，最多 6 位小数，ADR-048）：包量定价权威值 / unit 与遥感行成交金额；未填不带 */
   amount?: number
   /** ADR-011：遥感数据明细行（挂 rs_items）——数量恒 1，单价 = 明细 price（后端权威重算） */
   itemId?: number
@@ -75,9 +77,16 @@ const subject = computed(() => {
 const totalQty = computed(() => props.items.reduce((s, i) => s + i.qty, 0))
 /** 是否含已填销售金额的行（ADR-018 §3：包量定价权威值 / 折扣金额） */
 const hasAmountItem = computed(() => props.items.some((i) => i.amount != null))
-/** 销售金额合计（元值）：已填金额行取行内值，未填行按 单价×数量 占位（结算以后端 cart_items 持久化值为准） */
+/** 销售金额合计（元值）：已填金额行取行内值（unit 模式 amount=单价 → 行总价=单价×qty；
+ *  amount 模式 amount=总价；遥感行 qty=1），未填行按 单价×数量 占位（结算以后端持久化值为准）
+ *  ADR-048：按 1e-6 规整累加，避免多位小数的 JS 浮点尾巴 */
 const totalYuan = computed(() =>
-  props.items.reduce((s, i) => s + (i.amount ?? priceOf(i) * i.qty), 0),
+  roundAmount(props.items.reduce((s, i) => {
+    if (i.amount == null) return s + priceOf(i) * i.qty
+    if (i.itemId != null) return s + i.amount  // 遥感行 qty=1，单价=总价
+    if (isAmountMode(i.asset)) return s + i.amount  // amount 模式是总价
+    return s + roundAmount(i.amount * i.qty)  // unit 模式：单价×数量=行总价
+  }, 0)),
 )
 
 const form = reactive({
@@ -191,9 +200,10 @@ function close() {
       <el-form-item label="项目名称" required>
         <el-input v-model="form.projectName" placeholder="请填写项目名称" />
       </el-form-item>
-      <!-- 购物车模式：多销售记录下单，单值金额语义模糊 → 只读汇总展示（Σ各行小计），金额由后端按分组小计派生 -->
+      <!-- 购物车模式：多销售记录下单，单值金额语义模糊 → 只读汇总展示（Σ各行小计），金额由后端按分组小计派生
+           2026-10-29（ADR-048）：行金额支持最多 6 位小数 → 去掉 Math.round 取整，合计按同口径展示 -->
       <el-form-item label="销售金额合计（元）">
-        <div class="sod-readonly-amount">¥ {{ formatYuan(Math.round(totalYuan)) }}</div>
+        <div class="sod-readonly-amount">¥ {{ formatYuan(totalYuan) }}</div>
       </el-form-item>
     </el-form>
 
