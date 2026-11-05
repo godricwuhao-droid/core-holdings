@@ -2,6 +2,76 @@
 
 > 记录 core-holdings 前端（Vue3 + TS + Element Plus + Vite）的页面/组件/接口封装变更。
 
+## 2026-11-04 ｜ 账号/用户管理：列表客户端分页+过滤 + 建号随机密码 + 顶栏自助改密
+
+> 范围：`src/views/settings/users.vue`、`src/layouts/MainLayout.vue`、`src/api/index.ts`、`src/utils/randomPassword.ts`（新增）。① 账号列表客户端分页+过滤（`GET /users` 不变）：工具栏（关键字 username/name 忽略大小写 + 角色 + 状态）→ `filteredUsers`/`pagedUsers` computed 切片，`el-pagination`（10 条/页可切 10/20/50/100），过滤变更回第 1 页，统计卡保持基于全量。② 建号随机密码：`generateRandomPassword()`（crypto.getRandomValues，12 位，去易混 0/O/1/l/I，保证大小写+数字各至少 1，洗牌），新建弹窗密码框 `#append`「随机生成」按钮（编辑态不显示）。③ 顶栏 user-chip 改 `el-dropdown`（修改密码/退出登录，全角色可见，原独立退出按钮并入下拉）；改密弹窗（旧/新/确认，前端校验 ≥6 位 + 新=确认）→ `changeMyPassword` → **成功用返回的新 token `setSession` 换 token**（tokenVersion+1，不换则下次请求 401）+ 同步 currentUser；400「旧密码不正确」走 toast。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-11-04 | 新增 | 账号管理：列表客户端分页+过滤（关键字/角色/状态）+ 建号随机密码（12位去易混）+ 顶栏自助改密（校验旧密码，换 token 保持登录，全角色） | src/views/settings/users.vue、src/layouts/MainLayout.vue、src/api/index.ts | ADR-054 | 配合后端 change-password |
+
+## 2026-11-04 ｜ 产品域：税点展示/录入 + 删售卖数量列 + 销售单价→采购单价（对外展示区间下限）+ 自动区间
+
+> 范围：`src/views/assets/{list,create,detail}.vue`、`src/types.ts`、`src/api/index.ts`。① 税点：`Asset`/`AssetInput` 加 `taxPoint?: number | null`（整数百分比，可空）；列表新增「税点」列（null→`-`，否则 `n%`）、详情「数量与归属」加「税点」项、登记表单「数量与价格」卡加「税点（%）」输入（0-100 整数，选填，提交 null 兜底、编辑回填）。② 列表删「售卖数量」列（shippedQty）；「重复售卖」tag（可用数量列内）保留。③ 对外卖价口径切参考区间下限：列表 `salePriceText`→`floorPriceText`（priceMin==null/容器→`-`，否则 formatMoney(priceMin)+单位后缀+区间追加）、快览抽屉与详情「销售单价」同口径；`availableValue`（可售金额统计）改 `q * (priceMin ?? salePrice ?? 0)`。④ 登记表单「销售单价（元）」→「采购单价（元）」（绑定 `form.salePrice` 不变）；自动区间 watch 公式改 `priceMin=roundAmount(salePrice×1.01)`、`priceMax=roundAmount(salePrice×1.02)`，去掉 isEdit 守卫（新建+编辑均生效），`loadAsset` 回填用 `isHydrating` 标志位（nextTick 释放）抑制初始加载，`touchedMin/touchedMax` 手改不覆盖（本次会话内），仅非容器、salePrice>0 才填。清理 list/detail 中不再使用的 `displayUnitPrice`/`isAmountMode` 导入。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-11-04 | 修改 | 产品域：税点展示/录入 + 删售卖数量列 + 销售单价→采购单价（对外展示区间下限）+ 填采购价自动区间（×1.01/1.02，新建+编辑，手改不覆盖）+ 可售金额切区间下限 | src/views/assets/{list,create,detail}.vue、src/types.ts | ADR-053 | 配合后端 taxPoint |
+
+## 2026-11-04 ｜ 资产详情页体验优化（进页即载流水/日志 + 操作人姓名 + SP 单号可点）
+
+> 范围：`src/views/assets/detail.vue`（纯前端，单文件）。① 数量流水/操作记录由「点 tab 才加载」改为「进入页面即预加载」——bootstrap 就绪（`watch(asset)`）+ `onMounted` 兜底调 `preloadTabs()`，仍走分页接口（`listAssetFlows`/`listAssetLogs`，保留服务端 total + 可见性过滤）并尊重 `loaded` 标记（切 tab 不重拉）；`watch(assetId)` 重置后补调 `preloadTabs()` 保证路由参数变化复用组件时重触发。② 操作人账号→姓名：新增 `operatorName()`（空→`-`、system→系统、其余走 `repName` 查不到回退原账号），数量流水 `operatorText` 与操作记录 tab 时间戳统一走该映射；`repOptions` 已在 setup 期加载，姓名随渲染即解析。③ 关联单号 `SP-xxx` 可点：新增 `spProjectId()`（仅 `SP-` 前缀且在 `db.projects` 按 code 映射到才返回 id），命中渲染 `.link` 跳 `/sales/projects/{id}/detail`，HT-/CK-/产品编号/已删单号保持纯文本。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-11-04 | 优化 | 资产详情页：数量流水/操作记录进入即加载 + 操作人账号改姓名（复用 repName，两 tab 一致）+ 关联 SP 单号点击跳销售项目详情 | src/views/assets/detail.vue | /assets/:id/detail 体验优化 | 纯前端 |
+
+## 2026-11-04 ｜ 购物车优化（去「销售单价」列 + 销售金额双向区间校验）
+
+> 范围：`src/views/cart/index.vue`。① 删除「销售单价」列（纯展示派生，小计/结算 payload 不依赖）；其「可售/已达上限」库存提示迁移至「销售金额」列副提示区（与参考区间提示合并，信息不丢）；清理 `CartRow.price` 字段 + `displayUnitPrice` 导入。② 销售金额输入加双向区间校验（新增 `amountOutOfRange`：非 amount 行 + 区间已设时 n<priceMin 或 n>priceMax）→ 越界标红（复用 `cart-customer-error`）+ `openOrder` 拦截结算并提示「销售金额须在参考区间内」；amount（包量）行不校验区间（与后端一致）；未设区间不校验、单边只卡有值侧。顶部提示条「上限不限制，可高于上限成交」→「须在参考区间内」。与后端 ADR-052 双向 enforce_max 对齐。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-11-04 | 修改 | 购物车：去「销售单价」列（hint 迁移）+ 销售金额双向区间校验/标红/阻断结算（amount 行不校验） | src/views/cart/index.vue | ADR-052 | 配合后端 enforce_max 双向；含结算提示措辞 polish |
+
+## 2026-11-04 ｜ 权限体系升级前端（五角色 + 商务主管分配入口 + 财务只读产品/服务）
+
+> 范围：`src/auth.ts`、`src/router/index.ts`、`src/layouts/MainLayout.vue`、`src/views/sales/projects/{index,detail,review}.vue`、`src/views/settings/users.vue`、`src/components/TransferDialog.vue`。角色扩为五角色（admin/supervisor/editor/viewer/finance）：`canWrite` 改 admin/supervisor/editor；新增 `isSupervisor`/`isFinance`/`canAssign`。路由新增 `financeAllowedPath`（仅 /assets/** 板块+详情，其余提示后回 /assets/embodied）；supervisor 路由与 editor/admin 同待遇（无特例）。菜单：finance 仅「产品及服务」；业务档（admin/supervisor/editor）现有业务菜单；viewer 不变。销售项目：主管/admin 任意行（pending/active）「分配/改派」（TransferDialog 新增 assign 模式，下拉前端过滤 role==='editor'，走既有 claim 接口）；editor 保留 ADR-012 接手/转交；审核入口/按钮放宽到「负责人或 admin/supervisor」（与后端 review 守卫同口径）；未分配单审核页对主管显示「分配」入口（后端 400「请先由商务主管分配」兜底）。users.vue 角色下拉/tag 扩五角色（默认新建仍 viewer）。销售项目可见性全部靠后端过滤，前端未加角色 filter。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-11-04 | 修改 | 权限体系升级前端：五角色 + 商务主管分配入口 + 财务只读产品/服务菜单 | src/auth.ts、router、layouts/MainLayout.vue、views/sales/projects/{index,detail,review}.vue、views/settings/users.vue | ADR-051 | 配合后端数据域 |
+
+## 2026-11-04 ｜ 订单审核页 UI 美化（去冗余 / 强化金额与主操作层次 / 去嵌套留白）
+
+> 范围：`src/views/sales/projects/review.vue`。仅视觉层（template 结构/文案 + scoped CSS），未改 `<script setup>` 业务逻辑/数据/computed/事件/v-model 绑定、接口、路由、`useBack` 返回行为。配色/圆角/边框/字号全部走 core-holdings-ui token，未新增色值、未用 EP 默认色板；保留明细行 5 列 grid 对齐、金额右对齐、数字 `tabular-nums`。改动点：① 页头长 run-on 说明收敛为「代码 + 状态标签（待审核/数量已锁定）」；② 卡片头 `.bh-sub` 与合同内 `.info-bar` 的重复操作说明收敛为卡片内单一分层说明条（3 条短句），合同总价细节移入 tooltip；③ 合同块去嵌套（内层 `.rv-ct` 去重边框改留白 + 单条分隔线），客户名升为标题级、销售金额合计右对齐大主色突出；④ 项目总金额改浅蓝醒目汇总块（大主色数值）。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-11-04 | 修改 | 审核页 UI 美化（去冗余/强化金额与主操作层次/去嵌套留白） | src/views/sales/projects/review.vue | UI 优化（core-holdings-ui） | |
+
+## 2026-11-04 ｜ 全站「返回」按钮统一为「回到上一页」
+
+> 范围：新增 `src/composables/useBack.ts`（唯一实现，判据 `window.history.state.back`：有历史 `router.back()`，无历史兜底 `router.push(fallbackRoute)`）+ 5 个视图返回入口。仅改返回导航逻辑与文案，未改接口/路由/权限态，未新增色值/token（返回按钮视觉沿用各页 `.back-link`）。兜底路由：销售域 `/sales/projects`；产品域按板块 `/assets/${board}`（动态）。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-11-04 | 修改/重构 | 全站返回按钮统一为「回到上一页」（新增 useBack 组合式函数，消除各页内联 back+else 重复；审核页原写死跳详情改为回上一页，修复 viewer 从列表进入跳错） | `src/composables/useBack.ts`（新增）及 5 个视图：`sales/projects/review.vue`、`sales/projects/detail.vue`、`sales/projects/create.vue`、`assets/detail.vue`、`assets/create.vue` | 返回导航 | 兜底路由：销售域 `/sales/projects`、产品域 `/assets/${board}`；返回链接文案统一为中性「返回」；保留特殊跳转（审核页底部「返回详情」、产品详情未找到空态「返回产品台账」、购物车空态「去选择产品」） |
+
+## 2026-11-03 ｜ ADR-050：审核阶段可编辑性增强（合同总价 / 客户名称 / 数量）
+
+> 范围：`src/views/sales/projects/review.vue`、`src/api/index.ts`（`reviewProject`）、`src/types.ts`（新增 `ReviewItemInput`/`ReviewContractInput`/`ReviewInput`）+ 本日志。对齐后端 ADR-050 契约（`docs/backend/api.md` `POST /projects/{id}/review`）：`items[].qty`（非遥感行 ≥1，遥感行恒 1 忽略）+ `contracts[]`（`contractId`/`customer`/`amount`）。未改接口路径、路由、权限态；未新增色值/token（提示条复用全局 `.info-bar` 浅蓝，金额输入 `:controls="false"`，数量列居中）。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-11-03 | 新增 | 审核页支持改合同总价/客户名/数量 | frontend/src/views/sales/projects/review.vue、api/index.ts、types.ts | ADR-050 | 对齐后端新增字段 |
+| 2026-11-03 | 新增 | **每合同卡「合同总价」输入**（`el-input-number :controls="false"`、min 0、6 位小数 formatter/parser、placeholder 示例）：留空 = 按 Σ 明细派生（行内灰字展示派生值），填写后合同合计/项目总额实时按「总价权威」展示；下方浅蓝 `.info-bar`「确认后按各明细行金额比例分摊到明细（总额权威）」；前端不做分摊计算（后端 confirm 时分摊） | `review.vue` 模板（`.rv-ct-amount`）、`contractLineSum`/`contractTotal`/`projectTotal`（项目总额 = Σ 合同生效总额，仍只读派生）、`.rv-ct-amount*` 样式 | ADR-050 §3 | 精度/口径同 ADR-048（`isAmountPrecisionValid`） |
+| 2026-11-03 | 新增 | **每合同卡「客户公司名称」可编辑**（`el-input`，maxlength 128）：trim 后空 / 超 128 字 → 禁用「确认下单」+ tooltip 提示（`contractInvalidMsg`），提交前 `ElMessage.warning` 双保险；提交时 trim 后写入 `contracts[].customer` | `review.vue` 模板（`.rv-ct-customer-input`）、`contractInvalid`/`contractInvalidMsg`、底部按钮 `:disabled` + `el-tooltip` | ADR-050 §4 | 冲突守卫（同客户 + 明细重叠 400）由后端兜底 |
+| 2026-11-03 | 修改 | **行「数量」由只读文本改为可编辑**（`el-input-number` 整数 min 1、数字列居中；**非遥感行可编辑**、**遥感行禁用**恒 1；repeatSale 行允许编辑）；网格数量列 78px → 110px（窄屏 72px → 104px）；删除页头/区块两处「数量不可修改（需改数量请驳回重下）」文案，改为「遥感明细行数量固定为 1」 | `review.vue` 模板（`.rv-c-qty`/`.rv-qty-input`）、`ReviewLine.origQty`、`rv-line-main-row` 网格 | ADR-050 §2/§5 | 放大超可售由后端 400 + 事务回滚兜底 |
+| 2026-11-03 | 修改 | **payload 对齐 ADR-050（沿用「只提交有变更项」原则）**：`items[]` 含改了 price/amount/qty/服务期限 的行——unit 行传 `price`（qty 变更附 `qty`，金额按 price×qty 后端重算）；amount 行传 `amount`（仅改数量时只传 `qty`，金额按数量比例缩放后端重算）；遥感行不传 `qty`。`contracts[]` 仅含确实改了 customer 或 amount 的合同（带 `contractId`）。确认弹窗文案增「含合同总价/客户名称/…/数量…调整（合同总价按各明细行金额比例分摊）」 | `review.vue` `handleConfirm`（变更检测 + payload 构造）、`api/index.ts` `reviewProject(payload: ReviewInput)`（原内联类型删除）、`types.ts` 新增 `ReviewItemInput`/`ReviewContractInput`/`ReviewInput` | ADR-050 §1 | reject 路径不变（后端忽略 `contracts`/`qty`） |
+
+> **备注**：验收 `npx vue-tsc -p tsconfig.app.json --noEmit` 退出码 0；agent-browser 实测（:5173 + :8000）：建含 unit 行 + 遥感行的待审核单 → 接手 → 改合同总价 2600 + 数量 2→3 → 确认下单 → 请求体 `{"action":"confirm","items":[{"itemId":58,"price":1900,"qty":3,…}],"contracts":[{"contractId":49,"amount":2600}]}`（未变更合同/客户未改不提交）→ 项目 active、合同总额 = 2600、行 qty=3、单价重派生 866.666667、项目总额 = Σ 合同；遥感行数量输入禁用（`disabled=true`）；客户名清空/超 128 字 → 确认按钮禁用 + tooltip「客户公司名称超过 128 字」；驳回路径回归正常（测试单 terminated）。测试单：项目 30（已确认）/ 31（已驳回清理）。未 build、未 commit。
+
 ## 2026-10-23 ｜ ADR-045：登录页 UI 重构为左右分栏
 
 | 日期 | 类型 | 变更内容 | 影响文件 | 关联任务 | 备注 |
@@ -2254,5 +2324,10 @@
 |------|------|----------|----------|----------|------|
 | 2026-10-29 | 修改 | 购物车顶部提示条去掉 `isViewer` 分支，统一为「设参考区间时金额不得低于区间下限（上限不限制，可高于上限成交）」；删除多余 `isViewer` 导入；输入/提交注释同步 | views/cart/index.vue | ADR-049 | 低于下限仍由后端 400，页面文案走 `showError` |
 | 2026-10-29 | 修改 | 产品登记 & 遥感明细的参考区间说明改为「下单时用于校验金额/单价下限（上限不限制），未设置则不限制」 | views/assets/create.vue、views/assets/detail.vue | ADR-049 | 审核页（review.vue）本就不展示区间限制，无需改 |
+| 2026-11-04 | 修复 | 金额输入框自动弹小数点/只能输小数/删除异常（编辑期改纯数字，只读展示用 format） | src/types.ts、src/views/sales/projects/create.vue | 全站金额输入（13 处） | `amountInputFormatter` 编辑期改纯数字（合法中间态如「12.」原样透传，避免 EP 每次按键 formatter 回写吞掉小数点）；新增 `amountDisplayFormatter`（千分位+最少两位小数）供 disabled 展示框使用，新建项目页合同金额只读框改指向它 |
+| 2026-11-04 | 修改 | 销售项目列表 /sales/projects 改服务端分页：listProjects 分页请求驱动 + el-pagination + 卡头显后端 total + 4 过滤转 query 参数（keyword 大小写敏感对齐）+ 写操作后重载；bootstrap/db.projects 不动 | src/views/sales/projects/index.vue、src/api/index.ts | ADR-055 | 配合后端 GET /projects |
+| 2026-11-04 | 新增 | ADR-056 前端：销售项目列表 5 列服务端排序 + 详情页合同列表勾选/单一驳回(pending) + 新增产品统计页(按 subject 主体聚合、可展开对账、采购口径、viewer 不可见、finance 放开) | src/views/sales/projects/{index,detail}.vue、src/views/statistics/index.vue、src/router/index.ts、src/layouts/MainLayout.vue、src/api/index.ts | ADR-056 | 配合后端排序/reject-contracts |
+| 2026-11-04 | 重构 | 审核订单页 review.vue 美化（方案A 每合同一张表：合同头+el-table 明细、金额 center、info-bar、客户名降级）+ sticky 底部条（已选 N/M+勾选合计+确认/驳回）+ 每合同勾选(默认全选)部分确认/驳回（确认走 review contractIds、驳回复用 reject-contracts、reviewContracts 过滤 pending） | src/views/sales/projects/review.vue | ADR-057 | 配合后端部分确认 |
+| 2026-11-04 | 修复 | ADR-057 修复：部分确认/驳回后剩余 pending 合同丢失默认勾选(watch 改幂等默认全选) + 勾全选省略 contractIds 走整单(日志格式回归) | src/views/sales/projects/review.vue | ADR-057 | BUG-ADR057-001/OBS-ADR057-01 |
 
 > 验证：`vue-tsc --noEmit` EXIT=0，`read_lints` 0 诊断；后端区间口径已在副本库实测（超上限放行、低于下限 400、审核改价不受限）。未构建、未 commit。

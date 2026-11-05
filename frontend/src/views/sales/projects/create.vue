@@ -14,6 +14,7 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { useBack } from '@/composables/useBack'
 import {
   ArrowDown,
   ArrowLeft,
@@ -26,6 +27,7 @@ import {
   Setting,
 } from '@element-plus/icons-vue'
 import {
+  amountDisplayFormatter,
   amountInputFormatter,
   amountInputParser,
   availableQty,
@@ -663,10 +665,10 @@ async function handleSubmit() {
   }
 }
 
+// 「返回/取消」：回上一页；深链/刷新直达（无历史）时兜底销售项目列表
+const { goBack } = useBack('/sales/projects')
 function handleCancel() {
-  // 有历史栈时返回上一页；直达 URL（无历史）时回退到销售项目列表，避免退出应用
-  if (window.history.state?.back) router.back()
-  else router.push('/sales/projects')
+  goBack()
 }
 </script>
 
@@ -678,7 +680,7 @@ function handleCancel() {
         <div>
           <a class="back-link" @click="handleCancel">
             <el-icon><ArrowLeft /></el-icon>
-            返回销售项目
+            返回
           </a>
           <h1>{{ isEdit ? '编辑销售项目' : '新建销售项目' }}</h1>
           <div class="desc">
@@ -923,7 +925,7 @@ function handleCancel() {
                   :model-value="c.contractAmount"
                   :min="0"
                   :controls="false"
-                  :formatter="amountInputFormatter"
+                  :formatter="amountDisplayFormatter"
                   disabled
                   style="width: 180px;"
                 />

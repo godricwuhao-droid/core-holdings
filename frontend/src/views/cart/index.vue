@@ -12,7 +12,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Delete, InfoFilled, ShoppingCart, WarningFilled } from '@element-plus/icons-vue'
-import { availableQty, displayUnitPrice, entityShort, formatMoney, formatTokens, isAmountMode, isAmountTextValid, priceRangeText, roundAmount, rsItemName, sanitizeAmountInput, type Asset, type CartItem, type RsItem } from '@/types'
+import { availableQty, entityShort, formatMoney, formatTokens, isAmountMode, isAmountTextValid, priceRangeText, roundAmount, rsItemName, sanitizeAmountInput, type Asset, type CartItem, type RsItem } from '@/types'
 import { checkoutCart, clearCart, db, genRequestId, getAsset, patchCartItem, refresh, removeCartItem, rsItemById, setCartAmount, setCartQty, setCartService, showError, type OrderFields } from '@/api'
 import SalesOrderDialog from '@/components/SalesOrderDialog.vue'
 import type { OrderItem } from '@/components/SalesOrderDialog.vue'
@@ -43,7 +43,6 @@ const skipNotice = computed(() => (skipClosed.value ? [] : skipLines.value))
 interface CartRow {
   cart: CartItem
   asset: Asset
-  price: number
   subtotal: number
   /** ADR-008：包量定价行（合同金额权威，单价仅参考） */
   isAmount: boolean
@@ -74,7 +73,6 @@ const cartRows = computed<CartRow[]>(() => {
       return {
         cart: c,
         asset,
-        price: rsItem ? rsItem.price : asset?.salePrice ?? 0,
         subtotal,
         isAmount,
         rsItem,
@@ -165,7 +163,14 @@ function onAmountInput(row: CartRow, v: string) {
 function amountInvalid(row: CartRow): boolean {
   const t = amountDraft(row).trim()
   const n = amountValue(row)
-  return t === '' || !isAmountTextValid(t) || n === undefined || !Number.isFinite(n) || n <= 0
+  return (
+    t === '' ||
+    !isAmountTextValid(t) ||
+    n === undefined ||
+    !Number.isFinite(n) ||
+    n <= 0 ||
+    amountOutOfRange(row) // ADR-052：超出参考区间（双向）也算非法 → 标红 + 阻断结算
+  )
 }
 
 /** 2026-10-26（ADR-047，OPTIONAL-SERVICEPERIOD-20261026）：服务期限改为**选填**，标红口径同步：
@@ -190,6 +195,22 @@ function rowRangeText(row: CartRow): string {
   return row.rsItem ? priceRangeText(row.rsItem) : priceRangeText(row.asset)
 }
 
+/** 销售金额是否超出参考区间（ADR-052，双向）：非 amount 行 + 区间已设时，n < priceMin 或 n > priceMax。
+ *  amount（包量/Token）行不卡区间（与后端一致，仅 >0 + ≤6 位小数）；未设区间不校验；缺项/非法由 amountInvalid 另判。
+ *  区间来源与 rowRangeText 同口径：遥感行读明细自身区间、普通行读产品区间。 */
+function amountOutOfRange(row: CartRow): boolean {
+  if (row.isAmount) return false
+  const n = amountValue(row)
+  if (n === undefined || !Number.isFinite(n)) return false
+  const src: Pick<Asset, 'priceMin' | 'priceMax'> = row.rsItem ?? row.asset
+  const lo = src.priceMin
+  const hi = src.priceMax
+  if (lo == null && hi == null) return false
+  if (lo != null && n < lo) return true
+  if (hi != null && n > hi) return true
+  return false
+}
+
 /** 失焦/回车提交（ADR-018 §3，PRICING-20261020；2026-10-24 ADR-022 必填口径；
  *  CART-PERF-20261021 改读草稿）：
  *  - 所有行（unit/amount/遥感）：最多 6 位小数的元值 > 0 才提交（ADR-048，原仅整数元）；
@@ -198,7 +219,7 @@ function rowRangeText(row: CartRow): string {
  *    （浏览器行为：mousedown → blur/change 先于 click），openOrder 校验运行时镜像已是最新值，
  *    天然失焦链路成立，无需额外合并处理（amountInvalid 的草稿合并口径作双保险）
  *  - 低于参考区间下限由后端 400（文案走 showError），400 时回滚到后端值并重置草稿；
- *    ADR-049：高于区间上限不拦截（金额可超上限成交）
+ *    ADR-052：高于区间上限也拦截（前端标红不提交，权威仍后端 400）
  *  ADR-039（NO-DISCOUNT-20261022）：折扣快捷入口下线——原「手改金额 → 折扣镜像作废 / 无手改则回传 rate」
  *  两分支整体删除，payload 只剩 qty + amount（金额是唯一权威，后端也不再读取折扣字段） */
 async function onAmountChange(row: CartRow) {
@@ -517,15 +538,18 @@ const orderItems = computed<OrderItem[]>(() =>
 function openOrder() {
   if (!db.cart.length) return
   const missingCustomer = cartRows.value.filter((r) => customerValue(r) === '')
-  const missingAmount = cartRows.value.filter((r) => amountInvalid(r))
+  const missingAmount = cartRows.value.filter((r) => amountInvalid(r) && !amountOutOfRange(r))
+  const outOfRange = cartRows.value.filter((r) => amountOutOfRange(r)) // ADR-052：超参考区间（已含在 amountInvalid，单列提示，不重复计数）
   const missingService = cartRows.value.filter((r) => !r.rsItem && serviceMissing(r))
-  const missingCount = missingCustomer.length + missingAmount.length + missingService.length
+  const missingCount = missingCustomer.length + missingAmount.length + outOfRange.length + missingService.length
   if (missingCount) {
     const parts: string[] = []
     if (missingCustomer.length) parts.push('客户')
-    if (missingAmount.length) parts.push('销售金额（元，最多 6 位小数）')
+    if (missingAmount.length) parts.push('销售金额（元，最多 6 位小数且 > 0）')
     if (missingService.length) parts.push('服务期限（开始/结束日期需成对填写，或都留空）')
-    ElMessage.warning(`${missingCount} 行信息未填齐：请填写${parts.join('、')}`)
+    const lead = parts.length ? `请填写${parts.join('、')}` : ''
+    const range = outOfRange.length ? '销售金额须回到参考区间内' : ''
+    ElMessage.warning(`${missingCount} 行未完善：${[lead, range].filter(Boolean).join('；')}`)
     return
   }
   orderVisible.value = true
@@ -606,8 +630,8 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
         <div>
           <b>下单前请完善关键信息</b>
           <!-- 2026-10-24（ADR-022）：必填口径——客户/销售金额必填；2026-10-26（ADR-047）服务期限改选填 -->
-          <!-- ADR-049（2026-10-29）：参考区间只约束下限——金额可高于上限成交（任何角色一致） -->
-          <span>每件产品必填客户、销售金额（元，最多 6 位小数且 &gt; 0），服务期限为选填（填则开始/结束日期须成对且开始不晚于结束；遥感明细行按期数售卖，不填期限）；设参考区间时金额不得低于区间下限（<b>上限不限制，可高于上限成交</b>）；数量受产品可用数量约束（可重复售卖不受限）。下单后按「产品 + 客户」分组各生成一条销售记录，销售项目进入「待审核」并锁定数量，商务确认（可改价）后生效，再执行「交付」生成交付记录。</span>
+          <!-- ADR-052（2026-11-04，取代 ADR-049 购物车只卡下限）：参考区间双向约束——销售金额须在区间内（不得低于下限、不得高于上限）；商务审核改价不限 -->
+          <span>每件产品必填客户、销售金额（元，最多 6 位小数且 &gt; 0），服务期限为选填（填则开始/结束日期须成对且开始不晚于结束；遥感明细行按期数售卖，不填期限）；设参考区间时销售金额须在参考区间内（<b>不得低于下限、不得高于上限</b>）；数量受产品可用数量约束（可重复售卖不受限）。下单后按「产品 + 客户」分组各生成一条销售记录，销售项目进入「待审核」并锁定数量，商务确认（可改价）后生效，再执行「交付」生成交付记录。</span>
         </div>
       </div>
 
@@ -686,33 +710,8 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
               </div>
             </template>
           </el-table-column>
-          <!-- FT-20261022-F：表头改居中（原表头右对齐已删），价格数据单元格仍 align="right" -->
-          <el-table-column label="销售单价" width="150" align="right" header-align="center">
-            <template #default="{ row }">
-              <!-- 2026-10-22 视觉优化：价格 14px 加粗 + 11px 副文案（单位 + 库存/上限），
-                   原数量列「已达上限」红色小字整合进此副文案（警示色沿用 --danger-color） -->
-              <!-- 2026-10-23 修复①：统一单元格结构——价格进主内容区，单位 + 可售/上限副文案进 18px 副提示区一行内 -->
-              <div class="cart-cell">
-                <div class="cell-main cart-price">
-                  <!-- ADR-025（2026-10-21）：包量定价（amount 模式）行单价统一走百万Token 口径（displayUnitPrice，仅展示，
-                       权威口径仍为行内销售金额）；unit/遥感行维持 formatMoney 原展示
-                       2026-10-23 修复②：去掉模板里多余的「¥ 」前缀——formatMoney 返回值已含 ¥，原写法渲染成「¥ ¥5,100,000.00」 -->
-                  <span class="cart-price-value" :class="{ muted: row.isAmount }">{{ row.isAmount ? displayUnitPrice(row.asset) : formatMoney(row.price) }}</span>
-                </div>
-                <div class="cell-hint cart-price-sub">
-                  <!-- ADR-025：amount 行单价已含「/百万Token」后缀，不再重复展示「元/{unit}」副文案 -->
-                  <span v-if="!row.isAmount">{{ row.rsItem ? '元/份' : `元/${row.asset.unit || '单位'}` }}</span>
-                  <!-- FIX-20261022 / BUG-22：上限口径改「本行可加到的上限」= 可售 − 同产品其他行 qty 合计 -->
-                  <span
-                    v-if="!row.rsItem && !row.asset.repeatSale"
-                    :class="row.cart.qty >= (availOf(row) ?? 0) ? 'cart-sellable-max' : ''"
-                  >
-                    {{ row.cart.qty >= (availOf(row) ?? 0) ? `已达上限 ${availOf(row)}` : `可售 ${availOf(row)}` }}
-                  </span>
-                </div>
-              </div>
-            </template>
-          </el-table-column>
+          <!-- ADR-052（2026-11-04）：「销售单价」列已删除——纯展示派生（挂牌价/明细价），小计/结算 payload 均不依赖；
+               其「可售/已达上限」库存提示已迁移至「销售金额」列副提示区；价格参考由「销售金额」列下参考区间提示承接 -->
           <!-- 2026-10-22 视觉优化：数量列改自定义步进器 [−] 数值 [+]（借鉴 cart-ui-demo.html stepper，
                替代上一批 96px el-input-number 写法）；± 点击走现有 onQtyChange PUT 提交链路，
                上限（min=1 / max=可用上限）与「已达上限」语义保留（上限时 + 号禁用置灰） -->
@@ -805,14 +804,22 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
                   />
                 </div>
                 <div class="cell-hint">
-                  <!-- ADR-018：产品设了参考区间时展示区间提示（低于下限由后端 400，文案走 showError）
-                       ADR-049（2026-10-29）：高于区间上限不拦截（金额可超上限成交）
+                  <!-- ADR-018：产品设了参考区间时展示区间提示（低于下限/高于上限由后端 400，文案走 showError）
+                       ADR-052（2026-11-04）：双向区间约束（低于下限 / 高于上限均拦截，前端标红不提交）
                        ADR-021（RSITEM-RANGE-20261020）：遥感明细行改读该明细自身区间，普通行仍读产品区间
                        2026-10-20 修复：提示可见性——显式辅助色 #71829A（原 .muted #9aa9bf 过淡）、11px；
                        遥感行单位按 ADR-021 口径展示「份」（父产品 unit 为「份（可售明细）」容器口径，不宜直接展示）
-                       ADR-039（NO-DISCOUNT-20261022）：提示行原「快捷换算摘要优先」分支删除，恒走参考区间 -->
+                       ADR-039（NO-DISCOUNT-20261022）：提示行原「快捷换算摘要优先」分支删除，恒走参考区间
+                       ADR-052：原「销售单价」列删除，其「可售/已达上限」库存提示迁移至此（与区间提示同区，信息不丢） -->
                   <span v-if="rowRangeText(row)" class="cart-amount-range">
-                    参考区间 {{ rowRangeText(row) }} 元/{{ row.rsItem ? '份' : (row.asset.unit || '单位') }}
+                    参考区间 {{ rowRangeText(row) }} 元/{{ row.rsItem ? '份' : (row.asset.unit || '单位') }}（须在此范围内）
+                  </span>
+                  <!-- ADR-052：从已删除的「销售单价」列迁来的库存提示（可重复售卖/遥感行不展示） -->
+                  <span
+                    v-if="!row.rsItem && !row.asset.repeatSale"
+                    :class="row.cart.qty >= (availOf(row) ?? 0) ? 'cart-sellable-max' : ''"
+                  >
+                    {{ row.cart.qty >= (availOf(row) ?? 0) ? `已达上限 ${availOf(row)}` : `可售 ${availOf(row)}` }}
                   </span>
                 </div>
               </div>
@@ -1112,23 +1119,7 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
   margin-top: 4px;
 }
 
-/* 销售单价列：价格 14px 加粗 + 11px 副文案（单位 + 库存/上限）
-   2026-10-23 修复①：价格进 40px 主内容区（右对齐），副文案进 18px 副提示区一行内（去掉 margin-top） */
-.cart-price {
-  justify-content: flex-end;
-}
-.cart-price-value {
-  font-size: 14px;
-  font-weight: 700;
-  color: var(--text-primary);
-  font-variant-numeric: tabular-nums;
-}
-.cart-price-sub {
-  display: flex;
-  justify-content: flex-end;
-  gap: 6px;
-  color: var(--text-secondary);
-}
+/* ADR-052（2026-11-04）：原「销售单价」列删除，.cart-price* 死样式一并移除；库存提示迁至销售金额列副提示 */
 .cart-sellable-max {
   color: var(--danger-color);
   font-weight: 600;

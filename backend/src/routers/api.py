@@ -21,6 +21,7 @@ import uuid
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPAuthorizationCredentials
+from sqlalchemy import case, func, or_
 from sqlalchemy.orm import Session
 
 from .. import models, schemas, security, services
@@ -82,6 +83,28 @@ def login(data: schemas.LoginInput, request: Request, db: Session = Depends(get_
 @router.get("/auth/me")
 def me(user: models.User = Depends(security.get_current_user)):
     return security.user_out(user)
+
+
+@router.post("/auth/change-password")
+def change_password(data: schemas.ChangePasswordInput,
+                    user: models.User = Depends(security.get_current_user),
+                    db: Session = Depends(get_db)):
+    """自助改密（ADR-054）：全角色可改本人密码，需校验旧密码。
+
+    改密后 tokenVersion+1（同 PUT /users/{id} 改密逻辑）→ 其它设备/旧会话旧 token
+    立即 401；本端点返回**用新 tokenVersion 重编码**的新 token（与 login 同形
+    `{token, user}`），前端 setSession 后当前设备无缝续用。
+    """
+    if not security.verify_password(data.oldPassword, user.passwordHash):
+        security.record_audit(db, user, "auth", "修改密码失败", "auth", user.username, "旧密码不正确")
+        raise HTTPException(400, "旧密码不正确")
+    user.passwordHash = security.hash_password(data.newPassword)
+    # BUG-11 / ADR-034 §2：改密 → tokenVersion+1，旧 token 立即失效（同 PUT /users/{id}）
+    user.tokenVersion = int(user.tokenVersion or 0) + 1
+    db.commit()
+    db.refresh(user)
+    security.record_audit(db, user, "auth", "修改密码", "auth", user.username)
+    return {"token": security.jwt_encode(user), "user": security.user_out(user)}
 
 
 # ============================================================
@@ -233,6 +256,102 @@ def list_audit_logs(
 def bootstrap(db: Session = Depends(get_db), user: models.User = Depends(security.get_current_user)):
     # ADR-009：cart 仅返回当前登录用户的行；viewer（生态人员）projects/contracts 按「自己下单」过滤
     return services.bootstrap(db, str(user.id), user)
+
+
+# ============================================================
+# 销售项目列表（服务端分页，ADR-055，仅 /sales/projects 列表页用）
+# ============================================================
+@router.get("/projects")
+def list_projects(
+    page: int = Query(1, ge=1),
+    pageSize: int = Query(20, ge=1, le=100),
+    keyword: str | None = Query(None),
+    status: str | None = Query(None),
+    rep: str | None = Query(None),
+    businessOwner: str | None = Query(None),
+    sortBy: str | None = Query(None),
+    sortOrder: str | None = Query(None),
+    db: Session = Depends(get_db),
+    user: models.User = Depends(security.get_current_user),
+):
+    """销售项目列表服务端分页（ADR-055）+ 服务端排序（ADR-056 §1）。bootstrap 的全量 projects 保持不动。
+
+    可见性与过滤均与 bootstrap/前端本地过滤同一口径：
+    - 可见性：build_visibility（user_sees_project 唯一口径）——restricted 角色
+      （editor 按 businessOwner、viewer 按 creator、finance 空集）`id.in_(vis.project_ids)`；
+      admin/supervisor 不限定。
+    - keyword：对齐前端 index.vue list computed——trim 后对
+      `${name}${code}${customer}` 拼接串做**大小写敏感**子串匹配（JS includes），
+      服务端用 SQLite instr（大小写敏感）实现，等价。
+    - status：过滤**存字段** `Project.status` 等值（前端 `p.status !== statusFilter`）。
+    - rep：`Project.rep` 等值（前端 `p.rep !== repFilter`）。
+    - businessOwner：`__none__` → 空/None（前端 `p.businessOwner` falsy 判定）；否则等值。
+    total = 「可见 ∩ 全部过滤」的 count（filter 之后 count，非切片后）。
+
+    排序（ADR-056 §1）：
+    - sortBy：`status`/`amount`/`lastFollowDate`/`expectedSignDate`/`code`；非法值按无排序处理（不报错）。
+    - sortOrder：`asc`/`desc`（默认 asc；非 desc 一律当 asc）。
+    - `status` 按**状态档位**排（SQL case 映射 rank：pending=0/active=1/delivering=2/
+      delivered=3/terminated=4），非字符串序；terminated 三展示子型同档（与 status 过滤一致）。
+    - `amount` = 前端「销售金额」列绑定字段 `Project.contractAmount`（存列，
+      `_recompute_project` 每次合同变更后重算为 Σ 合同 contractAmount，与列显示同源），
+      直接 order_by 该列即可正确反映销售金额大小。
+    - `lastFollowDate`/`expectedSignDate`：字符串日期 YYYY-MM-DD 字典序=时间序，
+      空串自然排最前（asc）/最后（desc），无需特殊处理。
+    - **分页稳定**：任何排序键后恒定追加 `id.desc()` 兜底（同排序值行跨页稳定）。
+    - 缺省（无 sortBy）→ 保持 `id.desc()`（最新在前，与 ADR-055 现状一致）。
+    """
+    vis = services.build_visibility(db, user)
+    q = db.query(models.Project)
+    if vis.restricted:
+        q = q.filter(models.Project.id.in_(vis.project_ids))
+    kw = (keyword or "").strip()
+    if kw:
+        haystack = (
+            func.coalesce(models.Project.name, "")
+            .concat(func.coalesce(models.Project.code, ""))
+            .concat(func.coalesce(models.Project.customer, ""))
+        )
+        q = q.filter(func.instr(haystack, kw) > 0)
+    if status:
+        q = q.filter(models.Project.status == status)
+    if rep:
+        q = q.filter(models.Project.rep == rep)
+    if businessOwner:
+        if businessOwner == "__none__":
+            q = q.filter(or_(models.Project.businessOwner.is_(None),
+                             models.Project.businessOwner == ""))
+        else:
+            q = q.filter(models.Project.businessOwner == businessOwner)
+    total = q.count()
+    # ADR-056 §1：服务端排序（非法 sortBy 按无排序处理；sortOrder 非 desc 一律当 asc）
+    sort_col = None
+    if sortBy == "status":
+        # 状态档位映射（生命周期序），非字符串序
+        sort_col = case(
+            (models.Project.status == "pending", 0),
+            (models.Project.status == "active", 1),
+            (models.Project.status == "delivering", 2),
+            (models.Project.status == "delivered", 3),
+            (models.Project.status == "terminated", 4),
+            else_=5,
+        )
+    elif sortBy == "amount":
+        # 「销售金额」列绑定 Project.contractAmount（存列，_recompute_project 重算=Σ合同金额）
+        sort_col = func.coalesce(models.Project.contractAmount, 0)
+    elif sortBy == "lastFollowDate":
+        sort_col = func.coalesce(models.Project.lastFollowDate, "")
+    elif sortBy == "expectedSignDate":
+        sort_col = func.coalesce(models.Project.expectedSignDate, "")
+    elif sortBy == "code":
+        sort_col = func.coalesce(models.Project.code, "")
+    if sort_col is None:
+        order = [models.Project.id.desc()]  # 缺省：最新在前（现状不变）
+    else:
+        order = [sort_col.desc() if sortOrder == "desc" else sort_col.asc(),
+                 models.Project.id.desc()]  # 恒定 id.desc() 兜底，保证翻页稳定
+    items = q.order_by(*order).offset((page - 1) * pageSize).limit(pageSize).all()
+    return {"total": total, "items": [schemas.ProjectOut.model_validate(p).model_dump() for p in items]}
 
 
 # ============================================================
@@ -434,8 +553,9 @@ def change_project_status(project_id: int, data: schemas.StatusInput, db: Sessio
 @router.post("/projects/{project_id}/review")
 def review_project(project_id: int, data: schemas.ReviewInput, db: Session = Depends(get_db),
                    user: models.User = Depends(security.require_editor)):
-    """订单审核（ADR-012，仅商务/管理员）：确认下单（可带行级改价 + 服务期限；
-    ADR-018 §4 起不再回写平台挂牌价）/ 驳回（释放锁定 + 项目终止 + 原因留痕）。
+    """订单审核（ADR-012，仅商务/管理员）：确认下单（可带行级改价 + 服务期限 +
+    ADR-050 行数量/合同总价/客户名称；ADR-018 §4 起不再回写平台挂牌价）/
+    驳回（释放锁定 + 项目终止 + 原因留痕，ADR-050 新字段忽略）。
     生态人员 403（require_editor 拦截）。
     【核心业务规则 ADR-012 修订 2026-10-19】全部建单入口统一 pending 后，本接口是唯一
     pending→active 出口；仅**商务负责人**（businessOwner 绑定账号）可操作，admin 越过，
@@ -449,13 +569,36 @@ def review_project(project_id: int, data: schemas.ReviewInput, db: Session = Dep
     return {"ok": True}
 
 
+@router.post("/projects/{project_id}/reject-contracts")
+def reject_contracts(project_id: int, data: schemas.RejectContractsInput,
+                     db: Session = Depends(get_db),
+                     user: models.User = Depends(security.require_editor)):
+    """勾选驳回（ADR-056 §2）：对 pending 项目勾选部分（或全部）pending 合同逐个驳回；
+    剩余 pending 合同项目保持 pending 可继续审核，全部驳回 → terminated。
+
+    鉴权：require_editor（admin/supervisor/editor；viewer/finance 403）+ 接手人守卫
+    （同 review：未分配 400；非负责人仅 admin/supervisor 越过，否则 403）。
+    复用整单驳回的逐合同步骤（`_reject_contracts`：释放锁定 → terminated +
+    remark「驳回：{reason}」→ 遥感明细回 in_stock → 项目派生 → 日志「驳回订单」）。
+    返回更新后的项目（ProjectOut，与 review 返回口径一致），供前端刷新。"""
+    p = services.reject_contracts(db, project_id, data.contractIds, data.reason,
+                                  operator=user.username, user=user)
+    security.record_audit(db, user, "sale", "驳回订单", "project",
+                          p.name if p else str(project_id),
+                          f"驳回销售记录 {len(data.contractIds)} 条：{data.reason.strip()}")
+    return schemas.ProjectOut.model_validate(p).model_dump()
+
+
 @router.post("/projects/{project_id}/claim")
 def claim_project(project_id: int, data: schemas.ClaimInput = schemas.ClaimInput(),
                   db: Session = Depends(get_db),
                   user: models.User = Depends(security.require_editor)):
-    """商务接手/转交（ADR-012 §5.1 纯移交制）：无负责人→接手（绑定自己）；
-    已有负责人→仅负责人可转交（body 传 newOwner=目标商务账号）或 admin 越过（接手/转交任意账号）。
-    接手后 businessOwner 成为改价/确认/驳回的权限依据（admin 可越过）。"""
+    """商务接手/转交 + 主管分配/改派（ADR-012 §5.1；ADR-051 叠加主管分配分支）：
+    无负责人→主管传 newOwner 分配给指定商务 / 否则接手（绑定自己）；
+    已有负责人→负责人转交（body 传 newOwner=目标商务账号）；
+    他人负责→仅 admin/supervisor 可改派（newOwner）或接手（不传），普通商务 400。
+    businessOwner 是改价/确认/驳回的权限依据（admin/supervisor 可越过）。
+    审计动作 = 服务层返回的动作串（分配/改派/接手/转交订单）。"""
     action = services.claim_project(db, project_id, user=user, new_owner=data.newOwner)
     p = db.get(models.Project, project_id)
     security.record_audit(db, user, "sale", action, "project",
@@ -773,8 +916,11 @@ _ENTITY_LABEL = "资产主体"
 
 @router.get("/entities", response_model=list[schemas.EntityOut])
 def list_entities(db: Session = Depends(get_db),
-                  _: models.User = Depends(security.get_current_user)):
-    """全量返回，按 createdAt 正序、id 正序（存量展示顺序稳定）。"""
+                  user: models.User = Depends(security.get_current_user)):
+    """全量返回，按 createdAt 正序、id 正序（存量展示顺序稳定）。
+    ADR-051：finance 不看公司主体 → 返回 []（不 403，避免前端报错）。"""
+    if user.role == "finance":
+        return []
     return services.list_entities(db)
 
 

@@ -130,17 +130,26 @@ def get_contract(db: Session, contract_id: int | None) -> models.Contract | None
 
 
 def user_sees_project(user: "models.User | None", p: models.Project) -> bool:
-    """销售项目可见性口径（2026-10-16：销售项目对生态人员放开，仅可见自己下单的）：
+    """销售项目可见性口径（**唯一口径**，bootstrap + 全部分页端点共用）：
 
-    - admin / editor：全部可见；
-    - viewer（生态人员）：仅「自己下单」的项目——实际下单账号（creator）是自己；
-      存量项目 creator 为空时回退「生态人员（rep）是自己姓名」判定。
+    - admin / supervisor（商务主管，ADR-051）：全部可见（含未分配池）；
+    - editor（商务，ADR-051）：仅 `businessOwner == 自己`（被分配给自己的）；
+    - viewer（生态人员，2026-10-16）：仅「自己下单」的项目——实际下单账号（creator）是自己；
+      存量项目 creator 为空时回退「生态人员（rep）是自己姓名」判定；
+    - finance（财务，ADR-051）：无销售项目。
     """
-    if user is None or user.role != "viewer":
+    if user is None:
         return True
-    if p.creator:
-        return p.creator == user.username
-    return bool(p.rep) and p.rep in (user.name, user.username)
+    role = user.role
+    if role in ("admin", "supervisor"):
+        return True
+    if role == "editor":
+        return (p.businessOwner or "").strip() == user.username
+    if role == "viewer":
+        if p.creator:
+            return p.creator == user.username
+        return bool(p.rep) and p.rep in (user.name, user.username)
+    return False  # finance：无销售项目
 
 
 def _normalize_rep(db: Session, rep: str) -> str:
@@ -167,8 +176,10 @@ def _normalize_rep(db: Session, rep: str) -> str:
 class Visibility:
     """请求级可见性上下文。
 
-    - admin / editor：全部可见（`restricted=False`，各 visible_* 直接放行）；
-    - viewer（生态人员）：仅自己下单的项目及其合同/交付/流水/日志 + 公开产品相关资源。
+    - admin / supervisor：全部可见（`restricted=False`，各 visible_* 直接放行）；
+    - editor（商务）：仅 businessOwner==自己 的项目（ADR-051）；
+    - viewer（生态人员）：仅自己下单的项目及其合同/交付/流水/日志 + 公开产品相关资源；
+    - finance（财务）：无销售项目（project_ids=∅），仅公开产品相关资源（ADR-051）。
     """
 
     def __init__(self, user: "models.User | None", project_ids: set[int] | None = None,
@@ -177,7 +188,9 @@ class Visibility:
                  own_files: set[str] | None = None):
         self.user = user
         self.username = (user.username if user is not None else "")
-        self.restricted = bool(user is not None and user.role == "viewer")
+        # ADR-051：admin/supervisor 全放行；editor（仅名下）/viewer（仅自己）/finance（∅）
+        # 走 restricted 分支，project_ids 由 build_visibility 经 user_sees_project 预计算
+        self.restricted = bool(user is not None and user.role not in ("admin", "supervisor"))
         self.project_ids = project_ids or set()
         self.contract_ids = contract_ids or set()
         self.outbound_ids = outbound_ids or set()
@@ -400,9 +413,9 @@ def _check_discount_range(asset: models.Asset | None, qty: int, amount,
       文案收口：去「折扣」字样，与 ADR-039 折扣下线一致）。
     - ADR-021（RSITEM-RANGE-20261020）：遥感明细行（rs 非空）区间取该 rs_item 自身的
       priceMin/priceMax（不再取父产品容器 assets 的区间）；普通产品行行为不变。
-    - ADR-049（2026-10-29，部分取代 ADR-037 §3）：**购物车/结算入口固定 `enforce_max=False`**
-      （只校验下限 amount < priceMin → 400，上限不限制，任何角色一致）；
-      `enforce_max=True` 仅剩「商务手工建单」（POST /projects）路径使用（维持双向）。
+    - ADR-052（2026-11-04，取代 ADR-049 的「购物车只卡下限」）：**购物车/结算入口 `enforce_max=True`（双向）**
+      （低于下限 amount < priceMin → 400；高于上限 amount > priceMax → 400）；
+      `enforce_max=True` 用于购物车/结算 + 商务手工建单（POST /projects），均双向。
       **审核改价（POST /projects/{id}/review）不调用本函数**，金额不受区间约束。
     返回 Decimal 金额（元，精度 1e-6）。"""
     if amount is None:
@@ -426,7 +439,7 @@ def _check_discount_range(asset: models.Asset | None, qty: int, amount,
     # 2026-10-29：判定**直接拿销售金额与区间比较**，不再除以数量折算单价
     # （原 unit_price = amount / qty → qty>1 时金额被除小，低于下限误 400）
     u = unit or (asset.unit if asset else "")
-    # ADR-049：购物车链路固定 enforce_max=False（只校验下限，上限不限制）
+    # ADR-052：购物车链路 enforce_max=True（双向区间约束）
     if (lo is not None and amt < _dec(lo)) or (enforce_max and hi is not None and amt > _dec(hi)):
         raise HTTPException(400, f"销售金额超出该产品参考区间（{_range_label(lo, hi, u)}）")
     return amt
@@ -448,8 +461,8 @@ def _check_unit_price_range(asset: models.Asset | None, price, qty: int = 1,
 
     单价 = price（元/{unit}）须落在 [priceMin, priceMax]；未设置区间 = 不限制，单边按单边校验。
     超限 400「销售单价超出该产品参考区间（…）」。
-    ADR-049（2026-10-29，部分取代 ADR-037 §3）：购物车/结算链路固定 `enforce_max=False`
-    （只校验下限）；`enforce_max=True` 仅剩商务手工建单路径，与 `_check_discount_range` 同口径。
+    ADR-052（2026-11-04，取代 ADR-049 的「购物车只卡下限」）：购物车/结算链路 `enforce_max=True`
+    （双向区间约束）；`enforce_max=True` 用于购物车/结算 + 商务手工建单，与 `_check_discount_range` 同口径。
     """
     if asset is None or qty <= 0:
         return
@@ -642,6 +655,7 @@ def create_asset(db: Session, data: schemas.AssetInput, operator: str = "") -> m
         unit=data.unit, quantity=data.quantity, repeatSale=data.repeatSale,
         salePrice=data.salePrice,
         priceMin=data.priceMin, priceMax=data.priceMax,  # ADR-018 §1：参考区间（可空=不限制）
+        taxPoint=data.taxPoint,  # ADR-053：税点（可空=未设置，纯展示不参与计算）
         status=data.status,  # 占位，下方按数量自动判定覆盖
         inboundDate=inbound_date, expiryDate=data.expiryDate,
         perpetual=data.perpetual, spec=data.spec, saleDetail=data.saleDetail,
@@ -672,7 +686,9 @@ def create_asset(db: Session, data: schemas.AssetInput, operator: str = "") -> m
 ASSET_FIELD_LABELS = {
     "name": "产品名称", "board": "所属板块", "type": "产品类型", "subject": "所属主体",
     "unit": "单位", "quantity": "产品总数", "repeatSale": "可重复售卖",
-    "salePrice": "销售单价", "priceMin": "参考区间下限", "priceMax": "参考区间上限",
+    # ADR-053：salePrice 语义改为「采购单价」（字段名/类型不变，仅文案）；新增 taxPoint「税点」
+    "salePrice": "采购单价", "priceMin": "参考区间下限", "priceMax": "参考区间上限",
+    "taxPoint": "税点",
     "status": "产品状态", "inboundDate": "登记日期",
     "expiryDate": "到期日期", "perpetual": "永久授权", "spec": "规格描述",
     "saleDetail": "销售明细", "featureDoc": "功能清单", "contractFile": "产品清单",
@@ -726,6 +742,7 @@ def update_asset(db: Session, asset_id: int, patch: dict, operator: str = "admin
         raise HTTPException(404, "产品不存在")
     allowed = {"name", "board", "type", "subject", "unit", "quantity", "repeatSale",
                "salePrice", "priceMin", "priceMax",  # ADR-018 §1（PRICING-20261020）：参考区间
+               "taxPoint",  # ADR-053：税点（可空，传 null 清空）
                "status", "inboundDate", "expiryDate", "perpetual",
                "spec", "saleDetail", "featureDoc", "contractFile", "remark"}
     # BUG-28：日期入参统一校验（YYYY-MM-DD，允许空串；只校验本次写入值，不清洗存量）
@@ -2120,9 +2137,11 @@ def _derive_project_status(p: models.Project) -> str:
     | 合同状态集合 | 项目状态 |
     |---|---|
     | 全 pending | pending（待审核） |
+    | {pending, terminated} 且含 pending（ADR-056 §2：部分驳回，剩余可续审） | pending（待审核） |
+    | 含 pending 且其余 ⊆ {active, delivering, delivered, terminated}（ADR-057 §3：部分确认，剩余可续审） | pending（待审核） |
     | 全 delivered | delivered（已完成） |
     | ⊆ {delivered, terminated} 且含 delivered（BUG-17：已交付 + 剩余作废） | delivered（已完成） |
-    | 含 terminated 且其余全 pending/terminated | terminated |
+    | 含 terminated 且其余全 terminated（无 pending） | terminated |
     | 全部合同 status ∈ {delivering, delivered}（即全部已签，含已交付） | delivering（交付中） |
     | 其余（含 active 未签完） | active（进行中） |
 
@@ -2137,6 +2156,16 @@ def _derive_project_status(p: models.Project) -> str:
     # （已交付的部分作废，项目不再显示「进行中」，也不再让项目级接口永久 400）
     if statuses <= {"delivered", "terminated"} and "delivered" in statuses:
         return "delivered"
+    # ADR-056 §2 + ADR-057 §3：只要还有 pending 合同（其余 ⊆ 非 pending 终态/流转态），
+    # 项目就保持 pending（剩余待审核合同可继续审核）。
+    # - ADR-056：[terminated×N, pending×M]（M>0）——此前该混合态被归入 terminated（整单
+    #   驳回路径下不会出现此混合态，无存量影响）；
+    # - ADR-057：[active×N, pending×M]（M>0）——部分确认新路径；核查确认合同置 active
+    #   仅发生在 review confirm（原整单确认会激活全部合同），故该混合态此前不可能产生，
+    #   本分支为纯新增，无存量行为变化。
+    if "pending" in statuses and statuses <= {"pending", "active", "delivering",
+                                              "delivered", "terminated"}:
+        return "pending"
     if "terminated" in statuses and statuses <= {"pending", "terminated"}:
         return "terminated"
     # ADR-019 §3：全部已签（delivering/delivered 混合）→ 交付中
@@ -2302,13 +2331,13 @@ def patch_contract_fields(db: Session, contract_id: int, patch: dict,
     """PATCH /contracts/{id}（ADR-019，PRICING-20261020）：录入合同时间节点。
 
     patch 为 exclude_unset dict（仅采信客户端实际传了的字段，区分「未传」与「传 null」）：
-    - signedDate（合同签订时间）：editor/admin（接手人守卫，与审核同口径：仅该单
-      businessOwner 或 admin）；仅合同 active 可录入（录入即 active→delivering +
-      项目重算）；录后可改（delivering 状态改值）、**传 null/空清空 → 400**
-      「签订时间录入后不可清空」；
-    - scheduledDeliveryDate（预计交付时间）：**仅 admin**（非 admin 403）；
+    - signedDate（合同签订时间）：接手人守卫，与审核同口径（仅该单 businessOwner
+      或 admin/supervisor，ADR-051 主管越过）；仅合同 active 可录入（录入即
+      active→delivering + 项目重算）；录后可改（delivering 状态改值）、
+      **传 null/空清空 → 400**「签订时间录入后不可清空」；
+    - scheduledDeliveryDate（预计交付时间）：**仅 admin**（非 admin 403，ADR-051 不变）；
       仅合同 delivering 可录/改/清空（null 允许，可纠正）。
-    viewer 直接 403「只读账号不可执行该操作」（该端点仅 editor/admin 使用）。
+    viewer 直接 403「只读账号不可执行该操作」（该端点仅 editor/admin/supervisor 使用）。
     返回更新后的合同。"""
     c = get_contract(db, contract_id)
     if not c:
@@ -2320,10 +2349,14 @@ def patch_contract_fields(db: Session, contract_id: int, patch: dict,
     if user.role == "viewer":
         raise HTTPException(403, "只读账号不可执行该操作")
     is_admin = user.role == "admin"
+    # ADR-051：signedDate 守卫 = 负责人或 admin/supervisor（与 review 同口径，主管越过）；
+    # scheduledDeliveryDate 仍**仅 admin**（下方独立判定，不共用）
+    can_sign = is_admin or user.role == "supervisor" \
+        or (p.businessOwner or "").strip() == user.username
 
     if "signedDate" in patch:
-        # 接手人守卫（与 review 同口径）：仅该单商务负责人可录，admin 越过
-        if not is_admin and (p.businessOwner or "").strip() != user.username:
+        # 接手人守卫（与 review 同口径）：仅该单商务负责人可录，admin/supervisor 越过
+        if not can_sign:
             raise HTTPException(403,
                 f"仅接手的商务负责人（{p.businessOwner}）可录入合同签订时间，如需处理请先转交")
         val = (patch.get("signedDate") or "").strip()
@@ -2375,52 +2408,63 @@ def _validate_business_owner(db: Session, username: str) -> None:
     if not name:
         return
     tgt = db.query(models.User).filter(models.User.username == name).first()
-    if tgt is None or not tgt.enabled or tgt.role not in ("editor", "admin"):
+    # ADR-051：分配/接手目标 = 启用中的 editor（商务）；admin/supervisor 放行
+    #（主管自接时 target 可能是 supervisor）
+    if tgt is None or not tgt.enabled or tgt.role not in ("editor", "admin", "supervisor"):
         raise HTTPException(400, f"「{name}」不是可用的商务账号，请重新选择")
 
 
 def claim_project(db: Session, project_id: int, user: models.User,
                   new_owner: str = "") -> str:
-    """商务接手/转交（ADR-012 §5.1，纯移交制）：
+    """商务接手/转交 + 主管分配/改派（ADR-012 §5.1 纯移交制；ADR-051 叠加主管分配分支）：
 
-    - 无负责人（pending/active 均可）：任意商务/管理员 → **接手**（绑定自己）；
-    - 已有负责人（**移交**）：仅**当前负责人**可转交——必须传 `new_owner`（启用的商务/管理员账号）；
-      admin 越过：可接手（绑自己）或转交给任意账号；
-      非负责人的普通商务 → 400（不可抢单，权责清晰）；
+    - 无负责人（pending/active 均可）：
+      - admin/supervisor 且传 `new_owner` → **分配**（绑定指定商务）；
+      - 否则 → **接手**（绑定操作人自己，含主管自接）；
+    - 已有负责人（**移交**）：
+      - 当前负责人 → **转交**——必须传 `new_owner`（启用的商务账号，不能是自己）；
+      - 他人负责：admin/supervisor → **改派**（传 `new_owner` 改绑指定商务）或**接手**（未传绑自己）；
+        非负责人的普通商务 → 400（不可抢单，权责清晰）；
     - delivered/terminated 终态 → 400。
-    返回动作标识（"接手订单" / "转交订单"，路由层写审计）。"""
+    返回动作标识（"分配订单"/"改派订单"/"接手订单"/"转交订单"，路由层写审计）。"""
     p = get_project(db, project_id)
     if not p:
         raise HTTPException(404, "项目不存在")
     if p.status in ("delivered", "terminated"):
         raise HTTPException(400, "该订单已完成/已终止，不可接手或转交")
     old = (p.businessOwner or "").strip()
-    is_admin = user.role == "admin"
+    new_owner = (new_owner or "").strip()
+    is_mgr = user.role in ("admin", "supervisor")  # ADR-051：主管可分配/改派
     if not old:
-        target = user.username  # 无主 → 接手（绑定操作人）
+        if is_mgr and new_owner:
+            target, action = new_owner, "分配订单"  # 无主 + 主管指定 → 分配给指定商务
+        else:
+            target, action = user.username, "接手订单"  # 无主 → 接手（绑定操作人，含主管自接）
     elif old == user.username:
         # 负责人移交：必须指定新负责人
-        new_owner = (new_owner or "").strip()
         if not new_owner:
             raise HTTPException(400, "请指定转交的目标商务账号")
         if new_owner == user.username:
             raise HTTPException(400, "转交目标不能是自己")
-        target = new_owner
+        target, action = new_owner, "转交订单"
     else:
-        if not is_admin:
-            raise HTTPException(400, f"该订单由商务负责人「{old}」负责，仅其本人可转交（如需介入请联系 admin 处理）")
-        target = (new_owner or "").strip() or user.username  # admin：指定则转交，未指定接手给自己
+        if not is_mgr:
+            raise HTTPException(400,
+                f"该订单由商务负责人「{old}」负责，如需改派请联系商务主管处理")
+        if new_owner:
+            target, action = new_owner, "改派订单"  # 主管改派：改绑指定商务
+        else:
+            target, action = user.username, "接手订单"  # 主管接手：改绑自己
     _validate_business_owner(db, target)
     p.businessOwner = target
     if old:
-        add_log(db, "project", p.name, "转交订单",
+        add_log(db, "project", p.name, action,
                 f"商务负责人 {old} → {target}", operator=user.username, project_id=p.id)
-        db.commit()
-        return "转交订单"
-    add_log(db, "project", p.name, "接手订单",
-            f"商务负责人绑定为 {target}", operator=user.username, project_id=p.id)
+    else:
+        add_log(db, "project", p.name, action,
+                f"商务负责人绑定为 {target}", operator=user.username, project_id=p.id)
     db.commit()
-    return "接手订单"
+    return action
 
 
 def review_project(db: Session, project_id: int, data: schemas.ReviewInput,
@@ -2436,61 +2480,124 @@ def review_project(db: Session, project_id: int, data: schemas.ReviewInput,
     ADR-020：行级入参可改服务期限（serviceStart/serviceEnd，格式/顺序校验）；
     NO-DISCOUNT-20261022 / ADR-039：**折扣率已下线**——审核改价只写 price/amount/service，
     既不读入参 discountRate、也**不回写** `ProjectItem.discountRate`（存量历史快照原值保留）；
-    数量审核时不可改（需改数量 → 驳回重下）；确认后存在 amount<=0 行 → 400；
+    ADR-050（2026-11-03）：数量审核可改（非遥感行；遥感行 qty≡1 传入忽略）——
+    unit 行 amount=price×finalQty 重算；amount 行传 amount 权威、只传 qty 按数量比例缩放；
+    非 repeatSale、非遥感行改数量 = 调整既有锁定（delta>0 走既有原子条件更新，
+    可用库存不足 → 400「第 X 行可用库存不足（需 N，当前可售 M）」，整事务回滚；
+    释放不足等不变量破坏 → 500 + 审计，ADR-033）；repeatSale 不锁库存只计次。
+    contracts[]（ADR-050）：合同总价按行金额比例分摊（残差归金额最大行，Σ行==总额精确，
+    合同总价最后生效覆盖逐行值）；customer 改写 Contract.customer（trim 非空 ≤128 字，
+    同项目内另一合同改后客户相同且明细集合相同 → 400，对齐建单期口径）；
+    Project.customer 由 _recompute_project 重派生；
+    确认后存在 amount<=0 行 → 400；
     合同 pending→active、项目派生 → active。
+    ADR-057（2026-11-04）：confirm 可选 contractIds（部分确认）——提供时 targets=勾选的
+    pending 合同（须全部属于该项目且 status=pending，否则 400；空列表 400），行级改价/改数量、
+    合同总价分摊、锁定调整、服务期限、守卫（空单/0元/pending_asset）、`c.status="active"`
+    均只作用于 targets；未勾选合同保持 pending 一字不动（锁定保持），项目在有 pending 合同时
+    派生保持 pending 可续审（_derive_project_status）；缺省（None）= 项目下全部 pending
+    合同，整单确认行为与现状一致（向后兼容）。
     reject：reason 必填；逐明细释放锁定（仅 it.locked）；合同 pending→terminated
-    （remark 留痕「驳回：{reason}」）、项目 terminated。单事务（H8）。"""
+    （remark 留痕「驳回：{reason}」）、项目 terminated。单事务（H8）。
+    ADR-050：reject 路径忽略 contracts 与 items[].qty（行为与现状完全一致）。"""
     p = get_project(db, project_id)
     if not p:
         raise HTTPException(404, "项目不存在")
     if p.status != "pending":
         raise HTTPException(400, "仅待审核项目可审核（确认下单/驳回）")
-    # ADR-012 §5.1 接手人守卫：未接手 400；非接手人仅 admin 可越过（日志留痕实际操作人由路由层审计覆盖）
+    # ADR-012 §5.1 接手人守卫：未分配 400；非负责人仅 admin/supervisor 可越过
+    #（ADR-051 Q3：主管为审核兜底处理人；日志留痕实际操作人由路由层审计覆盖）
     if user is not None:
         if not (p.businessOwner or "").strip():
-            raise HTTPException(400, "该订单尚未被商务接手，请先接手后再操作")
-        if p.businessOwner != user.username and user.role != "admin":
+            raise HTTPException(400, "该订单尚未分配，请先由商务主管分配")
+        if p.businessOwner != user.username and user.role not in ("admin", "supervisor"):
             # BUG-33 / api-contracts §1：权限类失败统一 403（此前 400）
             raise HTTPException(403,
                 f"仅接手的商务负责人（{p.businessOwner}）可调整该订单价格，如需处理请先转交")
     contracts = list(p.contracts)
+    c_by_id = {c.id: c for c in contracts}
+    diffs: list[str] = []
 
     if data.action == "reject":
         if not (data.reason or "").strip():
             raise HTTPException(400, "驳回原因不能为空")
         reason = data.reason.strip()
-        for c in contracts:
-            for it in c.items:
-                _apply_item_release(db, it, operator=operator, ref=c.code, contract_id=c.id)
-            c.status = "terminated"
-            # 留痕：生态人员经 bootstrap 仍可见驳回原因
-            # FIX-20261020-#11：追加而非覆盖——原合同备注（下单时的说明）必须保留
-            if (c.remark or "").strip():
-                c.remark = f"{c.remark}｜驳回：{reason}"
-            else:
-                c.remark = f"驳回：{reason}"
-            c.updatedAt = today()
-        # RS-STATUS-20261022：驳回 = 全部明细释放 → 状态必须回 in_stock。
-        # 上面循环里 `_apply_item_release` 的重算读到的合同状态仍是 pending（本循环之后才置
-        # terminated），故此处 flush 后再统一重算一次（冗余自愈，杜绝「驳回后明细仍售罄」）。
-        db.flush()
-        _sync_rs_item_statuses(
-            db, [it.itemId for c in contracts for it in c.items])
-        _recompute_project(p)
-        add_log(db, "project", p.name, "驳回订单",
-                f"项目 {p.code} 订单已驳回：{reason}（锁定已释放）", operator=operator,
-                project_id=p.id)
+        # ADR-056 §2：逐合同驳回步骤抽为 `_reject_contracts`（整单驳回=全部合同，
+        # 勾选驳回=选中合同，两处口径一致）
+        _reject_contracts(db, p, contracts, reason, operator=operator)
         db.commit()
         return
 
     if data.action != "confirm":
         raise HTTPException(400, f"不支持的审核动作：{data.action}")
 
-    # confirm：应用行级改价（只改合同行，未传改价的行保持原值）
-    # ADR-018 §4（PRICING-20261020）：不再装配 price_changes_by_asset、不再回写挂牌价
-    by_id = {i.itemId: i for i in data.items}
-    diffs: list[str] = []
+    # ---- ADR-057 §3：确定本次确认的目标合同集合 targets ----
+    # contractIds 缺省（None）= 整单确认：项目下全部 pending 合同（行为与现状一致，向后兼容）；
+    # 提供时 = 部分确认：只确认勾选的 pending 合同，未勾选保持 pending（项目有 pending 时
+    # 派生保持 pending 可续审，_derive_project_status）。
+    if data.contractIds is None:
+        targets = [c for c in contracts if c.status == "pending"]
+    else:
+        targets: list[models.Contract] = []
+        for cid in data.contractIds:
+            c = c_by_id.get(cid)
+            if c is None:
+                raise HTTPException(400, f"销售记录 {cid} 不属于该项目")
+            if c.status != "pending":
+                raise HTTPException(400, f"销售记录 {c.code} 非待审核状态，不可确认")
+            if c not in targets:
+                targets.append(c)
+        if not targets:
+            raise HTTPException(400, "contractIds 不能为空")
+
+    # ---- ADR-050：合同级入参解析（仅 confirm 生效；reject 忽略 contracts）----
+    # 先做全部 400 前置校验（归属/重复/字段/客户冲突），再落写——任一失败整事务回滚
+    contract_inputs: dict[int, schemas.ReviewContractInput] = {}
+    for ci in data.contracts:
+        if ci.contractId in contract_inputs:
+            raise HTTPException(400, f"销售记录 {ci.contractId} 重复出现在 contracts 中")
+        c = c_by_id.get(ci.contractId)
+        if c is None:
+            raise HTTPException(400, f"销售记录 {ci.contractId} 不属于该项目")
+        # ADR-057：部分确认时，合同级入参（总价/客户名）只允许针对本次确认的合同
+        if c not in targets:
+            raise HTTPException(400, f"销售记录 {c.code} 不在本次确认范围内")
+        if ci.customer is not None:
+            cust = (ci.customer or "").strip()
+            if not cust:
+                raise HTTPException(400, f"销售记录 {c.code} 的客户名称不能为空")
+            if len(cust) > 128:
+                raise HTTPException(400, f"销售记录 {c.code} 的客户名称不能超过 128 字")
+            ci.customer = cust
+        if ci.amount is not None:
+            # ADR-048：合同总价格式同销售金额（>0 且 ≤6 位小数）
+            ci.amount = float(_validate_amount_yuan(ci.amount))
+        contract_inputs[ci.contractId] = ci
+    # 客户冲突守卫（对齐建单期「同客户 + 相同明细 400」口径，建单段 seen_contracts 判定）：
+    # 以「改后」客户值 + 明细集合 (assetId, itemId) 排序元组为键，同项目内两合同键相同 → 400
+    _cust_keys: dict[tuple, str] = {}
     for c in contracts:
+        ci = contract_inputs.get(c.id)
+        cust = ci.customer if (ci is not None and ci.customer is not None) else (c.customer or "").strip()
+        key = (cust, tuple(sorted(((it.assetId or 0), (it.itemId or 0)) for it in c.items)))
+        if key[0] and key in _cust_keys:
+            raise HTTPException(400,
+                f"客户「{key[0]}」下相同的销售明细不可重复（与 {c.code} 冲突，请调整客户名称）")
+        _cust_keys[key] = c.code
+    for ci in contract_inputs.values():
+        c = c_by_id[ci.contractId]
+        if ci.customer is not None and ci.customer != c.customer:
+            diffs.append(f"{c.code} 客户 {c.customer or '-'} → {ci.customer}")
+            c.customer = ci.customer
+
+    # confirm：应用行级改价/改数量（只改合同行，未传的行保持原值）
+    # ADR-018 §4（PRICING-20261020）：不再装配 price_changes_by_asset、不再回写挂牌价
+    # ADR-049：审核链路不走参考区间（含改数量导致的折算单价变化）
+    by_id = {i.itemId: i for i in data.items}
+    # ADR-050：数量改动登记（it.id → (原qty, finalQty)），库存锁定调整在合同总价分摊之后统一执行
+    qty_changes: dict[int, tuple[int, int]] = {}
+    # ADR-057：行级改价/改数量只处理 targets 合同下的明细（未勾选合同一字不动）
+    for c in targets:
         for it in c.items:
             ri = by_id.get(it.id)
             if ri is None:
@@ -2499,6 +2606,7 @@ def review_project(db: Session, project_id: int, data: schemas.ReviewInput,
                 # 2026-10-20：遥感明细行放开审核改价——仅改**本行**销售金额（元，≤6 位小数，price 派生反算）；
                 # 不回写 rs_items.price（明细单价属产品「可售明细」主数据）也不进 price_changes_by_asset
                 #（不污染平台挂牌价）——订单级一次性价调整，其他订单不受影响
+                # ADR-050：遥感行 qty ≡ 1 不可改，传入忽略
                 if ri.amount is None:
                     continue
                 amt = _validate_amount_yuan(ri.amount)
@@ -2512,35 +2620,120 @@ def review_project(db: Session, project_id: int, data: schemas.ReviewInput,
                 continue
             a = get_asset(db, it.assetId)
             old_price, old_amount = it.price, it.amount
+            # ADR-050：行数量解析（非遥感行）——finalQty = qty ?? 原值（≥1）
+            final_qty = it.qty
+            if ri.qty is not None:
+                if ri.qty < 1:
+                    raise HTTPException(400, "数量必须大于 0")
+                final_qty = ri.qty
+            if final_qty != it.qty:
+                qty_changes[it.id] = (it.qty, final_qty)
+                it.qty = final_qty
             if a is not None and _is_amount_mode(a):
-                if ri.amount is None:
-                    continue
-                amt = _validate_amount_yuan(ri.amount)
-                it.amount = float(amt)
-                it.price = _derived_price(amt, it.qty)  # 派生参考单价（元/个）反算展示
-                # ADR-018 §4：不再回写 assets.salePrice（orig 快照永不触碰）
-                name = a.name
-                diffs.append(f"{name} 销售金额 {_fmt_money(old_amount)} → {_fmt_money(it.amount)} 元")
+                # amount 模式（包量/卫星 Token，合同金额权威）：
+                # 传 amount → 权威（price 派生）；只传 qty → 金额按数量比例缩放（price 随之派生）；
+                # 都不传 → 保持原值
+                if "amount" in ri.model_fields_set:
+                    amt = _validate_amount_yuan(ri.amount)
+                    it.amount = float(amt)
+                    it.price = _derived_price(amt, final_qty)  # 派生参考单价（元/个）反算展示
+                    # ADR-018 §4：不再回写 assets.salePrice（orig 快照永不触碰）
+                    name = a.name
+                    diffs.append(f"{name} 销售金额 {_fmt_money(old_amount)} → {_fmt_money(it.amount)} 元")
+                elif it.id in qty_changes:
+                    # 只传 qty：金额按数量比例缩放 = 原amount × finalQty / 原qty（Decimal，1e-6）
+                    old_qty, fq = qty_changes[it.id]
+                    scaled = (_dec(it.amount) * fq / old_qty).quantize(AMOUNT_QUANT)
+                    it.amount = float(scaled)
+                    it.price = _derived_price(scaled, fq)
+                    name = a.name
+                    diffs.append(f"{name} 数量 {old_qty} → {fq}（销售金额按数量比例缩放 "
+                                  f"{_fmt_money(old_amount)} → {_fmt_money(it.amount)} 元）")
             else:
-                if ri.price is None:
+                # unit 模式（amount = price × qty）：price 权威——
+                # finalPrice = price ?? 原值；finalAmount = quantize(finalPrice × finalQty, 1e-6)
+                # （即使传入 amount 也以 price×qty 为准，ADR-050 §2）
+                if ri.price is None and it.id not in qty_changes:
                     continue
-                if ri.price <= 0:
-                    raise HTTPException(400, "单价须大于 0")
-                # ADR-048：审核改价单价同样限 ≤6 位小数（直连接口兜底）
-                price_dec = _dec(ri.price)
-                if price_dec != price_dec.quantize(AMOUNT_QUANT):
-                    raise HTTPException(400, "单价须最多保留 6 位小数")
-                it.price = float(price_dec)
-                it.amount = float((_dec(ri.price) * it.qty).quantize(AMOUNT_QUANT))
+                if ri.price is not None:
+                    if ri.price <= 0:
+                        raise HTTPException(400, "单价须大于 0")
+                    # ADR-048：审核改价单价同样限 ≤6 位小数（直连接口兜底）
+                    price_dec = _dec(ri.price)
+                    if price_dec != price_dec.quantize(AMOUNT_QUANT):
+                        raise HTTPException(400, "单价须最多保留 6 位小数")
+                    it.price = float(price_dec)
+                it.amount = float((_dec(it.price) * final_qty).quantize(AMOUNT_QUANT))
                 # ADR-018 §4：不再回写 assets.salePrice（orig 快照永不触碰）
                 name = a.name if a else f"产品 #{it.assetId}"
-                diffs.append(f"{name} 单价 {_fmt_money(old_price)} → {_fmt_money(it.price)} 元")
-    # 合同合计重算（派生 = Σ 行 amount）
-    for c in contracts:
+                if ri.price is not None:
+                    diffs.append(f"{name} 单价 {_fmt_money(old_price)} → {_fmt_money(it.price)} 元")
+                if it.id in qty_changes:
+                    old_qty, fq = qty_changes[it.id]
+                    diffs.append(f"{name} 数量 {old_qty} → {fq}（金额 {_fmt_money(old_amount)} → "
+                                  f"{_fmt_money(it.amount)} 元）")
+    # ---- ADR-050：合同总价分摊（行级解析之后，逐合同；合同总价最后生效，覆盖逐行值）----
+    for ci in contract_inputs.values():
+        if ci.amount is None:
+            continue
+        c = c_by_id[ci.contractId]
+        if not c.items:
+            raise HTTPException(400, f"销售记录 {c.code} 没有明细行，无法分摊合同总价")
+        target = _dec(ci.amount)
+        sum_dec = sum((_dec(it.amount) for it in c.items), Decimal("0"))
+        if sum_dec <= 0:
+            raise HTTPException(400, f"销售记录 {c.code} 明细金额合计为 0，无法按金额比例分摊合同总价")
+        # 各行按 finalAmount/sum×target 量化；四舍五入残差落到金额最大行，使 Σ行 == target 精确
+        alloc = {it.id: (_dec(it.amount) / sum_dec * target).quantize(AMOUNT_QUANT) for it in c.items}
+        residual = target - sum(alloc.values(), Decimal("0"))
+        if residual != 0:
+            max_it = max(c.items, key=lambda x: _dec(x.amount))
+            alloc[max_it.id] += residual
+        for it in c.items:
+            it.amount = float(alloc[it.id])
+            it.price = _derived_price(alloc[it.id], it.qty)  # 单价重新派生（元/个）
+        c.contractAmount = float(target)  # ADR-029 不变式：合同总额 = Σ行 = target
+        diffs.append(f"{c.code} 合同总价 → {_fmt_money(target)} 元（按明细比例分摊）")
+    # 合同合计重算（派生 = Σ 行 amount；已分摊合同 Σ行 == target，重算幂等）
+    # ADR-057：只重算 targets（未勾选合同未做任何行级改动，重算亦为幂等无变化，但保持「一字不动」口径）
+    for c in targets:
         c.contractAmount = float(
             sum((_dec(it.amount) for it in c.items), Decimal("0")).quantize(AMOUNT_QUANT))
+    # ---- ADR-050：数量改动 → 库存锁定调整（非 repeatSale、非遥感行；全部在 confirm 单事务内）----
+    # 建单（pending）时已按原 qty 锁定；改数量 = 调整既有锁定，净效果 = 该订单持有 finalQty 锁定。
+    # 仅 it.locked（下单时真实加锁）的行参与锁定账（与释放/交付口径一致，防幽灵流水）。
+    # ADR-057：qty_changes 只登记自 targets 行级解析（上方循环已按 targets 过滤），
+    # 故锁定调整天然只按选中合同的数量变化执行，未勾选合同锁定不动。
+    for it in [x for c in contracts for x in c.items]:
+        if it.id not in qty_changes:
+            continue
+        old_qty, final_qty = qty_changes[it.id]
+        delta = final_qty - old_qty
+        a = get_asset(db, it.assetId)
+        if a is None:
+            continue  # pending_asset 行由下方守卫 400
+        eff_repeat = _item_repeat(db, a, it.itemId)
+        if eff_repeat:
+            continue  # repeatSale：不锁数量、只计次，改数量无库存约束
+        if not it.locked:
+            continue  # 下单时未真实加锁（repeatSale 期间下单等）→ 无锁定可调整
+        if delta > 0:
+            # 前置校验给出 ADR-050 规定文案；真正原子性由 apply_item_lock 条件更新保证
+            # （quantity − lockedQty − shippedQty ≥ delta，与既有加锁口径一致，防超卖）
+            available = a.quantity - a.lockedQty - a.shippedQty
+            if available < delta:
+                raise HTTPException(
+                    400, f"第 {it.id} 行可用库存不足（需 {delta}，当前可售 {available}）")
+            apply_item_lock(db, it.assetId, delta, True, p.code, operator=operator,
+                            contract_id=it.contractId, repeat_override=eff_repeat)
+        elif delta < 0:
+            # 释放：lockedQty ≥ -delta 条件更新，失败 → 500 不变量告警 + 审计（ADR-033，不静默）
+            apply_item_lock(db, it.assetId, -delta, False, p.code, operator=operator,
+                            contract_id=it.contractId, repeat_override=eff_repeat)
     # 确认守卫：防 0 元单生效（覆盖参考价未设的极端路径）
-    all_items = [it for c in contracts for it in c.items]
+    # ADR-057：守卫按**选中集合**判定（空单/0元/pending_asset 只看 targets，
+    # 未勾选合同的异常不影响本次部分确认）
+    all_items = [it for c in targets for it in c.items]
     # 2026-10-19 排查修复（S1）：空草稿项目（0 明细）不可 confirm——否则产生 0 元 0 明细的
     # 「已生效」项目且可被批量「交付」，唯一出口只剩终止
     if not all_items:
@@ -2557,7 +2750,8 @@ def review_project(db: Session, project_id: int, data: schemas.ReviewInput,
     # ADR-020：confirm 可改服务期限（只写 ProjectItem，格式/顺序校验）
     # FIX-20261022（api-contracts §3）：语义改为「**未传 = 保持原值；显式 null = 清空**」
     # （与 PUT /cart/{id} 的 UNSET 哨兵口径一致）——此前把 null 当"未传"，前端「清空日期」无效。
-    for c in contracts:
+    # ADR-057：服务期限只写 targets 明细
+    for c in targets:
         for it in c.items:
             ri = by_id.get(it.id)
             if ri is None:
@@ -2570,14 +2764,91 @@ def review_project(db: Session, project_id: int, data: schemas.ReviewInput,
             # 只传一边时与存量另一边组合校验（防改一边造成 start > end）
             new_start, new_end = _validate_service_period(new_start, new_end)
             it.serviceStart, it.serviceEnd = new_start, new_end
-    for c in contracts:
+    # ADR-057：只把 targets 置 active；未勾选合同保持 pending（锁定保持、可续审）
+    for c in targets:
         c.status = "active"
         c.updatedAt = today()
     _recompute_project(p)
+    # ADR-057：部分确认时日志说明确认份数
+    _partial_note = f"（{len(targets)} 份）" if data.contractIds is not None else ""
     add_log(db, "project", p.name, "确认下单",
-            f"项目 {p.code} 订单已确认" + (f"，改价：{'；'.join(diffs)}" if diffs else ""),
+            f"项目 {p.code} 订单已确认{_partial_note}" + (f"，改价：{'；'.join(diffs)}" if diffs else ""),
             operator=operator, project_id=p.id)
     db.commit()
+
+
+def _reject_contracts(db: Session, p: models.Project, contracts: list[models.Contract],
+                      reason: str, operator: str = "") -> None:
+    """逐合同驳回（ADR-056 §2 抽取，`review_project` 整单驳回与 `reject_contracts`
+    勾选驳回共用，口径一致）：对每个合同 → 逐明细 `_apply_item_release`（释放锁定）
+    → `c.status = "terminated"` → remark 追加 `驳回：{reason}`（FIX-20261020-#11：
+    追加而非覆盖，原合同备注保留）→ 批量后 flush + `_sync_rs_item_statuses`
+    （RS-STATUS-20261022：驳回=明细全释放→遥感明细回 in_stock；循环内合同状态尚未
+    落库，故 flush 后统一重算一次兜底）→ `_recompute_project` 派生项目状态
+    → `add_log("驳回订单")`。**不 commit**（由调用方在单事务内提交）。"""
+    for c in contracts:
+        for it in c.items:
+            _apply_item_release(db, it, operator=operator, ref=c.code, contract_id=c.id)
+        c.status = "terminated"
+        # 留痕：生态人员经 bootstrap 仍可见驳回原因
+        if (c.remark or "").strip():
+            c.remark = f"{c.remark}｜驳回：{reason}"
+        else:
+            c.remark = f"驳回：{reason}"
+        c.updatedAt = today()
+    db.flush()
+    _sync_rs_item_statuses(
+        db, [it.itemId for c in contracts for it in c.items])
+    _recompute_project(p)
+    add_log(db, "project", p.name, "驳回订单",
+            f"项目 {p.code} 驳回销售记录 {len(contracts)} 条：{reason}（锁定已释放）",
+            operator=operator, project_id=p.id)
+
+
+def reject_contracts(db: Session, project_id: int, contract_ids: list[int],
+                     reason: str, operator: str = "",
+                     user: models.User | None = None) -> models.Project:
+    """勾选驳回（ADR-056 §2）：对 **pending** 项目勾选部分（或全部）pending 合同逐个驳回；
+    剩余 pending 合同项目保持 pending 可继续审核（`_derive_project_status`：
+    {pending, terminated} 且含 pending → pending）；全部驳回 → terminated。
+
+    守卫（全部在写操作之前，单事务）：
+    - 项目存在（404）且 `status == "pending"`（400「仅待审核项目可驳回订单」）；
+    - 接手人守卫（同 review L2492-2498）：未分配 400；非负责人仅 admin/supervisor 越过，
+      否则 403（路由层 require_editor 已拦 viewer/finance）；
+    - `contractIds` 去重后全部属于该项目且 `status == "pending"`（否则 400）。
+    逐合同步骤复用 `_reject_contracts`（与整单驳回同口径）。单事务（H8）。"""
+    p = get_project(db, project_id)
+    if not p:
+        raise HTTPException(404, "项目不存在")
+    if p.status != "pending":
+        raise HTTPException(400, "仅待审核项目可驳回订单")
+    if user is not None:
+        if not (p.businessOwner or "").strip():
+            raise HTTPException(400, "该订单尚未分配，请先由商务主管分配")
+        if p.businessOwner != user.username and user.role not in ("admin", "supervisor"):
+            # BUG-33 / api-contracts §1：权限类失败统一 403
+            raise HTTPException(403,
+                f"仅接手的商务负责人（{p.businessOwner}）可调整该订单价格，如需处理请先转交")
+    c_by_id = {c.id: c for c in p.contracts}
+    seen: set[int] = set()
+    selected: list[models.Contract] = []
+    for cid in contract_ids:
+        if cid in seen:
+            continue
+        seen.add(cid)
+        c = c_by_id.get(cid)
+        if c is None:
+            raise HTTPException(400, f"销售记录 {cid} 不属于该项目")
+        if c.status != "pending":
+            raise HTTPException(400, f"销售记录 {c.code} 非待审核状态，不可驳回")
+        selected.append(c)
+    reason = (reason or "").strip()
+    if not reason:
+        raise HTTPException(400, "驳回原因不能为空")
+    _reject_contracts(db, p, selected, reason, operator=operator)
+    db.commit()
+    return p
 
 
 def _release_contract_items(db: Session, c: models.Contract, operator: str = "") -> int:
@@ -2620,7 +2891,7 @@ def update_project(db: Session, project_id: int, data: schemas.ProjectInput,
       改单唯一路径是「撤销」（POST /projects/{id}/withdraw）→ 明细回填购物车 → 重新下单；
       系统无草稿态（POST /projects 直接生成 pending），故「提交后禁编辑」等价于「viewer 禁止编辑」，
       不按状态/归属做条件分支（原「viewer 可编辑自己下单项目」分支已收回）。
-    - 商务/管理员规则**不变**：pending 仅商务负责人（或 admin 越过）可编辑基本信息；
+    - 商务/管理员规则：pending 仅商务负责人（或 admin/supervisor 越过，ADR-051）可编辑基本信息；
       存在 delivered 合同 / 派生 terminated 不可编辑；项目名称非空。
     """
     p = get_project(db, project_id)
@@ -2629,11 +2900,11 @@ def update_project(db: Session, project_id: int, data: schemas.ProjectInput,
     # ADR-028 §1：生态人员无编辑权（404 优先于 403；不看状态与归属，服务层一处收口）
     if user is not None and user.role == "viewer":
         raise HTTPException(403, "订单已提交，不可编辑；如需修改请「撤销」后重新下单")
-    # ADR-012 §5.1：pending 项目基本信息仅负责人（或 admin 越过）可编辑
+    # ADR-012 §5.1：pending 项目基本信息仅负责人（或 admin/supervisor 越过，ADR-051）可编辑
     #（ADR-028：viewer 已在上面一律 403，此处判定实际只对商务生效）
-    if p.status == "pending" and user is not None and user.role not in ("viewer", "admin"):
+    if p.status == "pending" and user is not None and user.role not in ("viewer", "admin", "supervisor"):
         if (p.businessOwner or "").strip() != user.username:
-            raise HTTPException(400, "待审核项目仅商务负责人（或管理员）可编辑基本信息")
+            raise HTTPException(400, "待审核项目仅商务负责人（或管理员/商务主管）可编辑基本信息")
     # 项目名非空（防止被清空；与 _create_project_core 口径一致）
     if not (data.name or "").strip():
         raise HTTPException(400, "项目名称不能为空")
@@ -3488,8 +3759,8 @@ def _cart_add_inner(db: Session, data: schemas.CartItemInput, user_id: str = DEF
         amount = _cart_amount(a, data.amount)
     else:
         # ADR-021（RSITEM-RANGE-20261020）：遥感明细行传 rs，区间取明细自身 priceMin/priceMax
-        # ADR-049（2026-10-29）：购物车入口固定只校验下限（enforce_max=False）
-        amt = _check_discount_range(a, qty, data.amount, unit=a.unit, rs=rs, enforce_max=False)
+        # ADR-052（2026-11-04）：购物车销售金额双向区间约束（enforce_max=True，取代 ADR-049 只卡下限）
+        amt = _check_discount_range(a, qty, data.amount, unit=a.unit, rs=rs, enforce_max=True)
         amount = float(amt) if amt is not None else None
     # ADR-020（PRICING-20261020）：服务期限校验（YYYY-MM-DD + start ≤ end，否则 400）
     service_start, service_end = _validate_service_period(data.serviceStart, data.serviceEnd)
@@ -3573,9 +3844,9 @@ def patch_cart_item(db: Session, cart_id: int, customer: str, user_id: str = DEF
     is_discount_row = c.itemId is not None or (a is not None and not _is_amount_mode(a))
     # ADR-021（RSITEM-RANGE-20261020）：遥感明细行区间取该 rs_item 自身（不再取父产品容器区间）
     rs = db.get(models.RsItem, c.itemId) if c.itemId is not None else None
-    # ADR-049（2026-10-29）：购物车行金额**只校验参考区间下限**（上限放开，任何角色一致）
+    # ADR-052（2026-11-04）：购物车行金额双向区间约束（enforce_max=True，取代 ADR-049 只卡下限）
     # ——原 ADR-037 §3 的「viewer 只下限 / editor-admin 双向」分角色口径作废
-    enforce_max = False
+    enforce_max = True
     # 行级金额（ADR-008 / ADR-018 §3）
     if amount is not UNSET:
         if amount is None:
@@ -3711,9 +3982,9 @@ def set_cart_qty(db: Session, cart_id: int, qty: int, user_id: str = DEFAULT_USE
     is_discount_row = c.itemId is not None or (a is not None and not _is_amount_mode(a))
     # ADR-021（RSITEM-RANGE-20261020）：遥感明细行区间取该 rs_item 自身（不再取父产品容器区间）
     rs = db.get(models.RsItem, c.itemId) if c.itemId is not None else None
-    # ADR-049（2026-10-29）：购物车行金额**只校验参考区间下限**（上限放开，任何角色一致）
+    # ADR-052（2026-11-04）：购物车行金额双向区间约束（enforce_max=True，取代 ADR-049 只卡下限）
     # ——原 ADR-037 §3 的「viewer 只下限 / editor-admin 双向」分角色口径作废
-    enforce_max = False
+    enforce_max = True
     if amount is not UNSET:
         if amount is None:
             if is_discount_row:
@@ -3904,7 +4175,7 @@ def checkout(db: Session, data: schemas.CheckoutInput, user_id: str = DEFAULT_US
     ——两端都空放行，只填一端仍按缺项 400（成对校验），两端都填时校验 start ≤ end。
     ADR-049（2026-10-29，部分取代 ADR-037 §3）：结算金额**只校验参考区间下限**
     （上限不限制，任何角色一致）；`viewer` 参数保留仅为调用签名兼容。
-    该口径同时透传 `_create_project_core(enforce_max=False)`，避免「购物车放行、结算 400」。
+    该口径同时透传 `_create_project_core(enforce_max=True)`，避免「购物车放行、结算 400」。
     NO-DISCOUNT-20261022 / ADR-039：折扣率已下线——购物车行的历史 `discountRate`
     **不读、不校验、不落库**（新 `project_items.discountRate` 恒 null，存量单历史值不动）。
     ADR-013：不再校验同主体（记录粒度=单资产，天然单主体；同客户多主体=多条记录并列）。
@@ -3965,11 +4236,11 @@ def checkout(db: Session, data: schemas.CheckoutInput, user_id: str = DEFAULT_US
     # 按 (产品, 客户) 分组（保持购物车行序）；七元组
     # (产品, 数量, 权威金额, itemId, 行级客户, serviceStart, serviceEnd)
     # 明细行 qty 恒 1（ADR-011）；ADR-022 后 amount 恒非空且为合法的 ≤6 位小数金额（上方必填校验保证）
-    # ADR-049（2026-10-29）：购物车结算金额**只校验参考区间下限**（上限放开，任何角色一致）；
+    # ADR-052（2026-11-04）：购物车结算金额双向区间约束（enforce_max=True，取代 ADR-049 只卡下限）；
     # 原 ADR-037 §3 分角色口径（viewer 只下限 / editor-admin 双向）作废。
     # ⚠️ 该值同时透传给 `_create_project_core`（结算会经 `_normalize_contracts` 再校验一次），
     # 两处必须一致，否则「购物车放行、结算 400」。
-    enforce_max = False
+    enforce_max = True
     # ADR-018 §3（PRICING-20261020）：unit/遥感行金额 checkout 时再过一次区间校验
     #（行更新时已校验，此处防绕过行更新接口直接改库/旧客户端）
     # NO-DISCOUNT-20261022 / ADR-039：**不再带 discountRate**（购物车列的历史值也不再透传；
@@ -4190,7 +4461,8 @@ def bootstrap(db: Session, user_id: str, user: "models.User | None" = None) -> d
 
     # ADR-035（ENTITIES-20261022）：资产主体清单全量下发（无角色过滤——主体非敏感商业数据；
     # 前端删除 types.ts::ENTITIES 常量后由 db.entities 提供下拉/简称映射）
-    entities = list_entities(db)
+    # ADR-051：finance 不看公司主体 → 省略 entities（返回 []）
+    entities = [] if (user is not None and user.role == "finance") else list_entities(db)
 
     # RS-STATUS-20261022（ADR-038 Decision 3 修订）：容器「可售数量」= `COUNT(status='in_stock')`
     # （明细状态 in_stock=可售 / all_sold=已售罄，与外层产品状态同构）。只对容器

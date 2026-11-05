@@ -1,8 +1,10 @@
 <script setup lang="ts">
 /**
- * 销售订单转交对话框（ADR-012 §5.1 纯移交制）：
- * - 负责人 → 下拉选新负责人（商务/管理员启用账号）→ claimProject(id, newOwner)；
- * - admin → 额外可选「接手给我」（newOwner 空）。
+ * 销售订单转交/分配对话框（ADR-012 §5.1 纯移交制；ADR-051 叠加主管分配模式）：
+ * - transfer（默认）：负责人 → 下拉选新负责人（商务/管理员启用账号）→ claimProject(id, newOwner)；
+ *   admin → 额外可选「接手给我」（newOwner 空）。
+ * - assign（ADR-051）：商务主管/管理员对任意可见项目「分配/改派」——下拉只列
+ *   启用中的商务（role==='editor'，前端过滤，契约见 ADR-051 §6），必选目标商务。
  * 打开时现取 GET /users/options（账号列表可能变化，不做全局缓存）。
  */
 import { computed, ref, watch } from 'vue'
@@ -15,7 +17,10 @@ const SELF_KEY = '__self__'
 const props = defineProps<{
   modelValue: boolean
   project: { id: number; name: string; businessOwner?: string } | null
+  /** ADR-051：'assign' = 主管/管理员分配/改派（下拉仅商务 editor）；'transfer' = 原转交语义 */
+  mode?: 'transfer' | 'assign'
 }>()
+const isAssign = computed(() => props.mode === 'assign')
 const emit = defineEmits<{ 'update:modelValue': [boolean]; done: [] }>()
 
 const visible = computed({
@@ -37,12 +42,18 @@ watch(visible, async (v) => {
   }
 })
 
-/** 转交目标 = 启用商务账号（排除当前负责人本人） */
+/** 转交目标 = 启用商务账号（排除当前负责人本人）；
+ *  ADR-051 分配模式 = 仅启用中的商务（role==='editor'，不含 admin） */
 const targets = computed(() =>
-  options.value.filter((o) => o.username !== props.project?.businessOwner),
+  options.value
+    .filter((o) => (isAssign.value ? o.role === 'editor' : true))
+    .filter((o) => o.username !== props.project?.businessOwner),
 )
 const label = (o: UserOption) => (o.name ? `${o.name}（${o.username}）` : o.username)
-const submitLabel = computed(() => (selected.value === SELF_KEY ? '确认接手' : '确认转交'))
+const submitLabel = computed(() => {
+  if (isAssign.value) return props.project?.businessOwner ? '确认改派' : '确认分配'
+  return selected.value === SELF_KEY ? '确认接手' : '确认转交'
+})
 
 async function onConfirm() {
   const p = props.project
@@ -55,7 +66,11 @@ async function onConfirm() {
   try {
     const toSelf = selected.value === SELF_KEY
     await claimProject(p.id, toSelf ? '' : selected.value)
-    ElMessage.success(toSelf ? '接手成功，该订单现在归你负责' : '转交成功，商务负责人已变更')
+    if (isAssign.value) {
+      ElMessage.success(props.project?.businessOwner ? '改派成功，商务负责人已变更' : '分配成功，商务负责人已指定')
+    } else {
+      ElMessage.success(toSelf ? '接手成功，该订单现在归你负责' : '转交成功，商务负责人已变更')
+    }
     emit('done')
     visible.value = false
   } catch (e) {
@@ -67,7 +82,7 @@ async function onConfirm() {
 </script>
 
 <template>
-  <el-dialog v-model="visible" title="转交销售订单" width="440" append-to-body>
+  <el-dialog v-model="visible" :title="isAssign ? (project?.businessOwner ? '改派销售订单' : '分配销售订单') : '转交销售订单'" width="440" append-to-body>
     <div v-if="project" class="tf-body">
       <p class="tf-line">
         销售订单：<b>{{ project.name }}</b>
@@ -75,17 +90,22 @@ async function onConfirm() {
           （当前负责人：<b>{{ project.businessOwner }}</b>）
         </template>
       </p>
-      <p class="tf-tip muted">转交后由新负责人负责该订单的定价审核（确认下单/驳回）。</p>
+      <p class="tf-tip muted">
+        {{ isAssign
+          ? '分配/改派后由目标商务负责该订单的定价审核（确认下单/驳回）。'
+          : '转交后由新负责人负责该订单的定价审核（确认下单/驳回）。' }}
+      </p>
       <el-select v-model="selected" placeholder="请选择目标商务账号" style="width: 100%">
-        <!-- 2026-10-19 排查修复：无主单 admin 也提供「接手给我」（原条件要求有主，admin 在编辑页无法接手） -->
+        <!-- 2026-10-19 排查修复：无主单 admin 也提供「接手给我」（原条件要求有主，admin 在编辑页无法接手）；
+             ADR-051 分配模式不含该选项（下拉只列商务 editor） -->
         <el-option
-          v-if="isAdmin"
+          v-if="isAdmin && !isAssign"
           :value="SELF_KEY"
           :label="`接手给我（admin · ${currentUser?.username}）`"
         />
         <el-option v-for="o in targets" :key="o.username" :value="o.username" :label="label(o)" />
       </el-select>
-      <p v-if="!options.length" class="tf-empty muted">暂无可用的商务账号</p>
+      <p v-if="!targets.length" class="tf-empty muted">暂无可用的商务账号</p>
     </div>
     <template #footer>
       <el-button @click="visible = false">取消</el-button>

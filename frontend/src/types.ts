@@ -83,6 +83,8 @@ export interface Asset {
   // 参考价格区间（ADR-018，PRICING-20261020）：元/{unit}，选填（可单边），下单折扣区间校验用
   priceMin?: number | null
   priceMax?: number | null
+  // 税点（ADR-053）：整数百分比（13 = 13%），纯展示元数据，不参与任何金额计算；可空（null/undefined = 未设置 → 展示 `-`）
+  taxPoint?: number | null
   // 可售明细数（UI-OPT-20261022，ADR-038 修订口径）：**仅容器（type='遥感数据'）有值**，后端派生
   // = 明细总数 − 被「非 terminated 销售记录」占用**且 repeatSale=false** 的明细数
   // （repeatSale=true 的明细售出后仍可售，不参与扣减；锁定/已交付都算占用）；
@@ -215,14 +217,15 @@ export function availableQty(a: Asset): number | null {
   return Math.max(0, a.quantity - a.lockedQty - a.shippedQty)
 }
 
-/** 可售金额 = 可售数量 × 单价。
+/** 可售金额 = 可售数量 × 对外卖价（ADR-053：用参考区间下限 priceMin，兜底采购价 salePrice→0，
+ * 不再用成本价作卖价，与列表「销售单价」列展示口径一致）。
  * 包量定价（amount 模式，卫星Token）返回 0：其 salePrice 为参考值（元/份，不参与计价，
  * ADR-008/ADR-017），以合同金额（元，最多 6 位小数）为权威口径，两者相乘不是真实金额
  * （曾导致看板/板块「可售金额」虚高）。已体现在项目/合同的 contractAmount 统计中。 */
 export function availableValue(a: Asset): number {
   if (isAmountMode(a)) return 0
   const q = availableQty(a)
-  return q === null ? 0 : q * a.salePrice
+  return q === null ? 0 : q * (a.priceMin ?? a.salePrice ?? 0)
 }
 
 /** 产品数量状态（两态，列表/详情/算力板块共用）：可售（绿）/ 已售罄（红）。可重复售卖归入"可售" */
@@ -792,8 +795,23 @@ export function formatMoney(v: number | null | undefined): string {
   return formatAmountValue(Number(v), true)
 }
 
-/** el-input-number 金额显示格式（ADR-048）：聚焦时显示用户原文，失焦后走「最少两位/最多六位」 */
+/**
+ * el-input-number 金额「编辑期」显示（ADR-048）：纯数字、无千分位、不强制补零（≤6 位小数）。
+ * 实时格式化（千分位/补 .00）会让 el-input-number 每次 input 重写 DOM、光标被甩到小数区，
+ * 造成「自动弹小数点/只能输小数/删除异常」；故编辑期只透传数字，千分位只用于失焦后的只读展示（见 amountDisplayFormatter / formatMoney）。
+ * 注意：合法中间态文本（如「12.」「.5」，见 AMOUNT_INPUT_RE）必须原样透传——
+ * EP 每次按键后都会用 formatter(modelValue) 回写 DOM，若把「12.」规整成「12」，小数点会被吞掉。
+ */
 export function amountInputFormatter(v: number | string | null | undefined): string {
+  if (v === null || v === undefined || v === '') return ''
+  if (typeof v === 'string' && AMOUNT_INPUT_RE.test(v.trim())) return v.trim()
+  const n = Number(v)
+  if (!Number.isFinite(n)) return ''
+  return String(parseFloat(n.toFixed(AMOUNT_MAX_FRAC)))
+}
+
+/** el-input-number 金额「只读展示」formatter（仅用于 disabled/展示型输入框）：千分位 + 最少两位小数（同 formatMoney，不带 ¥）。disabled 无输入事件，不会触发编辑期光标问题 */
+export function amountDisplayFormatter(v: number | string | null | undefined): string {
   if (v === null || v === undefined || v === '') return ''
   const n = Number(v)
   if (!Number.isFinite(n)) return ''
@@ -877,4 +895,32 @@ export function today(): string {
 
 export function nowStr(): string {
   return new Date().toISOString().replace('T', ' ').slice(0, 16)
+}
+
+// ==================== 订单审核（POST /projects/{id}/review，ADR-012 / ADR-050） ====================
+/** 审核行级入参（camelCase，对齐后端 schemas.ReviewItemInput）
+ *  ADR-050：新增 qty（仅非遥感行生效，≥1；遥感行恒 1，传入忽略） */
+export interface ReviewItemInput {
+  itemId: number // project_items.id（行 id，非产品 id）
+  price?: number // unit 行权威单价（元，>0 且 ≤6 位小数）
+  amount?: number // amount/遥感行权威金额（元，>0 且 ≤6 位小数）
+  qty?: number // ADR-050：行数量（非遥感行，≥1）
+  serviceStart?: string | null // 未传 = 保持原值；显式 null = 清空
+  serviceEnd?: string | null
+}
+/** 审核合同级入参（ADR-050 新增，对齐后端 schemas.ReviewContractInput） */
+export interface ReviewContractInput {
+  contractId: number // 销售记录（合同）主键
+  customer?: string // 客户公司名称（trim 后非空、≤128 字）
+  amount?: number // 合同总价（元，>0 且 ≤6 位小数），确认后按明细行金额比例分摊（总额权威）
+}
+/** 审核请求体（ADR-050：新增 contracts[]，全部可选、向后兼容） */
+export interface ReviewInput {
+  action: 'confirm' | 'reject'
+  reason?: string // reject 必填
+  items?: ReviewItemInput[]
+  contracts?: ReviewContractInput[] // reject 时被后端忽略
+  // ADR-057：confirm 可选部分确认——只确认勾选的 pending 合同（须全部 pending，空数组 400）；
+  // 缺省（不传）= 整单确认（全部 pending 合同，行为与现状一致）
+  contractIds?: number[]
 }

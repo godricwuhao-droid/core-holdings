@@ -20,18 +20,27 @@
           <el-icon style="vertical-align: -2px;"><CircleCheckFilled /></el-icon>
           <span style="margin-left: 4px;">系统运行中</span>
         </el-tag>
-        <span class="user-chip">
-          <span class="user-name">{{ currentUser?.name || currentUser?.username || '-' }}</span>
-          <el-tag
-            size="small"
-            effect="light"
-            :class="'tag-' + roleTagClass"
-            style="margin-left: 6px;"
-          >
-            {{ ROLE_LABELS[currentUser?.role ?? 'viewer'] }}
-          </el-tag>
-        </span>
-        <el-button text class="logout-btn" @click="handleLogout">退出</el-button>
+        <!-- ADR-054：user-chip 改 el-dropdown（修改密码 / 退出登录），所有角色可见 -->
+        <el-dropdown trigger="click" @command="onUserCommand">
+          <span class="user-chip">
+            <span class="user-name">{{ currentUser?.name || currentUser?.username || '-' }}</span>
+            <el-tag
+              size="small"
+              effect="light"
+              :class="'tag-' + roleTagClass"
+              style="margin-left: 6px;"
+            >
+              {{ ROLE_LABELS[currentUser?.role ?? 'viewer'] }}
+            </el-tag>
+            <el-icon class="user-chip-caret" aria-hidden="true"><ArrowDown /></el-icon>
+          </span>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item command="password">修改密码</el-dropdown-item>
+              <el-dropdown-item command="logout" divided>退出登录</el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
       </div>
     </div>
 
@@ -51,7 +60,8 @@
           class="side-menu"
           style="border-right: none; padding-top: 8px;"
         >
-          <el-menu-item v-if="!isViewer" index="/dashboard">
+          <!-- ADR-051：首页概览仅业务档（admin/supervisor/editor）；viewer 与 finance 均不显示 -->
+          <el-menu-item v-if="!isViewer && !isFinance" index="/dashboard">
             <el-icon><Odometer /></el-icon>
             <template #title><span>首页概览</span></template>
           </el-menu-item>
@@ -73,6 +83,13 @@
             </el-menu-item>
           </el-sub-menu>
 
+          <!-- ADR-056 §3：产品统计（按主体聚合对账）——admin/主管/商务/财务可见，viewer（生态人员）不可见
+               （finance 可见性由守卫 financeAllowedPath 白名单同步放开） -->
+          <el-menu-item v-if="!isViewer" index="/statistics">
+            <el-icon><DataAnalysis /></el-icon>
+            <template #title><span>产品统计</span></template>
+          </el-menu-item>
+
           <!-- viewer（生态人员）：销售管理整组不可见，仅「销售项目」（后端已按自己下单过滤）与购物车独立保留 -->
           <el-menu-item v-if="isViewer" index="/sales/projects">
             <el-icon><TrendCharts /></el-icon>
@@ -88,7 +105,8 @@
             </template>
           </el-menu-item>
 
-          <el-sub-menu v-if="!isViewer" index="sales">
+          <!-- ADR-051：销售管理整组仅业务档（admin/supervisor/editor）；finance 仅「产品及服务」 -->
+          <el-sub-menu v-if="!isViewer && !isFinance" index="sales">
             <template #title>
               <el-icon><TrendCharts /></el-icon>
               <span>销售管理</span>
@@ -121,13 +139,39 @@
         <router-view />
       </el-main>
     </el-container>
+
+    <!-- ADR-054：自助改密弹窗（所有角色） -->
+    <el-dialog
+      v-model="pwdDialog.visible"
+      title="修改密码"
+      width="420px"
+      :close-on-click-modal="false"
+    >
+      <el-form label-width="96px">
+        <el-form-item label="旧密码" required>
+          <el-input v-model="pwdDialog.oldPassword" type="password" show-password placeholder="当前登录密码" />
+        </el-form-item>
+        <el-form-item label="新密码" required>
+          <el-input v-model="pwdDialog.newPassword" type="password" show-password placeholder="至少 6 位" />
+        </el-form-item>
+        <el-form-item label="确认新密码" required>
+          <el-input v-model="pwdDialog.confirmPassword" type="password" show-password placeholder="再次输入新密码" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="pwdDialog.visible = false">取消</el-button>
+        <el-button type="primary" :loading="pwdDialog.submitting" @click="handleChangePassword">
+          确认修改
+        </el-button>
+      </template>
+    </el-dialog>
   </el-container>
 </template>
 
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, reactive, computed } from 'vue'
 import { useRoute } from 'vue-router'
-import { ElMessageBox } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   Odometer,
   Box,
@@ -138,9 +182,11 @@ import {
   Fold,
   Expand,
   ShoppingCart,
+  ArrowDown,
+  DataAnalysis, // ADR-056 §3：「产品统计」菜单图标（既有依赖内图标）
 } from '@element-plus/icons-vue'
-import { db } from '@/api'
-import { canWrite, clearSession, currentUser, isAdmin, isViewer, ROLE_LABELS } from '@/auth'
+import { changeMyPassword, db } from '@/api'
+import { canWrite, clearSession, currentUser, isAdmin, isFinance, isViewer, ROLE_LABELS, setSession } from '@/auth'
 
 const route = useRoute()
 const isCollapse = ref(false)
@@ -150,13 +196,68 @@ const activeMenu = computed(() => route.path)
 /** 购物车角标：当前购物车条目总数量（预留账号权限后按登录用户统计） */
 const cartCount = computed(() => db.cart.reduce((s, c) => s + c.qty, 0))
 
-/** 角色标签配色（对齐 global.css 产品类型色板，不用 Element 默认色） */
+/** 角色标签配色（对齐 global.css 产品类型色板，不用 Element 默认色；
+ *  ADR-051 五角色：admin 蓝 / supervisor 紫 / editor 绿 / finance 橙 / viewer 灰） */
 const roleTagClass = computed(() => {
   const role = currentUser.value?.role
   if (role === 'admin') return 'blue'
+  if (role === 'supervisor') return 'purple'
   if (role === 'editor') return 'green'
+  if (role === 'finance') return 'orange'
   return 'gray'
 })
+
+// ============================================================
+// ADR-054：自助改密（所有角色）
+// ============================================================
+const pwdDialog = reactive({
+  visible: false,
+  submitting: false,
+  oldPassword: '',
+  newPassword: '',
+  confirmPassword: '',
+})
+
+function openPasswordDialog() {
+  pwdDialog.oldPassword = ''
+  pwdDialog.newPassword = ''
+  pwdDialog.confirmPassword = ''
+  pwdDialog.visible = true
+}
+
+async function handleChangePassword() {
+  if (!pwdDialog.oldPassword) {
+    ElMessage.warning('请输入旧密码')
+    return
+  }
+  if (!pwdDialog.newPassword || pwdDialog.newPassword.length < 6) {
+    ElMessage.warning('新密码不能为空且至少 6 位')
+    return
+  }
+  if (pwdDialog.newPassword !== pwdDialog.confirmPassword) {
+    ElMessage.warning('新密码与确认新密码不一致')
+    return
+  }
+  pwdDialog.submitting = true
+  try {
+    const res = await changeMyPassword(pwdDialog.oldPassword, pwdDialog.newPassword)
+    // 关键：改密后 tokenVersion+1，必须用返回的新 token 换掉本地 token，
+    // 否则下次请求用旧 token 会 401 掉线
+    setSession(res.token, res.user)
+    ElMessage.success('密码已修改')
+    pwdDialog.visible = false
+  } catch (e) {
+    // 400「旧密码不正确」等：detail 已由拦截器解析进 Error.message
+    ElMessage.error(e instanceof Error ? e.message : '修改密码失败')
+  } finally {
+    pwdDialog.submitting = false
+  }
+}
+
+function onUserCommand(cmd: string) {
+  if (cmd === 'password') openPasswordDialog()
+  else if (cmd === 'logout') void handleLogout()
+}
 
 /** 退出：确认弹窗 → 清本地态 → 跳登录页 */
 async function handleLogout() {
@@ -218,12 +319,19 @@ async function handleLogout() {
 .user-name {
   font-weight: 500;
 }
-.logout-btn {
-  font-size: 13px;
-  color: var(--text-secondary);
+/* ADR-054：user-chip 改下拉后的可点击态与下拉箭头 */
+.user-chip {
+  cursor: pointer;
+  padding: 4px 6px;
+  border-radius: 6px;
 }
-.logout-btn:hover {
-  color: var(--danger-color);
+.user-chip:hover {
+  background: var(--bg-color);
+}
+.user-chip-caret {
+  margin-left: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
 }
 
 /* 侧边菜单：可纵向滚动，滚动条隐藏（跨浏览器） */

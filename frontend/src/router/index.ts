@@ -51,6 +51,13 @@ const routes: RouteRecordRaw[] = [
         component: () => import('@/views/assets/create.vue'),
       },
 
+      // ---------- 产品统计（ADR-056 §3：按主体聚合，纯前端；viewer 守卫静默拦回，finance 白名单放开） ----------
+      {
+        path: 'statistics',
+        name: 'Statistics',
+        component: () => import('@/views/statistics/index.vue'),
+      },
+
       // ---------- 销售管理 ----------
       {
         path: 'sales/projects',
@@ -140,6 +147,17 @@ function viewerAllowedPath(path: string): boolean {
   return true
 }
 
+/** ADR-051：finance（财务）只读边界——仅「产品及服务」各板块 + 产品详情（含算力服务页）；
+ *  ADR-056 §3：放开 /statistics（产品统计，只读聚合，供对账）；
+ *  其余（/dashboard、/sales/*、/cart、/settings/* 等）一律拦截回产品首页 */
+function financeAllowedPath(path: string): boolean {
+  if (path === '/statistics') return true // ADR-056 §3：finance 可看产品统计
+  if (!path.startsWith('/assets/')) return false
+  if (path === '/assets/create') return false
+  if (/^\/assets\/\d+\/edit$/.test(path)) return false
+  return true
+}
+
 // ============================================================
 // 全局守卫：登录态 + 角色
 //  - 无 token：非 /login 一律重定向 /login（带 redirect 参数）
@@ -149,6 +167,8 @@ function viewerAllowedPath(path: string): boolean {
 //  - viewer（生态人员）：仅 /assets/**（排除创建/编辑页）、/sales/projects(+/:id/detail) 与 /cart，
 //    其余路由（看板/销售/交付/基础设置/产品创建编辑）→ 静默重定向 /assets/embodied
 //  - ADR-028：viewer 禁入销售项目编辑页 → 提示「订单已提交，不可编辑…」并回该单详情页
+//  - ADR-051：finance（财务）仅 /assets/**（排除创建/编辑页，只读浏览产品/服务），
+//    其余路由 → 提示后重定向 /assets/embodied
 //  - /settings/users 仅 admin，非 admin 直接访问 → 提示并回 /
 //  - /settings/entities（ENTITIES-20261022）仅 admin/editor，viewer 直接访问 → 提示并回产品首页
 // ============================================================
@@ -183,6 +203,11 @@ router.beforeEach(async (to) => {
       return `/sales/projects/${blockedEdit[1]}/detail`
     }
     if (!viewerAllowedPath(to.path)) return VIEWER_HOME
+  }
+  // ADR-051：finance（财务）只读——仅产品及服务（各板块 + 详情），其余提示后回产品首页
+  if (currentUser.value?.role === 'finance' && !financeAllowedPath(to.path)) {
+    ElMessage.warning('财务账号仅可浏览「产品及服务」')
+    return VIEWER_HOME
   }
   if (to.path === '/settings/users' && currentUser.value?.role !== 'admin') {
     ElMessage.warning('仅管理员可访问「账号与审计」')

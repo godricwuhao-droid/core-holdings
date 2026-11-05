@@ -25,6 +25,8 @@ class AssetOut(_ORM):
     # 参考区间（ADR-018 §1，PRICING-20261020）：元/份，选填；null=未设置（不限制折扣）
     priceMin: float | None = None
     priceMax: float | None = None
+    # ADR-053：税点（整数百分比，13=13%）；null=未设置（前端展示 -）；纯展示，不参与计算
+    taxPoint: int | None = None
     soldAmount: float  # 元
     soldCount: int
     status: str
@@ -62,6 +64,8 @@ class AssetInput(BaseModel):
     # 两者都有时 min ≤ max，否则 400「参考区间下限不能大于上限」
     priceMin: float | None = Field(default=None, ge=0)
     priceMax: float | None = Field(default=None, ge=0)
+    # ADR-053：税点（整数百分比，13=13%），选填；null/不传=未设置
+    taxPoint: int | None = Field(default=None, ge=0, le=100)
     status: str
     # ADR-036 §1（FORMS-20261022）：登记时间不再必填——不传/空 → 后端自动生成当天
     # YYYY-MM-DD；传值仍走 _validate_date_str 校验（编辑页只读展示是前端约束）
@@ -97,6 +101,9 @@ class AssetUpdate(BaseModel):
     # 参考区间（ADR-018 §1，PRICING-20261020）：选填；传 null 清空（恢复不限制）
     priceMin: float | None = Field(default=None, ge=0)
     priceMax: float | None = Field(default=None, ge=0)
+    # ADR-053：税点（整数百分比）；exclude_unset 语义同 priceMin/priceMax：
+    # 未传=保持原值，传 null=清空（恢复未设置）
+    taxPoint: int | None = Field(default=None, ge=0, le=100)
     status: str | None = None
     inboundDate: str | None = None
     expiryDate: str | None = None
@@ -119,7 +126,8 @@ class StatusInput(BaseModel):
 class ReviewItemInput(BaseModel):
     """行级改价入参：itemId = project_items.id。
     unit 模式传 price（实际单价）；amount 模式传 amount（实际合同金额，元（最多 6 位小数））；
-    遥感明细行（含 itemId 的销售明细）不接受改价 → 400。"""
+    遥感明细行（含 itemId 的销售明细）不接受改价 → 400。
+    ADR-050：qty 行数量（仅非遥感行生效，≥1；遥感行 qty≡1，传入忽略；不传=保持原值）。"""
     itemId: int
     price: float | None = None
     amount: float | None = None
@@ -127,13 +135,42 @@ class ReviewItemInput(BaseModel):
     # 不传 = 保持原值
     serviceStart: str | None = None
     serviceEnd: str | None = None
+    # 数量（ADR-050）：非遥感行可改（≥1）；unit 行 amount=price×qty 重算、
+    # amount 行未传 amount 时按数量比例缩放；非 repeatSale 行改大时校验可用库存
+    qty: int | None = None
+
+
+class ReviewContractInput(BaseModel):
+    """合同级入参（ADR-050）：contractId = contracts.id（销售记录主键）。
+    customer 改写客户公司名称（trim 后非空、≤128 字，否则 400）；
+    amount 合同总价（元，>0 且 ≤6 位小数）按该合同内各明细行金额比例分摊回写，
+    四舍五入残差落金额最大行，使 Σ行 == 总额精确（合同总价最后生效，覆盖逐行值）。
+    两字段均可选；reject 时整个 contracts 被忽略。"""
+    contractId: int
+    customer: str | None = None
+    amount: float | None = None
 
 
 class ReviewInput(BaseModel):
-    """POST /projects/{id}/review：action=confirm 确认下单（可带 items 改价）/ reject 驳回（reason 必填）"""
+    """POST /projects/{id}/review：action=confirm 确认下单（可带 items 改价/数量 +
+    contracts 合同总价/客户名，ADR-050）/ reject 驳回（reason 必填，新字段忽略）。
+    ADR-057：confirm 可选 contractIds（部分确认，只确认勾选的 pending 合同）；
+    缺省 None = 整单确认（全部 pending 合同，行为与现状一致）。"""
     action: str  # confirm | reject
     reason: str = ""
     items: list[ReviewItemInput] = []
+    contracts: list[ReviewContractInput] = []
+    contractIds: list[int] | None = None
+
+
+class RejectContractsInput(BaseModel):
+    """POST /projects/{id}/reject-contracts（ADR-056 §2 勾选驳回）：对 pending 项目勾选
+    部分（或全部）pending 合同逐个驳回；剩余 pending 合同项目保持 pending 可继续审核。
+
+    - contractIds：非空，须全部属于该项目且 status=pending（否则 400）。
+    - reason：必填（strip 后非空，≤200 字；批量勾选共用一个原因）。"""
+    contractIds: list[int] = Field(..., min_length=1)
+    reason: str = Field(..., min_length=1, max_length=200)
 
 
 class ClaimInput(BaseModel):
@@ -676,6 +713,12 @@ class LoginInput(BaseModel):
     password: str
 
 
+class ChangePasswordInput(BaseModel):
+    """自助改密（ADR-054）：全角色可改本人密码，需校验旧密码"""
+    oldPassword: str
+    newPassword: str = Field(min_length=6)  # 少于 6 位 → 422
+
+
 class UserOut(_ORM):
     """用户输出（不含 passwordHash）"""
     id: int
@@ -683,6 +726,7 @@ class UserOut(_ORM):
     name: str
     role: str
     enabled: bool
+    createdAt: str = ""  # ADR-054：补返回创建时间（存量老用户可能为空 → 前端显 -）
 
 
 class UserCreate(BaseModel):

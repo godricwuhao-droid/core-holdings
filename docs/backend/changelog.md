@@ -2,6 +2,85 @@
 
 > 记录 core-holdings 后端（FastAPI + SQLAlchemy + SQLite）的接口与行为变更。
 
+## 2026-11-04 ｜ ADR-057：审核页支持部分确认（review confirm 加可选 contractIds）
+
+> **依据 ADR-057（2026-11-04）**。`ReviewInput` 加可选 `contractIds`；`review_project` confirm 路径按 `contractIds` 过滤（行级改价/改数量、合同总价分摊、锁定调整、服务期限、守卫、`c.status="active"` 均只作用于选中集合 targets；未勾选合同保持 pending 一字不动）；`_derive_project_status` 补「含 pending 且其余 ⊆ {active, delivering, delivered, terminated} → pending」分支（与 ADR-056 `[terminated,pending]→pending` 同口径）。**缺省（不传）= 整单确认，行为与现状一致（向后兼容）**。reject 路径与 ADR-056 `reject-contracts` 不动。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-11-04 | 修改 | 审核页支持部分确认：review confirm 加可选 contractIds（只确认勾选、未勾保持 pending、项目有 pending 保持 pending 可续审、缺省整单不变）+ _derive_project_status 补 [active,pending]→pending | src/schemas.py、src/services.py | ADR-057 | 驳回复用 ADR-056 reject-contracts |
+
+## 2026-11-04 ｜ ADR-053：产品域——税点属性 + 销售单价改采购单价（语义/文案）
+
+> **依据 ADR-053（2026-11-04）**。`Asset` 新增可空整数列 `taxPoint`（税点百分比，`13` = 13%，纯展示不参与计算）+ 幂等迁移；`salePrice` 字段名/类型不变、语义改「采购单价」（仅编辑日志文案变）。**无计价/区间校验逻辑变更**；自动参考区间是前端行为，后端不感知。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-11-04 | 修改 | 产品域：Asset 新增 taxPoint（税点，整数百分比可空）+ salePrice 语义改采购单价（编辑日志文案） | src/models.py、main.py、src/schemas.py、src/services.py | ADR-053 | 无计价/区间逻辑变更 |
+
+## 2026-11-04 ｜ ADR-052：购物车销售金额双向区间约束（部分取代 ADR-049「只卡下限」）
+
+> **依据 ADR-052（2026-11-04）**。`_check_discount_range` 的**购物车 4 入口** `enforce_max=False → True`（同一判定式，True 即上下限同时卡）：`_cart_add_inner`（加购/批量）、`patch_cart_item`（改客户/改金额）、`set_cart_qty`（改数量/改金额）、`checkout`（结算含全量行重校验 + 透传 `_create_project_core`）。效果：unit 行（含遥感行）销售金额低于下限 400 **+ 高于上限 400**。**不变**：包量/amount 行走 `_cart_amount`（仅 >0 + ≤6 位，不卡区间）、`review_project`（审核改价不调区间函数，不限区间）、`_create_project_core` 默认 `enforce_max=True`（手工建单已双向）、兜底（未设区间=不限、单边=只卡有值侧）。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-11-04 | ⚠️ 修改 | 购物车销售金额改双向区间约束：4 入口 `enforce_max=False→True`（加购/批量、改客户改金额、改数量、结算含全量行重校验+透传 `_create_project_core`）→ unit 行低于下限/高于上限均 400 | `backend/src/services.py` | ADR-052 | ⚠️ 高于上限的购物车金额现被 400；存量超上限行结算需改回区间内；包量/审核/手工建单不变；未 commit |
+
+## 2026-11-04 ｜ ADR-051：权限体系升级（固定五角色 + 商务主管分配制 + 财务只读，后端核心）
+
+> **依据 ADR-051（Proposed，2026-11-04）**。角色 3→5（`admin/supervisor/editor/viewer/finance`，`User.role` String，**无 schema 迁移**）：能力守卫收口 `security.py`（上一轮已完成，本轮未动）；本轮完成**数据域 + 分配链路 + 财务边界**核心改动。**⚠️ Breaking（数据域收紧）**：editor（商务）由「全部项目可见」改为「仅 `businessOwner==自己`」；存量未归属单（`businessOwner=""`）商务将看不到，需主管分配（运营提示，见 ADR-051 §3）。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-11-04 | ⚠️ 修改 | 销售项目可见性 2→5 分支：`user_sees_project`（admin/supervisor 全部、editor 仅名下、viewer 不变、finance 无）+ `Visibility.restricted` 改为 `role not in (admin,supervisor)`（editor/viewer/finance 走预计算分支） | `backend/src/services.py` | ADR-051 §3 | 唯一口径，bootstrap + 全部分页端点共用；未 commit |
+| 2026-11-04 | 修改 | `claim_project` 加主管分配/改派分支：admin/supervisor 无主单传 `newOwner`=**分配**、他人单传 `newOwner`=**改派**/不传=接手；商务档不变（他人负责 → 400 文案改「如需改派请联系商务主管处理」）；动作标签 分配/改派/接手/转交订单（detail 含旧→新），路由层审计沿用返回动作串 | `backend/src/services.py`、`backend/src/routers/api.py`（docstring） | ADR-051 §4 | 不改项目 status；未 commit |
+| 2026-11-04 | 修改 | `_validate_business_owner` 目标白名单 `editor/admin` → `editor/admin/supervisor`（主管自接放行） | `backend/src/services.py` | ADR-051 §4 | 未 commit |
+| 2026-11-04 | 修改 | `review_project` 守卫：越过角色 `admin` → `admin/supervisor`（Q3 兜底）；未分配文案 → `该订单尚未分配，请先由商务主管分配` | `backend/src/services.py` | ADR-051 §4 | 未 commit |
+| 2026-11-04 | 修改 | `patch_contract_fields` 拆分共用 `is_admin`：`signedDate` = 负责人或 admin/supervisor；`scheduledDeliveryDate` **保持仅 admin 不变** | `backend/src/services.py` | ADR-051 §2/§8 | 未 commit |
+| 2026-11-04 | 修改 | `update_project` pending 基本信息守卫：越过角色 `admin` → `admin/supervisor`（文案加「商务主管」） | `backend/src/services.py` | ADR-051 §8 | 未 commit |
+| 2026-11-04 | 修改 | 财务边界：bootstrap `entities` 对 finance 返回 `[]`；`GET /entities` 对 finance 返回 `[]`（不 403）；bootstrap projects/contracts/outbounds 经 Visibility 自动为空 | `backend/src/services.py`、`backend/src/routers/api.py` | ADR-051 §5 | 未 commit |
+
+admin→admin/supervisor 改动点清单（共 4 处）：① `review_project` 越过守卫；② `patch_contract_fields` signedDate 守卫；③ `update_project` pending 编辑守卫；④ `claim_project` 管理档（`is_admin`→`is_mgr`，含分配/改派新分支）。**`scheduledDeliveryDate` 保持仅 admin**（独立 `is_admin` 判定，未放宽）。**未动**：`_can_withdraw`（撤销=下单人或 admin）、viewer 各分支、`require_admin`、`GET /users/options`。
+
+实测（:8000 运行实例，真实 HTTP + 落库核对；测试账号 sup01/fin01/biz01/biz02/eco01 保留，密码 123456）：
+1. eco01(viewer) 下单 → id=55 pending、`businessOwner=""`；biz01 bootstrap 不可见（projects=0），sup01/admin 可见（51 单，未分配池）。
+2. sup01 `claim {newOwner:"biz01"}` → 200，落库 `businessOwner=biz01`，日志/审计 `分配订单`；biz01 立即可见。
+3. sup01 `review confirm` → 200（active）；`claim {newOwner:"biz02"}` → 落库 `biz02`，日志/审计 `改派订单（biz01 → biz02）`。
+4. biz01 对 biz02 名下单 claim → 400 `该订单由商务负责人「biz02」负责，如需改派请联系商务主管处理`。
+5. fin01：bootstrap assets=37 / projects=contracts=outbounds=0 / entities=0；`GET /entities` 200 `[]`；`POST /cart` 403；`POST /assets` 403。
+6. 回归：viewer 下单/看自己单/撤销（id=57 withdraw 200）正常；sup01 分配 id=56 给 biz01 → biz01 confirm 200；sup01 录 `signedDate` 200、`scheduledDeliveryDate` 403（仅 admin）。
+- 注：本地开发库 admin 密码历史 API 测试改过且无记录，本轮已重置为种子默认 `123456`（`seed_admin_user` 口径）。
+
+## 2026-11-03 ｜ ADR-050：审核阶段可编辑性增强（合同总价 / 客户名称 / 数量）
+
+> **依据 ADR-050（Accepted，2026-11-03）**。扩展 `POST /projects/{id}/review`（`action=confirm`）：
+> ① 合同总价按比例分摊到明细（残差归金额最大行，Σ行==总额精确）；② 改客户公司名称（`Contract.customer` 权威 + 冲突守卫 + `Project.customer` 重派生）；③ 改非遥感行数量（unit 行 amount=price×qty、amount 行只传 qty 按数量比例缩放；非 repeatSale 行调整既有锁定，超可售 400 整事务回滚）。
+> 新增字段全部可选、向后兼容（旧 payload 行为不变）；**reject 路径新字段被忽略**；**无 schema 变更、无迁移**。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-11-03 | 新增 | 审核支持改合同总价/客户名/数量（`items[].qty`、`contracts[]:{contractId,customer,amount}`；分摊/冲突守卫/锁定调整） | `backend/src/schemas.py`、`backend/src/services.py`（`review_project`）、`backend/src/routers/api.py`（docstring）；`docs/backend/api.md` | ADR-050 | 新增字段，向后兼容；reject 行为不变；未 commit |
+
+改动明细：
+- `schemas.py`：`ReviewItemInput` + `qty: int | None = None`（非遥感行生效，≥1）；新增 `ReviewContractInput {contractId, customer?, amount?}`；`ReviewInput` + `contracts: list[ReviewContractInput] = []`（camelCase，全可选）。
+- `services.py::review_project` confirm 分支（reject 分支零改动）：
+  - **合同级解析**（行级解析前）：`contractId` 归属/重复 400；`customer` trim 非空 ≤128 字 400；`amount` 走 `_validate_amount_yuan`（>0 且 ≤6 位小数，ADR-048）；客户冲突守卫复用建单期 `seen_contracts` 口径（改后客户值 + `(assetId,itemId)` 明细集合键，同项目内重复 → 400）；通过后写 `Contract.customer`。
+  - **行级解析**（ADR-050 §2）：unit 行 `finalPrice = price ?? 原值`、`finalQty = qty ?? 原值`、`finalAmount = quantize(finalPrice × finalQty, 1e-6)`（传 amount 也以 price×qty 为准）；amount 行传 amount 权威 / 只传 qty 按 `原amount × finalQty / 原qty` 缩放 / 都不传保持原值（`model_fields_set` 区分「未传」与「显式 null」）；遥感行 qty 忽略恒 1、仅 amount 可改（原逻辑不变）。审核链路不走参考区间（ADR-049）、不回写挂牌价（ADR-018）、不碰 orig/discountRate（ADR-039）。
+  - **合同总价分摊**（行级解析后，逐合同）：`target=amount`、`sum=Σ行finalAmount`（≤0 → 400）；每行 `quantize(finalAmount/sum×target, 1e-6)`，残差落金额最大行使 Σ==target 精确；各行 `price = quantize(finalAmount/finalQty)` 重派生；`contractAmount = target`。合同总价最后生效（覆盖逐行值）。
+  - **数量库存**（分摊后统一执行，单事务）：仅 `it.locked`（下单时真实加锁）且非 repeatSale（`_item_repeat` 判定）且非遥感行参与；`delta>0` 前置校验可用库存（`quantity − lockedQty − shippedQty ≥ delta`，与 `apply_item_lock` 原子条件同口径）不足 → 400 `第 {行id} 行可用库存不足（需 {delta}，当前可售 {M}）`，再走 `apply_item_lock` 原子加锁；`delta<0` 走 `apply_item_lock` 释放（条件更新失败 → 500 不变量告警 + 审计，ADR-033）。
+  - 既有守卫全部保留：空明细 400 / pending_asset 400 / amount≤0 400 / 服务期限校验 / 接手人守卫。
+- `routers/api.py`：仅 docstring 更新（权限 `require_editor`、响应 `{"ok":true}` 不变）。
+
+实测（测试库运行实例 :8000，admin JWT，真实 HTTP；覆盖 ADR-050「验证」8 项）：
+1. **① 合同总价**：两行合同（Σ=44400）传 `amount=50001` → `contractAmount==50001`、Σ行==50001 精确（四舍五入残差 1e-6 落金额最大行 30856.472973→30856.472974）、各行单价重派生、项目 `expectedAmount/contractAmount` 级联。
+2. **② 客户名**：多客户项目改一合同客户名（含首尾空格 trim）→ `contract.customer` 更新、`project.customer` 重派生为空串；单合同项目改名 → `project.customer` = 新值；同项目另一合同改后客户相同且明细集相同 → **400**「客户「测试客户C」下相同的销售明细不可重复（与 HT-… 冲突）」，项目保持 pending 无脏数据。
+3. **③ 数量**：unit 行 3→5 → `amount=500×5=2500`、`lockedQty` +2（流水 `project_lock`）；2→1 → `amount=500`、`lockedQty` −1（`cancel_release`）；放大超可售 → **400**「第 51 行可用库存不足（需 15，当前可售 10）」，事务回滚（项目仍 pending、qty/客户/金额未变、无新增流水）。
+4. **④ repeatSale**：行 5→7 → `amount=7000`、产品 `lockedQty` 恒 0（只计次）。
+5. **⑤ 遥感行**：传 `qty=5` 被忽略（恒 1）、`amount=25000` 生效（price 派生 25000）、容器 `lockedQty` 不变。
+6. **⑥ 区间/挂牌价**：unit 行 `price=1`（< `priceMin=900`）审核通过（ADR-049 豁免）；`assets.salePrice` 保持 1000 未回写（ADR-018）。
+7. **⑦ reject**：带 `contracts`（customer/amount）与 `items[].qty` 驳回 → 新字段全部忽略，行为同现状（terminated + 释放锁定 + `remark=驳回：…`）。
+8. **⑧ 多合同**：两合同分别传总价 50001/60000 独立分摊、项目总额 = 50001+60000 = 110001。
+
 ## 2026-10-22 ｜ ADR-044：`asset_deliverables.url`（外部链接）+ 协议白名单校验
 
 > **依据 ADR-044（Accepted，2026-10-22，业务方要求「交付物支持填入 URL 链接」）**。删除端点（`api.py:836`，`DELETE /assets/{id}/deliverables/{item_id}`）**已存在，本任务未改**。
@@ -1683,6 +1762,9 @@ repeatSale 明细短路，交付/终止都不再触碰它）。此时 `available
 | 2026-10-29 | 新增 | `docs/adr/ADR-049.md`：参考区间只约束**下限**；购物车/结算任何角色金额可高于区间上限；审核改价不受区间限制；商务手工建单保留双向校验（部分取代 ADR-037 §3） | `docs/adr/ADR-049.md`、`docs/architecture.md` | ADR-049 | 无数据结构变更 |
 | 2026-10-29 | 修改 | 购物车链路 `enforce_max` 统一为 `False`：`_cart_add_inner` 显式传 `False`；`patch_cart_item` / `set_cart_qty` / `checkout` 的 `enforce_max = not viewer` → `False`（`viewer` 参数保留仅兼容签名）；结算透传 `_create_project_core(enforce_max=False)`，避免「购物车放行、结算 400」 | `backend/src/services.py` | ADR-049 | 低于下限仍 400 原文案 |
 | 2026-10-29 | 修改 | 审核改价补精度兜底：`items[].price` 增加「≤6 位小数」校验（ADR-048 口径），并明确该入口**不调用**区间校验函数、不回写挂牌价 | `backend/src/services.py` | ADR-048/049 | 审核改价仍只受「>0 + 精度」约束 |
+| 2026-11-04 | 新增 | 账号自助改密：`POST /auth/change-password`（全角色、校验旧密码、tokenVersion+1 踢旧会话、返回新 token 保持登录）+ `UserOut` 补 `createdAt` | `src/routers/api.py`、`src/schemas.py` | ADR-054 | 顺带修「创建时间」列 |
+| 2026-11-04 | 新增 | 销售项目列表服务端分页：`GET /projects`（page/pageSize + 可见性 build_visibility + keyword/status/rep/businessOwner 过滤 + {total,items}，排序 id.desc）；bootstrap 全量 projects 不变 | src/routers/api.py | ADR-055 | 仅列表页用 |
+| 2026-11-04 | 新增 | 销售项目：GET /projects 服务端排序（status 档位+金额/日期/编号，id.desc 兜底）+ POST /projects/{id}/reject-contracts（勾选部分 pending 合同驳回，复用 terminated+remark，部分驳回项目保持 pending） | src/routers/api.py、src/schemas.py、src/services.py | ADR-056 | 复用整单驳回逐合同逻辑 |
 
 > 验证（副本库）：区间 `[3,036,767, 3,066,834]` 下金额 3,680,200.80（超上限 20%）PATCH/PUT/checkout 全部通过且金额一致；2,429,413.60（低于下限）400；审核改价 9,200,502（3 倍上限）通过、7 位小数 400。`py_compile` + `vue-tsc` 通过，临时脚本已清理。
 > 未构建、未 commit；后端 `--reload` 已热加载。

@@ -12,7 +12,8 @@
   改密/禁用/改角色时 tokenVersion += 1（旧 token 立即失效）。**不提供 /auth/logout**（ADR-034 §3）。
 - 密码：hashlib.pbkdf2_hmac('sha256', pwd, salt, 100_000) + 16 字节随机 salt，
   存储格式 `pbkdf2$<salt_hex>$<hash_hex>`；明文密码不出现在任何响应体/日志中。
-- 固定三角色：admin（管理）/ editor（可编辑）/ viewer（只读），不做动态权限表。
+- 固定五角色（ADR-051，2026-11-04）：admin（管理员）/ supervisor（商务主管）/
+  editor（商务）/ viewer（生态）/ finance（财务，只读产品/服务），不做动态权限表。
 """
 import base64
 import hashlib
@@ -154,8 +155,13 @@ def _resolve_jwt_secret() -> str:
 
 JWT_SECRET = _resolve_jwt_secret()
 
-ROLES = ("admin", "editor", "viewer")
-EDITOR_ROLES = ("admin", "editor")
+# ADR-051（2026-11-04）：固定五角色——admin / supervisor（商务主管）/ editor（商务）/
+# viewer（生态）/ finance（财务，只读产品/服务）
+ROLES = ("admin", "supervisor", "editor", "viewer", "finance")
+# 业务写层（产品/交付/主体/基础资料/交付物 编辑 + 审核 + 接手/分配）
+EDITOR_ROLES = ("admin", "supervisor", "editor")
+# 分配/改派层（商务主管 + admin 兜底）
+SUPERVISOR_ROLES = ("admin", "supervisor")
 
 bearer = HTTPBearer(auto_error=False)
 
@@ -266,7 +272,7 @@ def get_current_user(
 
 
 def require_editor(user: models.User = Depends(get_current_user)) -> models.User:
-    """业务写操作：admin + editor 可执行，viewer 403
+    """业务写操作（ADR-051）：admin + supervisor + editor 可执行，viewer/finance 403
     （ADR-014：文案统一由后端给出，前端拦截器对 403 直接 toast detail）"""
     if user.role not in EDITOR_ROLES:
         raise HTTPException(403, "只读账号不可执行该操作")
@@ -274,7 +280,18 @@ def require_editor(user: models.User = Depends(get_current_user)) -> models.User
 
 
 def require_order(user: models.User = Depends(get_current_user)) -> models.User:
-    """下单链路（购物车 + 直接下单）：已认证即可，admin/editor/viewer 均放行"""
+    """下单链路（购物车 + 直接下单 + 项目状态/撤销）：admin/supervisor/editor/viewer 放行；
+    ADR-051：finance（财务只读）排除 → 403"""
+    if user.role == "finance":
+        raise HTTPException(403, "财务账号为只读，不可执行该操作")
+    return user
+
+
+def require_supervisor(user: models.User = Depends(get_current_user)) -> models.User:
+    """分配/改派层（ADR-051 §2）：admin + supervisor 可执行（可复用谓词；
+    分配动作本身走 `POST /projects/{id}/claim` 的 is_mgr 分支，不新开端点）"""
+    if user.role not in SUPERVISOR_ROLES:
+        raise HTTPException(403, "仅商务主管（或管理员）可执行该操作")
     return user
 
 
@@ -319,6 +336,8 @@ def user_out(user: models.User) -> dict:
         "name": user.name,
         "role": user.role,
         "enabled": user.enabled,
+        # ADR-054：补 createdAt（存量老用户可能为空 → 前端显 -）
+        "createdAt": user.createdAt or "",
     }
 
 

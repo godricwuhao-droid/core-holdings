@@ -9,7 +9,8 @@
  */
 import { computed, reactive } from 'vue'
 
-export type Role = 'admin' | 'editor' | 'viewer'
+// ADR-051：固定五角色（admin/supervisor/editor/viewer/finance）
+export type Role = 'admin' | 'supervisor' | 'editor' | 'viewer' | 'finance'
 
 export interface CurrentUser {
   id: number
@@ -22,11 +23,13 @@ export interface CurrentUser {
 const TOKEN_KEY = 'token'
 const USER_KEY = 'currentUser'
 
-/** 角色中文展示名（内部标识仍为 admin/editor/viewer，仅展示名调整） */
+/** 角色中文展示名（内部标识为 role 枚举，仅展示名调整；ADR-051 扩为五角色） */
 export const ROLE_LABELS: Record<Role, string> = {
   admin: '管理员',
+  supervisor: '商务主管',
   editor: '商务人员',
   viewer: '生态人员',
+  finance: '财务',
 }
 
 /** 无权限按钮的禁用态 tooltip 文案（2026-10-20 ADR-014：原「只读提示」常量更名——
@@ -51,11 +54,23 @@ export const currentUser = computed<CurrentUser | null>(() => state.user)
 /** 是否管理员（账号与审计等 admin 专用能力） */
 export const isAdmin = computed(() => state.user?.role === 'admin')
 
-/** 是否可执行业务写操作（admin / editor 可写；viewer 仅下单链路，产品编辑类禁用） */
-export const canWrite = computed(() => state.user !== null && state.user.role !== 'viewer')
+/** 是否可执行业务写操作（ADR-051：admin / supervisor / editor 可写；
+ *  viewer 仅下单链路、finance 只读，产品编辑类禁用） */
+export const canWrite = computed(
+  () => state.user !== null && (state.user.role === 'admin' || state.user.role === 'supervisor' || state.user.role === 'editor'),
+)
 
 /** 是否生态人员（viewer）：菜单/路由收窄 + 下单链路放权 */
 export const isViewer = computed(() => state.user?.role === 'viewer')
+
+/** 是否商务主管（ADR-051）：销售项目全量可见 + 分配/改派 + 审核兜底 */
+export const isSupervisor = computed(() => state.user?.role === 'supervisor')
+
+/** 是否财务（ADR-051）：只读，仅产品及服务（菜单/路由收窄） */
+export const isFinance = computed(() => state.user?.role === 'finance')
+
+/** 是否可分配/改派销售订单（ADR-051 §4：admin + supervisor；走既有 claim 接口） */
+export const canAssign = computed(() => isAdmin.value || isSupervisor.value)
 
 /**
  * 是否已登录（ADR-009）：下单链路（购物车加购/改量/删行/清空/结算、直接下单）

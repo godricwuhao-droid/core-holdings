@@ -9,7 +9,7 @@
  * 抽屉底部提供状态变更快捷入口（商务/管理员：交付/终止，项目级批量；生态人员：仅终止自己项目），
  * 逐合同操作与「查看详情」仍走项目详情页。
  */
-import { computed, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 // ADR-040（2026-10-22）：补 ArrowDown（「更多▾」）/ Delete（菜单项图标），均为既有依赖内图标
@@ -28,8 +28,8 @@ import {
   type Project,
   type ProjectStatus,
 } from '@/types'
-import { allUserOptions, changeProjectStatus, claimProject, db, deleteProject, getAsset, refresh, showError, userOptions, type UserOption } from '@/api'
-import { canWrite, currentUser, isViewer, isAdmin, NO_PERM_TIP } from '@/auth'
+import { allUserOptions, changeProjectStatus, claimProject, db, deleteProject, getAsset, listProjects, refresh, showError, userOptions, type UserOption } from '@/api'
+import { canAssign, canWrite, currentUser, isViewer, isAdmin, isSupervisor, NO_PERM_TIP } from '@/auth'
 // ADR-042 / REFILL-20261022：「重新提交」动线收敛到 composable（与详情页共用同一套弹窗/失败/归属逻辑）
 import { useResubmitProject } from '@/composables/useResubmitProject'
 import TransferDialog from '@/components/TransferDialog.vue'
@@ -66,10 +66,11 @@ function repName(rep?: string): string {
   const u = ownerOptions.value.find((x) => x.username === rep) || ownerOptions.value.find((x) => x.name === rep)
   return u?.name || rep
 }
-/** ADR-012 §5.1：「审核订单」入口仅对接手人（或 admin 越过）展示；未接手/他人接手 → 隐藏（操作由后端守卫兜底） */
+/** ADR-012 §5.1：「审核订单」入口仅对接手人（或 admin 越过）展示；未接手/他人接手 → 隐藏（操作由后端守卫兜底）
+ *  ADR-051 Q3：商务主管兜底——supervisor 对已分配单（含他人名下）可审核（与后端 review 守卫同口径） */
 function canReviewRow(row: { businessOwner?: string }): boolean {
   return canWrite.value && !!row.businessOwner
-    && (isAdmin.value || row.businessOwner === currentUser.value?.username)
+    && (isAdmin.value || isSupervisor.value || row.businessOwner === currentUser.value?.username)
 }
 /** ADR-012 §5.1 纯移交制：无主→任意商务可见「接手」（viewer 灰显）；有主→仅负责人「转交」或 admin 越过；
  *  他人负责的单据对普通商务不显示按钮 */
@@ -95,6 +96,7 @@ async function handleClaim(p: Project) {
   try {
     await claimProject(p.id)
     ElMessage.success('已接手，该订单现在归你负责')
+    await reloadAfterWrite() // ADR-055：留在列表页的写操作 → 重载当前页 + 刷新 db 镜像
   } catch (e) {
     showError(e, '操作失败')
   }
@@ -102,9 +104,22 @@ async function handleClaim(p: Project) {
 
 const transferVisible = ref(false)
 const transferTarget = ref<{ id: number; name: string; businessOwner?: string } | null>(null)
+// ADR-051：对话框模式——'transfer'（商务转交/admin 原语义）| 'assign'（主管/管理员分配/改派，下拉仅商务 editor）
+const transferMode = ref<'transfer' | 'assign'>('transfer')
 function openTransfer(p: Project) {
   transferTarget.value = p
+  transferMode.value = 'transfer'
   transferVisible.value = true
+}
+/** ADR-051：主管/管理员「分配/改派」入口（复用 TransferDialog assign 模式 + claim 接口） */
+function openAssign(p: Project) {
+  transferTarget.value = p
+  transferMode.value = 'assign'
+  transferVisible.value = true
+}
+/** ADR-051：主管/管理员可对任意可见项目分配/改派（后端 claim is_mgr 分支；终态 400，前端按 pending/active 收敛） */
+function canAssignRow(row: { status: string }): boolean {
+  return canAssign.value && (row.status === 'pending' || row.status === 'active')
 }
 
 /**
@@ -127,9 +142,10 @@ function openWithdraw(p: Project) {
   withdrawTarget.value = p
   withdrawVisible.value = true
 }
-/** 撤销成功后：仅刷新镜像并停留列表（跳 /cart 交给详情/编辑入口，见 WithdrawProjectDialog 注释） */
+/** 撤销成功后：刷新镜像 + 重载当前页并停留列表（跳 /cart 交给详情/编辑入口，见 WithdrawProjectDialog 注释） */
 async function onWithdrawn() {
   await refresh()
+  loadProjects() // ADR-055：撤销改变项目状态 → 表格重载
 }
 
 /**
@@ -164,18 +180,90 @@ const reps = computed(() =>
     .map(String),
 )
 
-const list = computed(() =>
-  db.projects.filter((p) => {
-    const kw = searchText.value.trim()
-    if (kw && !`${p.name}${p.code}${p.customer}`.includes(kw)) return false
-    if (statusFilter.value && p.status !== statusFilter.value) return false
-    if (repFilter.value && p.rep !== repFilter.value) return false
-    // ADR-012 §5.1：按商务负责人账号筛选（'__none__' = 未指派/历史自由文本）
-    if (ownerFilter.value === '__none__' && p.businessOwner) return false
-    if (ownerFilter.value && ownerFilter.value !== '__none__' && p.businessOwner !== ownerFilter.value) return false
-    return true
-  }),
-)
+// ADR-055：服务端分页状态（仿 settings/users.vue 审计 tab）——表格数据由 GET /projects 分页接口驱动；
+// 原 db.projects 本地过滤 list computed 已移除（过滤逻辑已逐条对齐到后端 GET /projects，
+// keyword 大小写敏感 / status / rep / businessOwner 含 '__none__'）。
+const pg = reactive({
+  loading: false,
+  page: 1,
+  pageSize: 20,
+  total: 0,
+  items: [] as Project[],
+  // ADR-056 §1：服务端排序状态（sortable="custom" + @sort-change 驱动；undefined = 缺省最新在前）
+  sortBy: undefined as string | undefined,
+  sortOrder: undefined as 'asc' | 'desc' | undefined,
+})
+
+/** ADR-056 §1：表头点击排序（el-table @sort-change）——order: ascending/descending/null（第三次点击取消）。
+ *  prop→sortBy 映射（列 prop 与后端排序键不一致处：contractAmount→amount；其余同名）；
+ *  取消（null）→ 清空排序回缺省（最新在前）；排序变更一律回第 1 页重拉。 */
+const SORT_PROP_MAP: Record<string, string> = {
+  code: 'code',
+  contractAmount: 'amount',
+  status: 'status',
+  lastFollowDate: 'lastFollowDate',
+  expectedSignDate: 'expectedSignDate',
+}
+function onSortChange({ prop, order }: { prop: string; order: 'ascending' | 'descending' | null }) {
+  const sortBy = order ? SORT_PROP_MAP[prop] : undefined
+  pg.sortBy = sortBy
+  pg.sortOrder = order === 'ascending' ? 'asc' : order === 'descending' ? 'desc' : undefined
+  pg.page = 1
+  loadProjects()
+}
+
+async function loadProjects() {
+  pg.loading = true
+  try {
+    // ⚠️ 对齐要求：传当前 UI 过滤变量的**原值**——keyword 用 trim 后原值（**不 lowercase**，
+    // 后端 instr 大小写敏感以对齐原前端 includes）；空值不传；'__none__' 照传
+    const res = await listProjects({
+      page: pg.page,
+      pageSize: pg.pageSize,
+      keyword: searchText.value.trim() || undefined,
+      status: statusFilter.value || undefined,
+      rep: repFilter.value || undefined,
+      businessOwner: ownerFilter.value || undefined,
+      // ADR-056 §1：排序参数有值才传（缺省 → 后端 id.desc 最新在前）
+      sortBy: pg.sortBy,
+      sortOrder: pg.sortOrder,
+    })
+    pg.total = res.total
+    pg.items = res.items
+  } catch (e) {
+    showError(e, '加载销售项目失败')
+  } finally {
+    pg.loading = false
+  }
+}
+
+/** 过滤变更 → 回第 1 页重拉（状态下拉/生态人员/商务负责人走 watch；
+ *  搜索框走 @change/@keyup.enter，避免每次击键都请求） */
+function onFilterChange() {
+  pg.page = 1
+  loadProjects()
+}
+watch([statusFilter, repFilter, ownerFilter], onFilterChange)
+
+function onPageChange(page: number) {
+  pg.page = page
+  loadProjects()
+}
+function onSizeChange(size: number) {
+  pg.pageSize = size
+  pg.page = 1
+  loadProjects()
+}
+
+/** 写操作后重载：刷新 db 镜像（供 rep/owner 下拉选项）+ 重载当前页表格 */
+async function reloadAfterWrite() {
+  await refresh()
+  loadProjects()
+}
+
+onMounted(() => {
+  loadProjects()
+})
 
 function goEdit(p: Project) {
   // 2026-10-19：订单审核独立页——商务/管理员的 pending 单 → /review（仅订单审核+备注）；其余状态 → /edit
@@ -206,8 +294,9 @@ function contractTip(p: Project): string {
 function canEditProject(p: Project): boolean {
   if (isViewer.value) return false // ADR-028：viewer 任何状态都不可编辑
   // ADR-012 §5.1：pending（待审核）项目仅商务负责人（或 admin 越过）可审核
+  // ADR-051 Q3：商务主管兜底可审核（与后端 review 守卫同口径）
   if (p.status === 'pending') {
-    return isAdmin.value || (p.businessOwner || '').trim() === currentUser.value?.username
+    return isAdmin.value || isSupervisor.value || (p.businessOwner || '').trim() === currentUser.value?.username
   }
   if (!p.contractCount) return p.status === 'active'
   const contracts = db.contracts.filter((c) => c.projectId === p.id)
@@ -349,6 +438,7 @@ async function drawerChangeStatus(status: 'delivered' | 'terminated') {
     await changeProjectStatus(p.id, status)
     ElMessage.success(status === 'delivered' ? '项目已交付：产品数量与交付记录已自动更新' : '项目已终止：数量锁定已释放')
     drawerVisible.value = false
+    await reloadAfterWrite() // ADR-055：抽屉关闭后仍停留列表 → 重载当前页 + 刷新 db 镜像
   } catch (e) {
     showError(e, '项目状态变更失败')
   } finally {
@@ -382,6 +472,7 @@ async function handleDelete(p: Project) {
   try {
     await deleteProject(p.id)
     ElMessage.success('项目已删除：数量锁定已释放，相关交付记录已撤销')
+    await reloadAfterWrite() // ADR-055：删除后重载当前页 + 刷新 db 镜像（下拉选项同步）
   } catch (e) {
     showError(e, '删除失败')
   }
@@ -406,16 +497,20 @@ async function handleDelete(p: Project) {
     <el-card shadow="never">
       <div class="table-head">
         <span class="t">销售项目</span>
-        <span class="c">共 {{ list.length }} 条</span>
+        <!-- ADR-055：total 改显后端返回的「可见 ∩ 过滤」总数（原为本地 list.length） -->
+        <span class="c">共 {{ pg.total }} 条</span>
       </div>
 
       <div class="toolbar">
+        <!-- ADR-055：搜索改服务端过滤——@change（失焦/回车/清空）+ @keyup.enter 触发，避免每次击键都请求 -->
         <el-input
           v-model="searchText"
           placeholder="搜索项目名称 / 编号 / 客户"
           clearable
           style="width: 260px;"
           :prefix-icon="Search"
+          @change="onFilterChange"
+          @keyup.enter="onFilterChange"
         />
         <el-select v-model="statusFilter" placeholder="全部状态" clearable style="width: 140px;">
           <el-option v-for="(s, k) in PROJECT_STATUS" :key="k" :label="s.label" :value="k" />
@@ -434,10 +529,12 @@ async function handleDelete(p: Project) {
         </el-select>
       </div>
 
-      <el-table :data="list" border stripe @row-click="openDrawer" class="clickable">
+      <!-- ADR-055：表格数据改服务端分页接口返回的 pg.items（原为 db.projects 本地过滤 list） -->
+      <!-- ADR-056 §1：@sort-change 驱动服务端排序（5 列 sortable="custom"，排序键映射见 onSortChange） -->
+      <el-table v-loading="pg.loading" :data="pg.items" border stripe @row-click="openDrawer" @sort-change="onSortChange" class="clickable">
         <!-- 2026-10-19 UI 优化：编号列加宽 + mono 等宽 + 不换行（原 110px 导致 SP-xxxx 折 3 行）；
              项目名称列收窄（min-width 200 → 150），超长省略 + tooltip 已有 -->
-        <el-table-column prop="code" label="项目编号" width="185" align="left" show-overflow-tooltip>
+        <el-table-column prop="code" label="项目编号" width="185" align="left" show-overflow-tooltip sortable="custom">
           <template #default="{ row }">
             <span class="proj-code">{{ row.code }}</span>
           </template>
@@ -467,7 +564,9 @@ async function handleDelete(p: Project) {
             <span v-else class="muted">未指派</span>
           </template>
         </el-table-column>
-        <el-table-column label="项目状态" width="110" align="center">
+        <!-- ADR-056 §1：状态列按「状态档位」服务端排序——列仍渲染派生 projectOutcome（8 文案），
+             但设 prop="status" 供 @sort-change 识别（后端按 pending→active→delivering→delivered→terminated 档位排） -->
+        <el-table-column prop="status" label="项目状态" width="110" align="center" sortable="custom">
           <template #default="{ row }">
             <!-- ADR-041 / FLOW-20261022：终止态细分展示（已撤销 / 已驳回 / 已终止）——纯展示，
                  筛选下拉与按钮可用性仍按真实 status（后端只有 terminated） -->
@@ -476,7 +575,7 @@ async function handleDelete(p: Project) {
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="销售金额" width="120" align="right">
+        <el-table-column prop="contractAmount" label="销售金额" width="120" align="right" sortable="custom">
           <template #default="{ row }">
             <span v-if="row.contractAmount">{{ formatMoney(row.contractAmount) }}</span>
             <span v-else class="muted">-</span>
@@ -485,10 +584,10 @@ async function handleDelete(p: Project) {
         <el-table-column label="关联产品" width="90" align="center">
           <template #default="{ row }">{{ row.items.length }} 项</template>
         </el-table-column>
-        <el-table-column prop="expectedSignDate" label="预计签约" width="110" align="left">
+        <el-table-column prop="expectedSignDate" label="预计签约" width="110" align="left" sortable="custom">
           <template #default="{ row }">{{ row.expectedSignDate || '-' }}</template>
         </el-table-column>
-        <el-table-column prop="lastFollowDate" label="最近跟进" width="110" align="left">
+        <el-table-column prop="lastFollowDate" label="最近跟进" width="110" align="left" sortable="custom">
           <template #default="{ row }">{{ row.lastFollowDate || '-' }}</template>
         </el-table-column>
         <!-- 操作列：详情入口收敛到快览抽屉底部「查看详情」（点击行即开抽屉），此处保留编辑 / 撤销 / 重新提交
@@ -501,8 +600,21 @@ async function handleDelete(p: Project) {
                    已接手的自己不再显示按钮；delivered/terminated 终态不可接手/转交 -->
               <!-- ADR-012 §5.1 纯移交制：无主→「接手」（任意商务）；有主→仅负责人「转交」（下拉选人）或 admin 越过；
                    他人负责的单据对普通商务不显示按钮；delivered/terminated 终态不可接手/转交 -->
+              <!-- ADR-051：商务主管/管理员「分配/改派」——任意行（pending/active）可分配给某商务（editor），
+                   复用 TransferDialog assign 模式 + claim 接口；editor 视角仍走下方「接手/转交」（ADR-012） -->
               <el-tooltip
-                v-if="canClaimRow(row)"
+                v-if="canAssignRow(row)"
+                :content="row.businessOwner ? '改派给其他商务账号' : '分配给商务账号（未分配池派单）'"
+                placement="top"
+              >
+                <span class="op-tip" @click.stop>
+                  <el-button link type="primary" size="small" @click.stop="openAssign(row)">
+                    {{ row.businessOwner ? '改派' : '分配' }}
+                  </el-button>
+                </span>
+              </el-tooltip>
+              <el-tooltip
+                v-else-if="canClaimRow(row)"
                 :content="!canWrite
                   ? NO_PERM_TIP
                   : !row.businessOwner ? '接手后由你负责定价审核（确认下单/驳回）'
@@ -608,6 +720,19 @@ async function handleDelete(p: Project) {
         <el-empty description="暂无销售项目，请从产品页「直接下单 / 加入购物车」下单" :image-size="80" />
         </template>
       </el-table>
+
+      <!-- ADR-055：服务端分页（.pagination 全局样式，仿审计日志 tab 先例；切条数回第 1 页） -->
+      <div class="pagination">
+        <el-pagination
+          v-model:current-page="pg.page"
+          :page-size="pg.pageSize"
+          :total="pg.total"
+          :page-sizes="[10, 20, 50, 100]"
+          layout="total, prev, pager, next, sizes"
+          @current-change="onPageChange"
+          @size-change="onSizeChange"
+        />
+      </div>
     </el-card>
 
     <!-- 项目快览抽屉：点击行打开，聚焦销售记录清单（只读）；「查看详情」才进入详情页 -->
@@ -758,8 +883,10 @@ async function handleDelete(p: Project) {
       </template>
     </el-drawer>
 
-    <!-- ADR-012 §5.1 纯移交制：转交对话框（负责人/admin，下拉选新负责人） -->
-    <TransferDialog v-model="transferVisible" :project="transferTarget" />
+    <!-- ADR-012 §5.1 纯移交制：转交对话框（负责人/admin，下拉选新负责人）；
+         ADR-051：assign 模式 = 主管/管理员分配/改派（下拉仅商务 editor） -->
+    <!-- ADR-055：转交/分配成功后重载当前页 + 刷新 db 镜像 -->
+    <TransferDialog v-model="transferVisible" :project="transferTarget" :mode="transferMode" @done="reloadAfterWrite" />
 
     <!-- ADR-026：撤销待审核订单（统一对话框；成功后停留列表并刷新镜像） -->
     <WithdrawProjectDialog v-model="withdrawVisible" :project="withdrawTarget" @done="onWithdrawn" />

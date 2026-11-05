@@ -202,6 +202,11 @@ def _ensure_migration() -> None:
             conn.execute(text("ALTER TABLE assets ADD COLUMN priceMin FLOAT"))
             conn.execute(text("ALTER TABLE assets ADD COLUMN priceMax FLOAT"))
         print("[migration] assets.priceMin/priceMax 列已补充（ADR-018 参考区间）")
+    # ADR-053：assets.taxPoint 税点（整数百分比，可空=未设置）；幂等补列
+    if "taxPoint" not in cols:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE assets ADD COLUMN taxPoint INTEGER"))
+        print("[migration] assets.taxPoint 列已补充（ADR-053 税点）")
     # RSITEM-RANGE-20261020（ADR-021）：遥感售卖明细参考价区间，可空、存量 96 条明细 NULL=不限制
     rs_cols = [c["name"] for c in insp.get_columns("rs_items")]
     if "priceMin" not in rs_cols:

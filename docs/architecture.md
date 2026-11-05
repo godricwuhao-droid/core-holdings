@@ -8,7 +8,7 @@
 
 ## 1. 系统定位与技术栈
 
-面向五大业务板块（具身智能 / 卫星服务 / 软件产品 / 硬件产品 / 算力服务）的可售卖产品及服务平台：产品台账、数量、销售（合同）、购物车下单、交付、交付物一体化，三角色权限 + 审计。
+面向五大业务板块（具身智能 / 卫星服务 / 软件产品 / 硬件产品 / 算力服务）的可售卖产品及服务平台：产品台账、数量、销售（合同）、购物车下单、交付、交付物一体化，五角色权限（admin/supervisor 商务主管/editor 商务/viewer 生态/finance 财务，ADR-051）+ 审计。
 
 > **对外术语口径（2026-10-19 起）**：平台是对外产品平台，全部用户可见文案不再出现「资产/库存」字样——内部"资产"= 面向客户的"产品"（板块按产品/服务划分）；库存按语义映射（库存数量=可用数量、库存可售=可售、暂无库存=已售罄、锁定/扣减库存=锁定/扣减数量…）。完整映射与执行清单见 `docs/asset-inventory-rename-checklist-20261019.md`。代码标识符（assetId、/assets 路径、asset_change 等）保持不变；历史日志/ADR 不回溯改写。
 
@@ -30,7 +30,7 @@
 | **金额口径** | **全程"元"**（库内/接口/展示，前端 ¥+千分位+**最少两位、最多 6 位小数**，尾随 0 截到两位，ADR-048）。禁止"万"字、禁止 ×10000 桥接。`amount = price × qty`（Decimal，量化 1e-6）后端权威重算；卫星 Token（amount 模式）单价展示走 `salePrice×1e6` 元/百万Token 口径（ADR-025，仅展示层） |
 | **包量定价（ADR-008）** | `Asset.pricingMode`：`'unit'`（默认）/ `'amount'`（卫星 Token 登记自动置）。amount 模式：销售明细**合同金额（元，最多 6 位小数，ADR-048）为权威输入**（后端校验 >0 且 ≤6 位小数，否则 400），跳过 price×qty 重算，price 仅作派生展示（元/万Token 参考，2026-10-16 起不带"约"）；购物车 amount 模式行需填合同金额（`cart_items.amount`，经 `PUT /cart/{id}` **必须带 qty** 提交，缺 qty=0 会删行）；checkout 不再传 items，金额已在 cart_items 持久化 |
 | 销售记录结构（ADR-007 → ADR-013 → ADR-016） | 项目内**每个产品（×客户）一条销售记录**（ADR-016：同产品多客户拆多条）（HT-xxxx，界面名「销售记录」；代码/表名/路由仍为 contracts），**允许多主体**（记录主体=各行主体全一致→该值，混合→空）；项目状态/金额由销售记录派生；状态变更走 `PATCH /contracts/{id}/status` |
-| 状态机 | 项目状态只走 PATCH 状态接口（待审核项目例外：只走 `POST /projects/{id}/review`，ADR-012）；生态人员购物车结算建「待审核」（锁定照常），商务确认（可终审改价，**不回写挂牌价**，ADR-018）或驳回；录签订时间进「交付中」（ADR-019）；已完成/已终止不可编辑。**状态变更唯一入口 = `_change_contract_status_core`**（交付前置条件在此守卫，合同级/项目级共用，ADR-032）；项目级批量「全量或全不」（任一合同不合规整体 400 并列出全部原因）；终止**按明细状态回滚**（shipped→撤销交付回退销量，locked→释放锁定，缺明细/产品→400 不静默）；派生 `{delivered,terminated}`→`delivered`（ADR-032） |
+| 状态机 | 项目状态只走 PATCH 状态接口（待审核项目例外：只走 `POST /projects/{id}/review`，ADR-012）；生态人员购物车结算建「待审核」（锁定照常），商务确认（可终审改价/改数量/改客户名/改**合同总价**（按比例分摊到明细，保持 `合同总额=Σ明细`），**不回写挂牌价**，ADR-018/ADR-050）或驳回；录签订时间进「交付中」（ADR-019）；已完成/已终止不可编辑。**状态变更唯一入口 = `_change_contract_status_core`**（交付前置条件在此守卫，合同级/项目级共用，ADR-032）；项目级批量「全量或全不」（任一合同不合规整体 400 并列出全部原因）；终止**按明细状态回滚**（shipped→撤销交付回退销量，locked→释放锁定，缺明细/产品→400 不静默）；派生 `{delivered,terminated}`→`delivered`（ADR-032） |
 | 一致性 | 写操作单事务；数量前置校验（同产品多行合计防超卖）；被引用产品禁删（**含 delivered 引用**，ADR-032）；**下单校验单一出口**（`_create_project_core` 权威链：明细存在性→归属/qty→折扣→服务期限→参考区间→按产品聚合数量；unit 行单价也过区间校验；`contractAmount` 传值必须 = Σ 明细，ADR-029）；**并发**：checkout 幂等键 `requestId`（24h）、状态变更/数量扣减条件更新、不变量破坏显式 500 + 审计（无静默夹断，ADR-033）；**参考区间只约束下限**：购物车/结算（任何角色）金额可高于区间上限，仅拦低于下限；商务审核改价不受区间限制；仅商务手工建单仍双向校验（ADR-049，部分取代 ADR-037） |
 | **订单撤销（ADR-026）** | `POST /projects/{id}/withdraw`（require_order）：仅 `pending`；下单人本人或 admin（存量回退 rep）；原因必填 ≤200 字；单事务 = 合同 pending→terminated（释放真实锁定 + cancel_release 流水 + remark「撤销：原因」）+ 项目 terminated + 解绑负责人 + 明细回填下单人购物车（复用 `_cart_add_inner`，**同键替换不累加**——ADR-042 §1 起；此前为累加）+ OpLog/审计；回填失败行降级不中断（原价回填/跳过并回报） |
 | **交付物（ADR-024）** | 模板体系（`/settings/deliverables` 页 + `deliverable_templates` 表 + bootstrap 惰性生成）彻底下线；交付物实例仅详情页「交付物」页签手动增改；每项单个附件 `asset_deliverables.file`（upload 散列名；前端 accept 仅 pdf/docx/png/jpg/jpeg/gif/webp，禁 .doc）；抽屉与详情页两处点击预览（复用 FilePreview）；存量实例已一次性清空 |
@@ -54,8 +54,9 @@
 ## 5. 购物车与权限
 
 - **购物车按登录用户隔离（ADR-009）**：全部购物车端点用登录用户 id；bootstrap.cart 只返回本人行；结算只清本人
-- 权限矩阵：admin（全部含基础设置）/ editor（业务写全放行，无基础设置）/ viewer（生态人员）
-- **下单链路 = require_order（认证即放行）**：viewer 可 单加/批量加购/改客户/改数量/删行/清空/结算/直接下单；产品维护类（增删改产品、明细维护、交付物、基础资料、交付）= require_editor；账号/审计 = require_admin。前端 canWrite/isLoggedIn 与后端一致（**不要再加 viewer 降级分支**）
+- 权限矩阵（**五角色，ADR-051**）：admin（全部含基础设置）/ supervisor 商务主管（业务写全放行 + 查看所有销售项目 + 分配/改派 + 审核兜底）/ editor 商务（业务写全放行，无基础设置；**仅见名下销售项目**）/ viewer 生态（可下单、仅见自己下单的项目）/ finance 财务（**只读，仅产品/服务**，不可下单/编辑/看销售项目/主体）。能力=角色→权限点（守卫），数据=角色+归属→行级域（`user_sees_project`/`Visibility`），两层正交、均服务端强制
+- **下单链路 = require_order（认证即放行，唯 finance 排除→403）**：viewer/supervisor/editor/admin 可 单加/批量加购/改客户/改数量/删行/清空/结算/直接下单；产品维护类（增删改产品、明细维护、交付物、基础资料、交付）+ 审核/接手/分配 = require_editor（admin/supervisor/editor）；**分配/改派 = require_supervisor（admin/supervisor）**；账号/审计 = require_admin。前端 canWrite（admin/supervisor/editor）与后端一致（**不要再加 viewer/finance 降级分支**）
+- **销售项目可见性（ADR-051，唯一口径 `user_sees_project`/`Visibility`）**：admin/supervisor 全部；editor 仅 `businessOwner==自己`；viewer 仅 `creator==自己`；finance 无。未分配池（`businessOwner=""`）仅 admin/supervisor（+creator 本人）可见；下单后由商务主管「分配」给商务（复用 `claim`，分配=主管身份 claim with newOwner）→ 被分配商务 + 主管可见并处理
 - **自己项目有限操作（2026-10-16，ADR-028 起编辑权收回）**：`PATCH /projects/{id}/status`（仅 terminated）、`PATCH /contracts/{id}/status`（仅 terminated，含撤销 delivered 交付）、`POST /projects/{id}/withdraw`（仅 pending）、`POST /projects/{id}/refill-cart`（仅 terminated）对 viewer 放开但**限自己下单项目**（`user_sees_project`），越权 403、交付 400。**`PUT /projects/{id}` 对 viewer 不再放开（一律 403）**——订单提交即冻结，改单走撤销重下。viewer 前端入口：侧边「销售项目」菜单 + 列表/详情（**无编辑入口**；`/edit` 路由不对 viewer 放行）+ 撤销 + 重新提交；新建/删除/交付仍禁用
 - 审计：写操作与登录/登出入 audit_logs
 - **文件端点** `GET /api/files/{filename}`：JWT 双通道鉴权（`Authorization` 头或 `?token=` 查询参数，iframe/img 无法带头所以前端 fileUrl 统一拼 token）；`?inline=true` 返回 `Content-Disposition: inline`（预览 iframe/img 用），缺省 attachment（下载用）。前端统一走 `fileUrl(filename, inline?)`，勿手拼 /api/files URL；文件删除的引用检查含 `asset_deliverables.file`（ADR-024）
@@ -122,7 +123,15 @@
 | ADR-040 | Accepted | 销售项目删除入口收敛：列表常驻「删除」→ 行尾「更多▾」仅 admin + `DELETE /projects/{id}` 权限 `require_editor` → `require_admin`（ADR-028 §3 护栏与回滚链零改动）；附带移除产品列表「编辑」按钮（入口 3→2） |
 | ADR-047 | Accepted | 购物车服务期限由必填改**选填**（部分取代 ADR-022 §1 第三条）：两端都空放行（落库 `NULL`）、只填一端仍 400（成对校验）、两端都填保持 ADR-020 校验；客户/金额必填不变；前端去列头红星并同步提示文案 |
 | ADR-048 | Accepted | 金额精度放开到**最多 6 位小数**（部分取代 ADR-008/022 的「整数元」）：全链路 `Decimal` 量化 1e-6（取消强制到分），展示「最少两位、最多六位、尾随 0 截到两位」，覆盖购物车/建单/审核改价/产品单价与区间/遥感明细单价/交付补录；业务规则（必填/区间/分组/锁定）不变，无 DB 迁移 |
-| ADR-049 | Accepted（部分取代 ADR-037 §3） | 参考区间**只约束下单下限**：购物车加购/改数量/改金额/结算（任何角色）金额可高于区间上限，仅低于下限 400；商务审核改价不受区间限制（仅校验 >0 与 ≤6 位小数）；商务手工建单保留双向校验；无数据结构变更 |
+| ADR-049 | Accepted（部分取代 ADR-037 §3；**§购物车「只卡下限」部分被 ADR-052 取代**） | 参考区间**只约束下单下限**：购物车加购/改数量/改金额/结算（任何角色）金额可高于区间上限，仅低于下限 400；商务审核改价不受区间限制（仅校验 >0 与 ≤6 位小数）；商务手工建单保留双向校验；无数据结构变更 |
+| ADR-050 | Accepted | 审核阶段可编辑性增强：`POST /projects/{id}/review` 支持改**合同总价**（按各明细行金额比例分摊、残差归最大行、保持 `合同总额=Σ明细`、不回写挂牌价）+ 改**客户公司名称**（写权威 `Contract.customer`、`Project.customer` 重派生、同客户+同明细集冲突 400）+ 改**非遥感数量**（unit 行 `amount=price×qty`、amount 行按比例缩放、改大校验可用库存不足 400 整事务回滚、repeatSale 只计次、遥感恒 1）；reject 忽略新字段、旧 payload 行为不变 |
+| ADR-051 | Accepted | 权限体系升级（**固定五角色** admin/supervisor 商务主管/editor 商务/viewer 生态/finance 财务，静态集中式不引动态权限表）：能力=角色→权限点（`require_order` 排除 finance、新增 `require_supervisor`）+ 数据域=角色→行级（`user_sees_project`/`Visibility`：editor 仅名下、supervisor/admin 全部、viewer 仅自己、finance 无）+ **商务主管分配制**（未分配池 `businessOwner=""` 仅 admin/supervisor 可见，复用 `claim` 由主管分配/改派给商务、被分配商务+主管可见并可审核兜底）+ 财务只读仅产品/服务；无 schema 迁移 |
+| ADR-052 | Accepted | 购物车销售金额**双向区间约束**（部分取代 ADR-049 §购物车「只卡下限」）：购物车 4 入口 `_check_discount_range` `enforce_max=False→True`（加购/批量、改客户改金额、改数量、结算含全量行重校验）→ unit 行低于下限/高于上限均 400；**包量（amount）行不覆盖**（仅 >0+≤6 位）、**审核改价不限制**、**手工建单仍双向**均不变；存量超上限行结算拦截（无迁移）；前端去「销售单价」列（纯展示派生，hint 迁移）+ 销售金额输入加双向区间校验/标红/阻断结算 |
+| ADR-053 | Accepted | 产品域三处：① **税点** `Asset.taxPoint`（整数百分比、nullable、纯展示不计算）→ 列表/详情展示 + 登记可录；② 列表删「**售卖数量**」列（`shippedQty`），「重复售卖」tag 保留；③ **销售单价→采购单价**（复用 `salePrice` 列无迁移、对外不展示仅编辑可见）+ 列表/详情/抽屉销售单价改展示**区间下限 `priceMin`** + 填采购价**自动按 ×1.01/×1.02 生成参考区间**（新建+编辑、手改不覆盖、仅非容器、前端实现）+ `availableValue`（可售金额）切 `priceMin` |
+| ADR-054 | Accepted | 账号/用户管理三处：① 账号列表**客户端分页 + 过滤**（关键字 username/name + 角色 + 状态；`GET /users` 不变、统计卡照常）；② **自助改密** `POST /auth/change-password`（全角色、需校验旧密码、`tokenVersion+1` 踢旧会话、返回新 token 保持登录）+ 顶栏 user-chip 改 `el-dropdown`（改密/退出，全角色可见）；③ 建号**随机密码**（12 位大小写+数字去易混、明文可见可复制、仅新建）；顺带 `UserOut` 补 `createdAt` 修「创建时间」列恒 `-` |
+| ADR-055 | Accepted | 销售项目列表页 `/sales/projects` **服务端分页**：新增 `GET /projects`（page/pageSize + 可见性 `build_visibility` + 4 过滤 keyword/status/rep/businessOwner 转 query 参数、服务端 filter+count+切片、排序 id.desc、`{total,items}`）；**bootstrap 全量 projects 不动**（13 消费点零影响）；列表页改分页请求驱动 + el-pagination + 卡头显后端 total + 写操作后重载；rep/owner 下拉选项仍取 db.projects 全量 |
+| ADR-056 | Accepted | 三处：§1 销售项目列表**服务端排序**（`GET /projects` 加 `sortBy/sortOrder`，状态按生命周期档位 5 序 + 金额/最近跟进/预计签约/编号，`id.desc()` 兜底保翻页稳定，5 列 `sortable="custom"`）；§2 详情页**勾选驳回订单**（合同改列表+selection，仅 pending 合同、批量/单一驳回，新增 `POST /projects/{id}/reject-contracts` 复用 terminated+remark 零迁移、部分驳回项目保持 pending 可续审）；§3 新增「**产品统计**」一级菜单（按 `Asset.subject` 主体聚合资产数量/金额、纯前端、可展开对账 Excel、采购口径、仅 viewer 不可见、finance 守卫放开） |
+| ADR-057 | Accepted | 审核订单页 `review.vue` **美化 + 合同勾选部分确认/驳回**：§1 视觉改**方案A 每合同一张表**（合同头=客户名降级+主体tag+合同总价input+小计，下方 el-table 产品/数量/原价/实际价/金额/服务期限、行内可编辑、行高统一、金额列 center 跟规范、`.info-bar`）；§2 合并**sticky 底部条**（已选 N/M 合同+勾选合同合计+确认下单/驳回，照购物车 `.cart-checkout`、豁免全局非悬浮规范）；§3 **每合同勾选（默认全选）** 控制确认/驳回只作用于勾选：确认走 `review` 加可选 `contractIds`（部分确认、未勾保持 pending、项目有 pending 时保持 pending 可续审）、驳回复用 `reject-contracts`；缺省整单向后兼容 |
 
 ## 8. 文档地图与变更流程
 

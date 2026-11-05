@@ -3,14 +3,18 @@
  * 销售管理 - 销售项目详情（ADR-007 合同清单）
  *
  * 从「销售项目列表」行点击 / 「产品详情-关联销售项目」进入。
- * 只读展示项目信息 + 「合同清单」区块（每份合同一张卡片，明细并入卡片展示）；
- * 合同级操作：交付 / 终止（PATCH /contracts/{id}/status，数量联动最小单位）；
+ * 只读展示项目信息 + 「销售记录清单」区块（ADR-056 §2：合同以**列表(表格)**呈现，
+ * 明细行/时间节点/备注收进 expand 展开行）；
+ * 合同级操作：交付 / 终止 / 录入签订时间（PATCH /contracts/{id}/status 等，数量联动最小单位）；
+ * ADR-056 §2：项目 pending 时合同行可勾选（仅 pending 合同）→「批量驳回」/ 行内「驳回」
+ * （POST /projects/{id}/reject-contracts，原因必填；剩余 pending 合同项目保持 pending 可续审）；
  * 项目状态由合同状态自动派生，本页不提供项目级状态变更入口。
  * 「编辑」跳转编辑页（仅基本信息）。
  */
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { useBack } from '@/composables/useBack'
 import { ArrowLeft, EditPen, Folder, InfoFilled, Tickets } from '@element-plus/icons-vue'
 import {
   PROJECT_STATUS,
@@ -23,11 +27,12 @@ import {
   rsItemName,
   tagInfo,
   type Contract,
+  type ContractItem,
 } from '@/types'
-import { allUserOptions, changeContractStatus, claimProject, db, getAsset, patchContractFields, refresh, showError, type UserOption } from '@/api'
+import { allUserOptions, changeContractStatus, claimProject, db, getAsset, patchContractFields, refresh, rejectContracts, showError, type UserOption } from '@/api'
 import TransferDialog from '@/components/TransferDialog.vue'
 import WithdrawProjectDialog from '@/components/WithdrawProjectDialog.vue'
-import { canWrite, isViewer, isAdmin, currentUser, NO_PERM_TIP } from '@/auth'
+import { canAssign, canWrite, isViewer, isAdmin, isSupervisor, currentUser, NO_PERM_TIP } from '@/auth'
 // ADR-042 / REFILL-20261022：「重新提交」动线收敛到 composable（与列表页共用同一套弹窗/失败/归属逻辑）
 import { useResubmitProject } from '@/composables/useResubmitProject'
 
@@ -46,9 +51,10 @@ function userName(v?: string): string {
   const u = ownerOptions.value.find((x) => x.username === v) || ownerOptions.value.find((x) => x.name === v)
   return u?.name || v
 }
-/** ADR-012 §5.1：「审核订单」入口仅对接手人（或 admin 越过）展示；未接手/他人接手 → 隐藏（后端守卫兜底） */
+/** ADR-012 §5.1：「审核订单」入口仅对接手人（或 admin 越过）展示；未接手/他人接手 → 隐藏（后端守卫兜底）
+ *  ADR-051 Q3：商务主管兜底——supervisor 对已分配单（含他人名下）可审核（与后端 review 守卫同口径） */
 const canReview = computed(() => canWrite.value && !!project.value?.businessOwner
-  && (isAdmin.value || project.value!.businessOwner === currentUser.value?.username))
+  && (isAdmin.value || isSupervisor.value || project.value!.businessOwner === currentUser.value?.username))
 
 /** ADR-012 §5.1 纯移交制：详情页无主单「接手」（转交走 TransferDialog 下拉选人） */
 async function handleClaim() {
@@ -74,10 +80,21 @@ async function handleClaim() {
 
 const transferVisible = ref(false)
 const transferTarget = ref<{ id: number; name: string; businessOwner?: string } | null>(null)
+// ADR-051：对话框模式——'transfer'（商务转交/admin 原语义）| 'assign'（主管/管理员分配/改派，下拉仅商务 editor）
+const transferMode = ref<'transfer' | 'assign'>('transfer')
 function openTransfer() {
   const p = project.value
   if (!p) return
   transferTarget.value = p
+  transferMode.value = 'transfer'
+  transferVisible.value = true
+}
+/** ADR-051：主管/管理员「分配/改派」入口（复用 TransferDialog assign 模式 + claim 接口） */
+function openAssign() {
+  const p = project.value
+  if (!p) return
+  transferTarget.value = p
+  transferMode.value = 'assign'
   transferVisible.value = true
 }
 
@@ -151,11 +168,8 @@ onMounted(async () => {
   await refresh()
 })
 
-function goBack() {
-  // 有历史栈时返回上一页；直达 URL（无历史）时回退到销售项目列表，避免退出应用
-  if (window.history.state?.back) router.back()
-  else router.push('/sales/projects')
-}
+// 「返回」：回上一页；深链/刷新直达（无历史）时兜底销售项目列表
+const { goBack } = useBack('/sales/projects')
 
 function goEdit() {
   // ADR-028（2026-10-21）：生态人员订单提交后禁编辑——兜底拦截（按钮已不渲染、路由也不放行 edit，
@@ -254,6 +268,83 @@ async function changeContract(c: Contract, status: 'delivered' | 'terminated') {
 }
 
 // ============================================================
+// ADR-056 §2：勾选驳回（仅 pending 项目 / pending 合同）
+// - 单一「驳回」：行内按钮，ElMessageBox.prompt 填原因（必填、trim 非空）→ rejectContracts 单合同；
+// - 「批量驳回」：表格上方按钮（≥1 勾选启用），选中合同共用一个原因；
+// - 成功后清空勾选 + refresh()（重拉合同/项目，保证前端状态与后端派生一致：
+//   仍有 pending 合同 → 项目保持 pending 可续审；全部驳回 → terminated）。
+// 可见性同「审核订单」（canReview：接手人/admin/supervisor），与后端接手人守卫同口径。
+// ============================================================
+const contractTableRef = ref()
+const selectedContracts = ref<Contract[]>([])
+const rejecting = ref(false)
+
+function onSelectionChange(rows: Contract[]) {
+  selectedContracts.value = rows
+}
+
+/** 驳回原因 prompt（必填、trim 非空）；取消/校验不过 → null */
+async function promptRejectReason(title: string, message: string): Promise<string | null> {
+  try {
+    const res = await ElMessageBox.prompt(message, title, {
+      type: 'warning',
+      confirmButtonText: '确认驳回',
+      cancelButtonText: '取消',
+      inputType: 'textarea',
+      inputPlaceholder: '请输入驳回原因（必填）',
+      inputValidator: (v: string) => (!v || !v.trim() ? '请输入驳回原因' : true),
+    })
+    return (res.value || '').trim()
+  } catch {
+    return null
+  }
+}
+
+/** 单一驳回（行内） */
+async function rejectSingle(c: Contract) {
+  if (rejecting.value) return
+  const reason = await promptRejectReason(
+    '驳回销售记录',
+    `请输入驳回销售记录 ${c.code} 的原因（必填）。驳回后该记录锁定数量将释放。`,
+  )
+  if (!reason) return
+  await doReject([c], reason)
+}
+
+/** 批量驳回（表格上方，≥1 勾选启用；共用一个原因） */
+async function rejectBatch() {
+  const list = selectedContracts.value.filter((c) => c.status === 'pending')
+  if (!list.length || rejecting.value) return
+  const reason = await promptRejectReason(
+    '批量驳回销售记录',
+    `已勾选 ${list.length} 条待审核销售记录，请输入驳回原因（必填，勾选记录共用）。驳回后锁定数量将释放。`,
+  )
+  if (!reason) return
+  await doReject(list, reason)
+}
+
+async function doReject(list: Contract[], reason: string) {
+  const p = project.value
+  if (!p || !reason) return
+  rejecting.value = true
+  try {
+    await rejectContracts(p.id, { contractIds: list.map((c) => c.id), reason })
+    ElMessage.success(
+      list.length > 1
+        ? `已驳回 ${list.length} 条销售记录，锁定数量已释放`
+        : `销售记录 ${list[0].code} 已驳回，锁定数量已释放`,
+    )
+    contractTableRef.value?.clearSelection()
+    selectedContracts.value = []
+    await refresh() // 重拉合同/项目（rejectContracts 内部已刷镜像，此处双保险对齐派生状态）
+  } catch (e) {
+    showError(e, '驳回失败')
+  } finally {
+    rejecting.value = false
+  }
+}
+
+// ============================================================
 // 合同时间节点录入（ADR-019，PRICING-20261020）：PATCH /contracts/{id}
 // - signedDate（合同签订时间）：商务/管理员；录入即 active→delivering；录后不可清空（后端 400 兜底）
 // - scheduledDeliveryDate（预计交付时间）：仅 admin；仅 delivering 可录/改/清空（null 允许）
@@ -317,7 +408,7 @@ async function submitDateDialog() {
         <div>
           <a class="back-link" @click="goBack">
             <el-icon><ArrowLeft /></el-icon>
-            返回销售项目
+            返回
           </a>
           <div class="title-row">
             <h1>{{ project?.name ?? '销售项目详情' }}</h1>
@@ -337,10 +428,19 @@ async function submitDateDialog() {
              现收窄到「编辑 / 审核订单」按钮本身 -->
         <div class="head-actions" v-if="project">
           <span>
+            <!-- ADR-051：商务主管/管理员「分配/改派」——任意项目（pending/active）可分配给某商务（editor），
+                 复用 TransferDialog assign 模式 + claim 接口；editor 视角仍走下方「接手/转交」（ADR-012） -->
+            <el-button
+              v-if="canAssign && (project.status === 'pending' || project.status === 'active')"
+              type="primary"
+              @click="openAssign()"
+            >
+              {{ project.businessOwner ? '改派' : '分配' }}
+            </el-button>
             <!-- ADR-012 §5.1 纯移交制：无主→「接手」；有主→仅负责人「转交」（下拉选人）或 admin 越过；
                  他人负责的单据对普通商务不显示（审核订单按钮仅接手人可见） -->
             <el-button
-              v-if="canWrite && (project.status === 'pending' || project.status === 'active')
+              v-if="!canAssign && canWrite && (project.status === 'pending' || project.status === 'active')
                    && (!project.businessOwner
                        || project.businessOwner === currentUser?.username
                        || isAdmin)"
@@ -474,227 +574,262 @@ async function submitDateDialog() {
           </div>
         </div>
 
-        <!-- ② 销售记录清单（ADR-007：数量联动最小单位；项目状态由销售记录状态自动派生） -->
+        <!-- ② 销售记录清单（ADR-007：数量联动最小单位；项目状态由销售记录状态自动派生；
+             ADR-056 §2：卡片改列表(表格)呈现——勾选列仅 pending 项目启用（仅 pending 合同可勾），
+             明细/时间节点/备注收进 expand 展开行；批量驳回按钮在区块头右侧） -->
         <div class="form-card">
           <div class="block-head">
             <span class="bh-icon" aria-hidden="true"><el-icon><Tickets /></el-icon></span>
             <div>
               <div class="bh-title">销售记录清单</div>
             </div>
+            <!-- ADR-056 §2：批量驳回——仅 pending 项目 + 接手人（canReview，与后端守卫同口径）；≥1 勾选启用 -->
+            <span v-if="project.status === 'pending' && canReview" class="bh-actions">
+              <el-button
+                type="danger"
+                plain
+                size="small"
+                :disabled="!selectedContracts.length"
+                :loading="rejecting"
+                @click="rejectBatch"
+              >
+                批量驳回（{{ selectedContracts.length }}）
+              </el-button>
+            </span>
           </div>
 
           <template v-if="contracts.length">
-            <div v-for="c in contracts" :key="c.id" class="contract-card" :class="`contract-${c.status}`">
-              <div class="contract-head">
-                <div class="ch-left">
-                  <!-- 2026-10-21：卡头改为「甲方：客户名称；乙方：签约主体全称」文本式——
-                       甲方 = 生态人员下单时输入的客户名称；乙方 = 该项目签约主体全称（不再用简称徽标）。
-                       状态标签保留在右侧。
-                       TASK-FE-DETAIL-REV2：甲方、乙方各占一行（样式见 .ch-left/.contract-party） -->
-                  <span class="contract-party">
-                    <span class="cp-label">甲方：</span>{{ c.customer || '-' }}
-                  </span>
-                  <span v-if="c.subject" class="contract-party">
-                    <span class="cp-label">乙方：</span>{{ c.subject }}
-                  </span>
-                  <!-- TASK-FE-DETAIL-REV：状态收敛——乙方后不再显示 el-tag，唯一状态指示改为卡头最右侧带背景色块胶囊 -->
-                </div>
-                <div class="op-actions">
-                  <!-- ADR-012：待审核销售记录无 交付/终止 快捷（后端对 pending 一律 400），唯一出口是编辑页审核面板 -->
-                  <template v-if="c.status === 'pending'">
-                    <!-- ADR-012 §5.1：仅接手人（或 admin）可见；未接手/他人接手 → 提示等待 -->
-                    <el-button
-                      v-if="canReview"
-                      type="warning"
-                      size="small"
-                      @click="goEdit"
-                    >
-                      审核订单
-                    </el-button>
-                    <span v-else class="muted contract-ended">待审核（等商务确认）</span>
-                  </template>
-                  <template v-else-if="c.status === 'active'">
-                    <!-- 交付仅商务/管理员（后端同样拦截 viewer） -->
-                    <el-tooltip :content="!canWrite ? '交付需商务人员/管理员操作' : ''" :disabled="canWrite" placement="top">
-                      <span>
-                        <el-button
-                          type="primary"
-                          size="small"
-                          :loading="actingContractId === c.id"
-                          :disabled="!canWrite || actingContractId === c.id"
-                          @click="deliverContract(c)"
-                        >
-                          交付
-                        </el-button>
+            <el-table ref="contractTableRef" :data="contracts" border class="contract-table" @selection-change="onSelectionChange">
+              <!-- 勾选列：仅项目 pending 时渲染；仅 pending 合同可勾（已确认/已交付/已终止走各自状态操作） -->
+              <el-table-column
+                v-if="project.status === 'pending'"
+                type="selection"
+                width="44"
+                align="center"
+                :selectable="(row: Contract) => row.status === 'pending'"
+              />
+              <!-- 展开行：合同明细 + 时间节点/备注（原卡片信息全部保留） -->
+              <el-table-column type="expand">
+                <template #default="{ row }">
+                  <div class="ct-expand">
+                    <div class="contract-info">
+                      <span class="ci-item">
+                        <span class="muted ci-label">合同签订</span>
+                        <span :class="{ muted: !row.signedDate }">{{ row.signedDate || '未签订' }}</span>
                       </span>
-                    </el-tooltip>
-                    <!-- 终止：自己项目可操作（含生态人员，后端校验归属） -->
-                    <el-tooltip :content="NO_PERM_TIP" :disabled="canOwn" placement="top">
-                      <span>
-                        <el-button
-                          type="danger"
-                          plain
-                          size="small"
-                          :loading="actingContractId === c.id"
-                          :disabled="!canOwn || actingContractId === c.id"
-                          @click="terminateContract(c)"
-                        >
-                          终止
-                        </el-button>
+                      <span class="ci-item">
+                        <span class="muted ci-label">预计交付</span>
+                        <span :class="{ muted: !row.scheduledDeliveryDate }">{{ row.scheduledDeliveryDate || '未录入' }}</span>
                       </span>
-                    </el-tooltip>
-                    <!-- ADR-019（PRICING-20261020）：录入签订时间（商务/管理员）——录入即 active→delivering；
-                         已录过签订时间的合同已转 delivering，active 分支下该按钮恒为「未录入」态 -->
-                    <el-tooltip :content="!canWrite ? '录入签订时间需商务人员/管理员操作' : ''" :disabled="canWrite" placement="top">
-                      <span>
-                        <el-button
-                          type="primary"
-                          plain
-                          size="small"
-                          :disabled="!canWrite"
-                          @click="openDateDialog(c, 'signedDate')"
-                        >
-                          录入签订时间
-                        </el-button>
+                      <span class="ci-item" v-if="row.items.some((it: ContractItem) => it.shippedDate)">
+                        <span class="muted ci-label">交付</span>
+                        <span>{{ formatDate(row.items.find((it: ContractItem) => it.shippedDate)?.shippedDate) }}</span>
                       </span>
-                    </el-tooltip>
-                  </template>
-                  <!-- ADR-019（PRICING-20261020）：交付中（已录签订时间未交付）——
-                       交付/终止沿用 active 分支既有调用；「预计交付时间」仅 admin 可录/改/清空 -->
-                  <template v-else-if="c.status === 'delivering'">
-                    <el-tooltip :content="!canWrite ? '交付需商务人员/管理员操作' : ''" :disabled="canWrite" placement="top">
-                      <span>
-                        <el-button
-                          type="primary"
-                          size="small"
-                          :loading="actingContractId === c.id"
-                          :disabled="!canWrite || actingContractId === c.id"
-                          @click="deliverContract(c)"
-                        >
-                          交付
-                        </el-button>
+                      <span class="ci-item" v-if="row.remark">
+                        <span class="muted ci-label">备注</span>
+                        <span>{{ row.remark }}</span>
                       </span>
-                    </el-tooltip>
-                    <el-tooltip :content="NO_PERM_TIP" :disabled="canOwn" placement="top">
-                      <span>
-                        <el-button
-                          type="danger"
-                          plain
-                          size="small"
-                          :loading="actingContractId === c.id"
-                          :disabled="!canOwn || actingContractId === c.id"
-                          @click="terminateContract(c)"
-                        >
-                          终止
-                        </el-button>
-                      </span>
-                    </el-tooltip>
-                    <el-tooltip :content="!isAdmin ? '预计交付时间仅管理员可录入' : ''" :disabled="isAdmin" placement="top">
-                      <span>
-                        <el-button
-                          size="small"
-                          :disabled="!isAdmin"
-                          @click="openDateDialog(c, 'scheduledDeliveryDate')"
-                        >
-                          预计交付时间
-                        </el-button>
-                      </span>
-                    </el-tooltip>
-                  </template>
-                  <el-tooltip v-else-if="c.status === 'delivered'" :content="NO_PERM_TIP" :disabled="canOwn" placement="top">
-                    <span>
+                    </div>
+                    <el-table v-if="row.items.length" :data="row.items" border size="small" class="contract-items">
+                      <!-- TASK-FE-030：行高固定 36px 后产品列单行显示，超长名称（含编号）用 tooltip 兜底不丢信息 -->
+                      <el-table-column label="产品" min-width="220" show-overflow-tooltip>
+                        <template #default="{ row: it }">
+                          <a class="link" @click="goAssetDetail(it.assetId)">{{ itemAssetName(it.assetId) }}</a>
+                        </template>
+                      </el-table-column>
+                      <!-- ADR-011：明细列（遥感明细行显示明细名，其余 '-'） -->
+                      <el-table-column label="明细" width="200" align="left" show-overflow-tooltip>
+                        <template #default="{ row: it }">
+                          <span :class="{ muted: itemRsName(it.itemId) === '-' }">{{ itemRsName(it.itemId) }}</span>
+                        </template>
+                      </el-table-column>
+                      <el-table-column label="数量" width="120" align="right">
+                        <template #default="{ row: it }">{{ itemQtyText(it.assetId, it.qty) }} {{ it.unit }}</template>
+                      </el-table-column>
+                      <el-table-column label="单价" width="170" align="right">
+                        <!-- ADR-008：包量定价行单价为派生参考展示（带「约」），金额以销售金额为准 -->
+                        <template #default="{ row: it }">
+                          <span v-if="isAmountItem(it.assetId)" class="muted">{{ derivedUnitPrice(it.amount, it.qty, it.unit) }}</span>
+                          <span v-else>{{ formatMoney(it.price) }}</span>
+                        </template>
+                      </el-table-column>
+                      <el-table-column label="金额" width="140" align="right">
+                        <template #default="{ row: it }">{{ formatMoney(it.amount) }}</template>
+                      </el-table-column>
+                      <!-- ADR-020（PRICING-20261020）：服务期限（start ~ end，空显 -；遥感明细行按期数售卖，展示为空即可） -->
+                      <el-table-column label="服务期限" width="200" align="center">
+                        <template #default="{ row: it }">
+                          <span :class="{ muted: !(it.serviceStart || it.serviceEnd) }">
+                            {{ it.serviceStart || it.serviceEnd ? `${it.serviceStart || '-'} ~ ${it.serviceEnd || '-'}` : '-' }}
+                          </span>
+                        </template>
+                      </el-table-column>
+                      <el-table-column label="交付要求" min-width="160" show-overflow-tooltip>
+                        <template #default="{ row: it }">{{ it.deliveryReq || '-' }}</template>
+                      </el-table-column>
+                    </el-table>
+                    <div v-else class="muted ct-empty">暂无明细</div>
+                  </div>
+                </template>
+              </el-table-column>
+              <el-table-column prop="code" label="合同编号" width="150" align="left">
+                <template #default="{ row }"><span class="ct-code">{{ row.code }}</span></template>
+              </el-table-column>
+              <el-table-column prop="customer" label="客户" min-width="140" align="left" show-overflow-tooltip>
+                <template #default="{ row }"><span :class="{ muted: !row.customer }">{{ row.customer || '-' }}</span></template>
+              </el-table-column>
+              <el-table-column prop="subject" label="签约主体" min-width="160" align="left" show-overflow-tooltip>
+                <template #default="{ row }"><span :class="{ muted: !row.subject }">{{ row.subject || '-' }}</span></template>
+              </el-table-column>
+              <el-table-column label="合同金额" width="130" align="right">
+                <template #default="{ row }"><span class="ci-amount">{{ formatMoney(row.contractAmount) }}</span></template>
+              </el-table-column>
+              <el-table-column label="状态" width="100" align="center">
+                <template #default="{ row }">
+                  <el-tag :type="tagInfo(PROJECT_STATUS, row.status).tag" size="small" effect="light">
+                    {{ tagInfo(PROJECT_STATUS, row.status).label }}
+                  </el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column prop="createdAt" label="下单时间" width="160" align="left">
+                <template #default="{ row }">{{ row.createdAt || '-' }}</template>
+              </el-table-column>
+              <!-- 操作列：按合同状态给对应按钮（保留原卡片全部操作）；
+                   ADR-056 §2：pending 行新增「驳回」（单一，仅接手人 canReview） -->
+              <el-table-column label="操作" width="260" fixed="right" align="center">
+                <template #default="{ row }">
+                  <div class="op-actions">
+                    <!-- ADR-012：待审核销售记录无 交付/终止 快捷（后端对 pending 一律 400），出口 = 审核页 + 驳回 -->
+                    <template v-if="row.status === 'pending'">
+                      <!-- ADR-012 §5.1：仅接手人（或 admin/supervisor）可见；未接手/他人接手 → 提示等待 -->
                       <el-button
+                        v-if="canReview"
+                        type="warning"
+                        size="small"
+                        @click="goEdit"
+                      >
+                        审核订单
+                      </el-button>
+                      <!-- ADR-056 §2：单一驳回（原因必填；驳回后锁定释放，项目按剩余合同派生） -->
+                      <el-button
+                        v-if="canReview"
                         type="danger"
                         plain
                         size="small"
-                        :loading="actingContractId === c.id"
-                        :disabled="!canOwn"
-                        @click="terminateContract(c)"
+                        :loading="rejecting"
+                        :disabled="rejecting"
+                        @click="rejectSingle(row)"
                       >
-                        终止
+                        驳回
                       </el-button>
-                    </span>
-                  </el-tooltip>
-                </div>
-                <!-- TASK-FE-DETAIL-REV：唯一状态指示——由纯文字升级为带背景色块胶囊，
-                     文案复用 tagInfo(PROJECT_STATUS, c.status).label；按状态映射 3 个修饰类分色 -->
-                <span
-                  class="status-pill"
-                  :class="c.status === 'terminated' ? 'sp-ended' : c.status === 'delivered' ? 'sp-done' : 'sp-active'"
-                >
-                  {{ tagInfo(PROJECT_STATUS, c.status).label }}
-                </span>
-              </div>
-
-              <div class="contract-info">
-                <!-- TASK-FE-DETAIL-REV2：label 加 ci-label 类（加深加粗），值不加粗（空值占位仍走 muted） -->
-                <span class="ci-item">
-                  <span class="muted ci-label">销售金额</span>
-                  <b class="ci-amount">{{ formatMoney(c.contractAmount) }}</b>
-                </span>
-                <span class="ci-item" v-if="c.items.some((it) => it.lockedDate)">
-                  <!-- 2026-10-20（ADR-019）：原「签约/锁定」改名「下单时间」（锁定即下单时刻；签订时间另列） -->
-                  <span class="muted ci-label">下单时间</span>
-                  <span>{{ formatDate(c.items.find((it) => it.lockedDate)?.lockedDate) }}</span>
-                </span>
-                <!-- ADR-019（PRICING-20261020）：合同签订时间 / 预计交付时间（存量合同为 null，显示占位文案） -->
-                <span class="ci-item">
-                  <span class="muted ci-label">合同签订</span>
-                  <span :class="{ muted: !c.signedDate }">{{ c.signedDate || '未签订' }}</span>
-                </span>
-                <span class="ci-item">
-                  <span class="muted ci-label">预计交付</span>
-                  <span :class="{ muted: !c.scheduledDeliveryDate }">{{ c.scheduledDeliveryDate || '未录入' }}</span>
-                </span>
-                <span class="ci-item" v-if="c.items.some((it) => it.shippedDate)">
-                  <span class="muted ci-label">交付</span>
-                  <span>{{ formatDate(c.items.find((it) => it.shippedDate)?.shippedDate) }}</span>
-                </span>
-                <span class="ci-item" v-if="c.remark">
-                  <span class="muted ci-label">备注</span>
-                  <span>{{ c.remark }}</span>
-                </span>
-              </div>
-
-              <el-table v-if="c.items.length" :data="c.items" border size="small" class="contract-items">
-                <!-- TASK-FE-030：行高固定 36px 后产品列单行显示，超长名称（含编号）用 tooltip 兜底不丢信息 -->
-                <el-table-column label="产品" min-width="220" show-overflow-tooltip>
-                  <template #default="{ row }">
-                    <a class="link" @click="goAssetDetail(row.assetId)">{{ itemAssetName(row.assetId) }}</a>
-                  </template>
-                </el-table-column>
-                <!-- ADR-011：明细列（遥感明细行显示明细名，其余 '-'） -->
-                <el-table-column label="明细" width="200" align="left" show-overflow-tooltip>
-                  <template #default="{ row }">
-                    <span :class="{ muted: itemRsName(row.itemId) === '-' }">{{ itemRsName(row.itemId) }}</span>
-                  </template>
-                </el-table-column>
-                <el-table-column label="数量" width="120" align="right">
-                  <template #default="{ row }">{{ itemQtyText(row.assetId, row.qty) }} {{ row.unit }}</template>
-                </el-table-column>
-                <el-table-column label="单价" width="170" align="right">
-                  <!-- ADR-008：包量定价行单价为派生参考展示（带「约」），金额以销售金额为准 -->
-                  <template #default="{ row }">
-                    <span v-if="isAmountItem(row.assetId)" class="muted">{{ derivedUnitPrice(row.amount, row.qty, row.unit) }}</span>
-                    <span v-else>{{ formatMoney(row.price) }}</span>
-                  </template>
-                </el-table-column>
-                <el-table-column label="金额" width="140" align="right">
-                  <template #default="{ row }">{{ formatMoney(row.amount) }}</template>
-                </el-table-column>
-                <!-- ADR-020（PRICING-20261020）：服务期限（start ~ end，空显 -；遥感明细行按期数售卖，展示为空即可） -->
-                <el-table-column label="服务期限" width="200" align="center">
-                  <template #default="{ row }">
-                    <span :class="{ muted: !(row.serviceStart || row.serviceEnd) }">
-                      {{ row.serviceStart || row.serviceEnd ? `${row.serviceStart || '-'} ~ ${row.serviceEnd || '-'}` : '-' }}
-                    </span>
-                  </template>
-                </el-table-column>
-                <el-table-column label="交付要求" min-width="160" show-overflow-tooltip>
-                  <template #default="{ row }">{{ row.deliveryReq || '-' }}</template>
-                </el-table-column>
-              </el-table>
-            </div>
+                      <span v-else class="muted contract-ended">待审核（等商务确认）</span>
+                    </template>
+                    <template v-else-if="row.status === 'active'">
+                      <!-- 交付仅商务/管理员（后端同样拦截 viewer） -->
+                      <el-tooltip :content="!canWrite ? '交付需商务人员/管理员操作' : ''" :disabled="canWrite" placement="top">
+                        <span>
+                          <el-button
+                            type="primary"
+                            size="small"
+                            :loading="actingContractId === row.id"
+                            :disabled="!canWrite || actingContractId === row.id"
+                            @click="deliverContract(row)"
+                          >
+                            交付
+                          </el-button>
+                        </span>
+                      </el-tooltip>
+                      <!-- 终止：自己项目可操作（含生态人员，后端校验归属） -->
+                      <el-tooltip :content="NO_PERM_TIP" :disabled="canOwn" placement="top">
+                        <span>
+                          <el-button
+                            type="danger"
+                            plain
+                            size="small"
+                            :loading="actingContractId === row.id"
+                            :disabled="!canOwn || actingContractId === row.id"
+                            @click="terminateContract(row)"
+                          >
+                            终止
+                          </el-button>
+                        </span>
+                      </el-tooltip>
+                      <!-- ADR-019（PRICING-20261020）：录入签订时间（商务/管理员）——录入即 active→delivering；
+                           已录过签订时间的合同已转 delivering，active 分支下该按钮恒为「未录入」态 -->
+                      <el-tooltip :content="!canWrite ? '录入签订时间需商务人员/管理员操作' : ''" :disabled="canWrite" placement="top">
+                        <span>
+                          <el-button
+                            type="primary"
+                            plain
+                            size="small"
+                            :disabled="!canWrite"
+                            @click="openDateDialog(row, 'signedDate')"
+                          >
+                            录入签订时间
+                          </el-button>
+                        </span>
+                      </el-tooltip>
+                    </template>
+                    <!-- ADR-019（PRICING-20261020）：交付中（已录签订时间未交付）——
+                         交付/终止沿用 active 分支既有调用；「预计交付时间」仅 admin 可录/改/清空 -->
+                    <template v-else-if="row.status === 'delivering'">
+                      <el-tooltip :content="!canWrite ? '交付需商务人员/管理员操作' : ''" :disabled="canWrite" placement="top">
+                        <span>
+                          <el-button
+                            type="primary"
+                            size="small"
+                            :loading="actingContractId === row.id"
+                            :disabled="!canWrite || actingContractId === row.id"
+                            @click="deliverContract(row)"
+                          >
+                            交付
+                          </el-button>
+                        </span>
+                      </el-tooltip>
+                      <el-tooltip :content="NO_PERM_TIP" :disabled="canOwn" placement="top">
+                        <span>
+                          <el-button
+                            type="danger"
+                            plain
+                            size="small"
+                            :loading="actingContractId === row.id"
+                            :disabled="!canOwn || actingContractId === row.id"
+                            @click="terminateContract(row)"
+                          >
+                            终止
+                          </el-button>
+                        </span>
+                      </el-tooltip>
+                      <el-tooltip :content="!isAdmin ? '预计交付时间仅管理员可录入' : ''" :disabled="isAdmin" placement="top">
+                        <span>
+                          <el-button
+                            size="small"
+                            :disabled="!isAdmin"
+                            @click="openDateDialog(row, 'scheduledDeliveryDate')"
+                          >
+                            预计交付时间
+                          </el-button>
+                        </span>
+                      </el-tooltip>
+                    </template>
+                    <el-tooltip v-else-if="row.status === 'delivered'" :content="NO_PERM_TIP" :disabled="canOwn" placement="top">
+                      <span>
+                        <el-button
+                          type="danger"
+                          plain
+                          size="small"
+                          :loading="actingContractId === row.id"
+                          :disabled="!canOwn"
+                          @click="terminateContract(row)"
+                        >
+                          终止
+                        </el-button>
+                      </span>
+                    </el-tooltip>
+                  </div>
+                </template>
+              </el-table-column>
+            </el-table>
           </template>
 
           <!-- 存量无销售记录项目：保留原销售明细展示（明细 contractId 为 null） -->
@@ -772,8 +907,9 @@ async function submitDateDialog() {
         </template>
       </el-dialog>
 
-      <!-- ADR-012 §5.1 纯移交制：转交对话框（负责人/admin，下拉选新负责人） -->
-      <TransferDialog v-model="transferVisible" :project="transferTarget" />
+      <!-- ADR-012 §5.1 纯移交制：转交对话框（负责人/admin，下拉选新负责人）；
+           ADR-051：assign 模式 = 主管/管理员分配/改派（下拉仅商务 editor） -->
+      <TransferDialog v-model="transferVisible" :project="transferTarget" :mode="transferMode" />
 
       <!-- ADR-026：撤销待审核订单（统一对话框；成功后刷新镜像并跳 /cart 改单重提） -->
       <WithdrawProjectDialog v-model="withdrawVisible" :project="project" @done="onWithdrawn" />
@@ -807,63 +943,26 @@ async function submitDateDialog() {
   text-decoration: underline;
 }
 
-/* 合同卡片：状态左侧色条区分（复用既有 token 色） */
-.contract-card {
-  border: 1px solid var(--border-color, #e5e9f0);
-  border-left-width: 3px;
-  border-radius: 8px;
-  padding: 12px 14px;
-  margin-bottom: 14px;
-}
-.contract-card:last-child {
-  margin-bottom: 0;
-}
-.contract-card.contract-active {
-  border-left-color: var(--primary-color);
-}
-/* ADR-019（PRICING-20261020）：交付中（已录签订时间未交付）——与状态 tag 同色板（橙） */
-.contract-card.contract-delivering {
-  border-left-color: var(--warning-color, #A86514);
-}
-.contract-card.contract-delivered {
-  border-left-color: var(--success-color, #0c7b51);
-}
-.contract-card.contract-terminated {
-  border-left-color: var(--danger-color);
-  opacity: 0.85;
-}
-.contract-head {
-  display: flex;
+/* ADR-056 §2：区块头右侧「批量驳回」按钮位（margin-left:auto 推到最右，同 .bh-hint 口径） */
+.bh-actions {
+  margin-left: auto;
+  display: inline-flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  flex-wrap: wrap;
-  margin-bottom: 10px;
+  gap: 8px;
 }
-.ch-left {
-  display: flex;
-  /* TASK-FE-DETAIL-REV2：甲方、乙方各占一行（原同行 +「；」分隔） */
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 5px;
-  /* TASK-FE-DETAIL-REV：占满左侧，把动作按钮与状态胶囊推到卡头最右 */
-  flex: 1;
-  min-width: 0;
-}
-/* TASK-FE-DETAIL-REV2：卡头「甲方：客户 / 乙方：主体全称」各占一行——
-   label 12px 深灰加粗（与下方栅格 label 风格统一），值 14px 主色普通字重 */
-.contract-party {
-  font-size: 14px;
-  color: var(--text-primary);
-  white-space: nowrap;
-  max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.cp-label {
+/* ADR-056 §2：合同列表（卡片改表格）——合同编号 mono 等宽（与列表页 .proj-code 同字体栈） */
+.ct-code {
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
   font-size: 12px;
-  font-weight: 600;
-  color: var(--text-body);
+  white-space: nowrap;
+}
+/* 展开行内边距（避免明细贴边） */
+.ct-expand {
+  padding: 12px 24px 14px;
+}
+.ct-empty {
+  font-size: 13px;
+  padding: 8px 0;
 }
 .op-actions {
   display: flex;
@@ -876,31 +975,7 @@ async function submitDateDialog() {
 .contract-ended {
   font-size: 13px;
 }
-/* TASK-FE-DETAIL-REV：卡头最右唯一状态胶囊——带背景色块，按状态映射 3 个修饰类分色
-   （终态红 / 已完成绿 / 进行中·交付中·待审核蓝） */
-.status-pill {
-  flex-shrink: 0;
-  display: inline-flex;
-  align-items: center;
-  border-radius: 999px;
-  padding: 2px 12px;
-  font-size: 13px;
-  line-height: 20px;
-  white-space: nowrap;
-}
-.status-pill.sp-ended {
-  background: #fdecee;
-  color: #c0392b;
-}
-.status-pill.sp-done {
-  background: #eaf8f1;
-  color: #0c7b51;
-}
-.status-pill.sp-active {
-  background: #eef0ff;
-  color: #4e63a8;
-}
-/* TASK-FE-DETAIL-REV：合同卡信息区改两列竖向栅格（label 12px 在上，值 14px 在下） */
+/* 合同信息区两列竖向栅格（label 12px 在上，值 14px 在下；ADR-056 §2 起用于展开行） */
 .contract-info {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

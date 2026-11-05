@@ -33,6 +33,8 @@ class Asset(Base):
     # 只填其一 = 单边边界。存量数据 NULL（即不限制）。
     priceMin: Mapped[float | None] = mapped_column(Float, nullable=True)
     priceMax: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # ADR-053：税点（整数百分比，13=13%）；nullable，None=未设置；纯展示元数据，不参与任何金额计算
+    taxPoint: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
     soldAmount: Mapped[float] = mapped_column(Float, default=0)  # 元
     soldCount: Mapped[int] = mapped_column(Integer, default=0)
     # 计价模式（ADR-008）：'unit'（默认，单价×数量）| 'amount'（包量金额权威，元、最多 6 位小数）。

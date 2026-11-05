@@ -16,12 +16,10 @@ import {
   assetStockState,
   availableQty,
   boardLabel,
-  displayUnitPrice,
   entityShort,
   expiryText,
   formatAssetQty,
   formatMoney,
-  isAmountMode,
   noSellableStock,
   priceRangeText,
   rsItemName,
@@ -252,16 +250,14 @@ const dDeliverables = computed(() =>
   drawerAsset.value ? getAssetDeliverables(drawerAsset.value.id) : [],
 )
 
-/** 列表「销售单价」列（口径与抽屉「销售单价」一致）：
- *  遥感容器按明细定价显示「-」；
- *  ADR-025（2026-10-21）：包量定价（amount 模式，卫星 Token）统一走百万Token 口径（displayUnitPrice）；
- *  unit 模式金额直显（repeatSale 带 /unit）。定宽 120 + 居中 + 溢出省略 hover 显示全文。
- *  ADR-018（PRICING-20261020）：有参考区间时追加「（参考区间 {min}~{max}）」，无区间维持原展示 */
-function salePriceText(a: Asset): string {
-  if (a.type === '遥感数据' || !a.salePrice) return '-'
-  const base = isAmountMode(a)
-    ? displayUnitPrice(a)
-    : a.repeatSale ? `${formatMoney(a.salePrice)}/${a.unit || '份'}` : formatMoney(a.salePrice)
+/** 列表「销售单价」列（口径与抽屉「销售单价」一致；ADR-053：对外展示参考区间下限 priceMin，
+ *  不再对外展示采购价 salePrice——采购价仅编辑表单可见）：
+ *  遥感容器按明细定价显示「-」；priceMin 未设置显示「-」（直到补区间/重算）；
+ *  否则 formatMoney(priceMin) + 单位后缀（repeatSale 带 /unit，元/份）。定宽 120 + 居中 + 溢出省略 hover 显示全文。
+ *  ADR-018（PRICING-20261020）：有参考区间时追加「（参考区间 {min}~{max}）」 */
+function floorPriceText(a: Asset): string {
+  if (a.type === '遥感数据' || a.priceMin == null) return '-'
+  const base = a.repeatSale ? `${formatMoney(a.priceMin)}/${a.unit || '份'}` : formatMoney(a.priceMin)
   const range = priceRangeText(a)
   return range ? `${base}（参考区间 ${range}）` : base
 }
@@ -474,14 +470,13 @@ const boardMeta = computed(() => {
             <span v-else class="muted">0</span>
           </template>
         </el-table-column>
-        <el-table-column label="售卖数量" width="90" align="center">
-          <template #default="{ row }">
-            <span v-if="row.shippedQty > 0" style="color: var(--warning-color); font-weight: 600;">{{ row.shippedQty }}</span>
-            <span v-else class="muted">0</span>
-          </template>
-        </el-table-column>
+        <!-- ADR-053：删「售卖数量」列（shippedQty）；「重复售卖」tag 在「可用数量」列内保留 -->
         <el-table-column label="销售单价" width="120" align="center" show-overflow-tooltip>
-          <template #default="{ row }">{{ salePriceText(row) }}</template>
+          <template #default="{ row }">{{ floorPriceText(row) }}</template>
+        </el-table-column>
+        <!-- ADR-053：税点（整数百分比，可空 → `-`） -->
+        <el-table-column label="税点" width="80" align="center">
+          <template #default="{ row }">{{ row.taxPoint != null ? `${row.taxPoint}%` : '-' }}</template>
         </el-table-column>
         <!-- 可用数量（UI-OPT-20261022）：一律走 availableQty——容器读后端派生 availableCount（明细条数），
              非容器 quantity−lockedQty−shippedQty；禁止在此另算，避免容器又显示父产品 quantity=1 -->
@@ -596,11 +591,11 @@ const boardMeta = computed(() => {
               <span class="il">销售单价</span>
               <!-- 遥感容器：按明细定价（明细单价为权威口径） -->
               <span v-if="isRemote" class="iv iv-weak">按明细定价</span>
-              <!-- ADR-025（2026-10-21）：包量定价（amount 模式）统一走百万Token 口径（与列表列同口径） -->
-              <!-- ADR-018（PRICING-20261020）：有参考区间时追加区间提示（与列表列同口径） -->
+              <!-- ADR-053：对外展示参考区间下限 priceMin（与列表列同口径，不再对外展示采购价）；
+                   ADR-018（PRICING-20261020）：有参考区间时追加区间提示 -->
               <span v-else class="iv">
-                <template v-if="isAmountMode(drawerAsset)">{{ drawerAsset.salePrice ? displayUnitPrice(drawerAsset) : '-' }}</template>
-                <template v-else>{{ drawerAsset.salePrice ? formatMoney(drawerAsset.salePrice) : '-' }}<template v-if="drawerAsset.repeatSale"> / {{ drawerAsset.unit }}</template></template>
+                <template v-if="drawerAsset.priceMin != null">{{ formatMoney(drawerAsset.priceMin) }}<template v-if="drawerAsset.repeatSale"> / {{ drawerAsset.unit }}</template></template>
+                <template v-else>-</template>
                 <template v-if="priceRangeText(drawerAsset)">（参考区间 {{ priceRangeText(drawerAsset) }}）</template>
               </span>
             </div>

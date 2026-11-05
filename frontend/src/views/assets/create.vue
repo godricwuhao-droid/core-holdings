@@ -18,13 +18,15 @@
  *  FORMS-20261022（ADR-036）：
  *  - §1 登记时间：新建不再提供输入（提交传空，后端自动取当天）；编辑只读展示（文本行）
  *  - §2 术语「长期买断」→「产品有效期」（字段名 perpetual 不变）
- *  - §3 参考区间自动同步（仅新建、仅非容器）：salePrice>0 且区间未手改 →
- *    priceMin=salePrice、priceMax=salePrice×1.02（ADR-048：按 1e-6 规整）；手改置 touchedMin/touchedMax 后不再覆盖
+ *  - §3 参考区间自动同步（ADR-053：新建+编辑均生效、仅非容器）：采购价 salePrice>0 且区间未手改 →
+ *    priceMin=salePrice×1.01、priceMax=salePrice×1.02（ADR-048：按 1e-6 规整）；
+ *    手改置 touchedMin/touchedMax 后不再覆盖；编辑初始加载（isHydrating）不触发，仅用户改动采购价才重算
  *  - §4 重复售卖：移除「卫星数据自动勾选」，默认一律 false；容器恒关（禁用态 + 说明）
  */
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
+import { useBack } from '@/composables/useBack'
 import {
   ArrowLeft,
   Box,
@@ -64,10 +66,12 @@ const form = reactive({
   unit: '',
   quantity: 1,
   repeatSale: false,
-  salePrice: 0,
+  salePrice: 0, // ADR-053：语义=采购单价（内部成本，对外不展示）；字段名/提交字段不变
   // 参考价格区间（ADR-018，PRICING-20261020）：选填，可单边；下单折扣区间校验用
   priceMin: undefined as number | undefined,
   priceMax: undefined as number | undefined,
+  // 税点（ADR-053）：整数百分比（0-100），可选（null = 未设置）
+  taxPoint: null as number | null,
   status: 'in_stock' as AssetStatus,
   inboundDate: today(),
   expiryDate: '',
@@ -114,17 +118,19 @@ watch(
   },
 )
 
-/** ADR-036 §3：参考区间自动同步（仅新建、仅非遥感容器）——
- *  salePrice > 0 且对应边界未被手动修改过 → priceMin = salePrice、priceMax = salePrice × 1.02（ADR-048：按 1e-6 规整）；
- *  手改区间输入（@change）置 touchedMin/touchedMax 后不再自动覆盖（以最后一次手改为准）；
- *  编辑模式不自动同步（loadAsset 回显存量值，watch 有 isEdit 守卫） */
+/** ADR-036 §3 / ADR-053：参考区间自动同步（新建 + 编辑均生效，仅非遥感容器）——
+ *  采购价 salePrice > 0 且对应边界未被手动修改过 → priceMin = salePrice × 1.01、priceMax = salePrice × 1.02（ADR-048：按 1e-6 规整）；
+ *  手改区间输入（@change）置 touchedMin/touchedMax 后不再自动覆盖（以最后一次手改为准，本次会话内有效）；
+ *  编辑模式初始加载（loadAsset 回显）用 isHydrating 标志位抑制，仅用户后续实际改动采购价才重算；
+ *  新建 salePrice 初始 0、>0 才填，天然安全 */
 const touchedMin = ref(false)
 const touchedMax = ref(false)
+const isHydrating = ref(false)
 watch(
   () => form.salePrice,
   (v) => {
-    if (isEdit.value || isRemote.value || !(v > 0)) return
-    if (!touchedMin.value) form.priceMin = v
+    if (isHydrating.value || isRemote.value || !(v > 0)) return
+    if (!touchedMin.value) form.priceMin = roundAmount(v * 1.01)
     if (!touchedMax.value) form.priceMax = roundAmount(v * 1.02)
   },
 )
@@ -133,6 +139,9 @@ function loadAsset() {
   if (!isEdit.value) return
   const a = getAsset(assetId.value)
   if (!a) return
+  // ADR-053：回填期间抑制自动区间 watch（isHydrating 置 true，nextTick 后置 false）——
+  // 编辑页打开不重算区间，仅用户后续手动改采购价才按公式重算（watch 为 pre-flush，先于 nextTick 回调执行）
+  isHydrating.value = true
   Object.assign(form, {
     name: a.name,
     board: a.board,
@@ -145,6 +154,8 @@ function loadAsset() {
     // ADR-018（PRICING-20261020）：参考区间回显（未设为 null → 输入框留空）
     priceMin: a.priceMin ?? undefined,
     priceMax: a.priceMax ?? undefined,
+    // ADR-053：税点回显（未设置 null/undefined → 输入框留空）
+    taxPoint: a.taxPoint ?? null,
     status: a.status,
     inboundDate: a.inboundDate,
     expiryDate: a.expiryDate,
@@ -156,6 +167,9 @@ function loadAsset() {
   // ADR-036 §4：遥感容器强制 repeatSale=false（后端 create/update 传 true 会 400）——
   // 表单内为禁用态恒关开关，存量脏值（历史数据）在此归零，避免保存时被后端 400 卡住
   if (isRemote.value) form.repeatSale = false
+  nextTick(() => {
+    isHydrating.value = false
+  })
 }
 
 // ===== 产品清单上传 =====
@@ -226,10 +240,11 @@ async function handleSubmit() {
   // 故传 quantity:1 / salePrice:0，单位与 constants.ts CATEGORY_UNITS 遥感条目一致；其余类型行为不变
   // ADR-018（PRICING-20261020）：参考区间 undefined → null（后端可空字段，区分「未设」）
   const priceRange = { priceMin: form.priceMin ?? null, priceMax: form.priceMax ?? null }
+  // ADR-053：税点 null/undefined → null（后端可空字段，区分「未设」；传 null 清空）
   // ADR-036 §1：新建不传登记时间（传空 → 后端自动取当天）；编辑回传存量值（前端只读展示，后端不锁）
   const payload: AssetInput = isRemote.value
-    ? { ...form, ...priceRange, name: form.name, quantity: 1, salePrice: 0, unit: '份（可售明细）', inboundDate: isEdit.value ? form.inboundDate : '' }
-    : { ...form, ...priceRange, name: form.name, inboundDate: isEdit.value ? form.inboundDate : '' }
+    ? { ...form, ...priceRange, taxPoint: form.taxPoint ?? null, name: form.name, quantity: 1, salePrice: 0, unit: '份（可售明细）', inboundDate: isEdit.value ? form.inboundDate : '' }
+    : { ...form, ...priceRange, taxPoint: form.taxPoint ?? null, name: form.name, inboundDate: isEdit.value ? form.inboundDate : '' }
   try {
     if (isEdit.value) {
       await updateAsset(assetId.value, payload)
@@ -248,10 +263,10 @@ async function handleSubmit() {
   }
 }
 
+// 「返回/取消」：回上一页；深链/刷新直达（无历史）时兜底到该产品所属板块列表
+const { goBack } = useBack(() => `/assets/${form.board}`)
 function handleCancel() {
-  // 有历史栈时返回上一页；直达 URL（无历史）时回退到产品台账，避免退出应用
-  if (window.history.state?.back) router.back()
-  else router.push(`/assets/${form.board}`)
+  goBack()
 }
 
 // 编辑模式：先拉取后端数据填充镜像，再预填表单（新建模式直接渲染）
@@ -269,7 +284,7 @@ onMounted(async () => {
         <div>
           <a class="back-link" @click="handleCancel">
             <el-icon><ArrowLeft /></el-icon>
-            {{ isEdit ? '返回产品详情' : '返回产品台账' }}
+            返回
           </a>
           <h1>{{ isEdit ? '编辑产品' : '登记产品' }}</h1>
           <div class="desc">登记产品名称、板块、数量与单价；产品编号自动生成，金额以元为单位。</div>
@@ -332,7 +347,7 @@ onMounted(async () => {
           <div class="block-head">
             <span class="bh-icon" aria-hidden="true"><el-icon><Goods /></el-icon></span>
             <span class="bh-title">数量与价格</span>
-            <span class="bh-hint">登记产品总数、计量单位与销售单价（元）</span>
+            <span class="bh-hint">登记产品总数、计量单位与采购单价（元）</span>
           </div>
           <div class="form-grid">
             <el-form-item label="计量单位" prop="unit">
@@ -346,17 +361,18 @@ onMounted(async () => {
                 {{ form.quantity }} 份（数量为可售份数；「每份含多少 Token」请写入规格说明）
               </div>
             </el-form-item>
-            <!-- ADR-017（2026-10-20）：Token 产品单价口径与普通产品一致（元/份），删除「元/万Token」特判 -->
-            <el-form-item label="销售单价（元）" prop="salePrice">
+            <!-- ADR-017（2026-10-20）：Token 产品单价口径与普通产品一致（元/份），删除「元/万Token」特判
+                 ADR-053：语义=采购单价（内部成本，对外不展示，仅本表单可见）；绑定字段 salePrice 不变 -->
+            <el-form-item label="采购单价（元）" prop="salePrice">
               <!-- FIX-20261022 / BUG-44（§6 硬约束）：金额输入一律 :controls="false"（无步进按钮），数量类保留
                    ADR-048：单价支持最多 6 位小数（formatter 失焦展示「最少两位」，parser 截断到 6 位） -->
               <el-input-number v-model="form.salePrice" :min="0" :controls="false" :formatter="amountInputFormatter" :parser="amountInputParser" style="width: 100%;" />
             </el-form-item>
             <!-- ADR-018（PRICING-20261020）：参考价格区间——元/{unit}，选填（可单边）；
-                 ADR-049（2026-10-29）：下单时**只校验下限**（低于下限 400，高于上限不拦截），
+                 ADR-052（2026-11-04）：下单时**双向校验**（低于下限 / 高于上限均 400），
                  商务审核改价不受区间约束
-                 ADR-036 §3：新建时销售单价填写后自动同步（min=单价、max=单价×1.02）；
-                 用户手改（@change）置 touchedMin/touchedMax 后不再自动覆盖（编辑模式不自动同步） -->
+                 ADR-053：采购价填写后自动同步（新建+编辑；min=采购价×1.01、max=采购价×1.02）；
+                 用户手改（@change）置 touchedMin/touchedMax 后不再自动覆盖；编辑初始加载不触发 -->
             <el-form-item label="参考价格区间（元）">
               <div class="price-range-row">
                 <el-input-number v-model="form.priceMin" :min="0" :controls="false" :formatter="amountInputFormatter" :parser="amountInputParser" placeholder="下限（选填）" style="width: 100%;" @change="touchedMin = true" />
@@ -364,8 +380,12 @@ onMounted(async () => {
                 <el-input-number v-model="form.priceMax" :min="0" :controls="false" :formatter="amountInputFormatter" :parser="amountInputParser" placeholder="上限（选填）" style="width: 100%;" @change="touchedMax = true" />
               </div>
               <div class="muted" style="font-size: 12px; margin-top: 4px;">
-                元/{{ form.unit || '单位' }}，选填（可只填一边）；下单时用于校验金额下限（上限不限制，可高于上限成交），未设置则不限制
+                元/{{ form.unit || '单位' }}，选填（可只填一边）；下单时校验销售金额须在参考区间内（不得低于下限、不得高于上限），未设置则不限制
               </div>
+            </el-form-item>
+            <!-- ADR-053：税点——整数百分比（0-100），选填（空 = 未设置 → 展示 `-`）；纯展示元数据，不参与金额计算 -->
+            <el-form-item label="税点（%）">
+              <el-input-number v-model="form.taxPoint" :min="0" :max="100" :precision="0" :controls="false" placeholder="选填，如 13" style="width: 100%;" />
             </el-form-item>
             <!-- ADR-008：包量定价说明（浅蓝提示条） -->
             <div v-if="isAmount" class="info-bar soft">

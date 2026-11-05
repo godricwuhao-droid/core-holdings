@@ -6,7 +6,7 @@
  *  - 账号管理：账号 CRUD（新增/编辑/删除；自己那行禁用改角色/启用与删除）
  *  - 审计日志：按操作类型/操作人筛选，分页（pageSize 20），时间倒序
  */
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Search, User, UserFilled, Document } from '@element-plus/icons-vue'
 import {
@@ -20,14 +20,18 @@ import {
   type UserOut,
 } from '@/api'
 import { currentUser, type Role } from '@/auth'
+import { generateRandomPassword } from '@/utils/randomPassword'
 
 // ============================================================
 // 角色 / 操作类型 中文映射
 // ============================================================
+// ADR-051：固定五角色（建号/改角色下拉；默认新建仍为 viewer，不变）
 const ROLE_OPTIONS: { value: Role; label: string }[] = [
   { value: 'admin', label: '管理员' },
+  { value: 'supervisor', label: '商务主管' },
   { value: 'editor', label: '商务人员' },
   { value: 'viewer', label: '生态人员' },
+  { value: 'finance', label: '财务' },
 ]
 
 function roleLabel(role: string): string {
@@ -66,11 +70,50 @@ async function loadUsers() {
   }
 }
 
+// 统计卡基于全量 users（不受过滤/分页影响，ADR-054）
 const stats = computed(() => ({
   total: users.value.length,
   enabled: users.value.filter((u) => u.enabled).length,
   admins: users.value.filter((u) => u.role === 'admin').length,
 }))
+
+// ---------- 客户端过滤 + 分页（ADR-054：GET /users 不变，全量本地切片） ----------
+const userFilter = reactive({
+  keyword: '',
+  role: '',
+  enabled: '', // '' 全部 / '1' 启用 / '0' 禁用
+})
+const userPage = ref(1)
+const userPageSize = ref(10)
+
+const filteredUsers = computed(() => {
+  const kw = userFilter.keyword.trim().toLowerCase()
+  return users.value.filter((u) => {
+    if (kw && !u.username.toLowerCase().includes(kw) && !(u.name || '').toLowerCase().includes(kw)) return false
+    if (userFilter.role && u.role !== userFilter.role) return false
+    if (userFilter.enabled !== '' && u.enabled !== (userFilter.enabled === '1')) return false
+    return true
+  })
+})
+
+const pagedUsers = computed(() => {
+  const start = (userPage.value - 1) * userPageSize.value
+  return filteredUsers.value.slice(start, start + userPageSize.value)
+})
+
+// 过滤条件变化 → 回到第 1 页
+watch([() => userFilter.keyword, () => userFilter.role, () => userFilter.enabled], () => {
+  userPage.value = 1
+})
+
+function onUserPageChange(page: number) {
+  userPage.value = page
+}
+
+function onUserSizeChange(size: number) {
+  userPageSize.value = size
+  userPage.value = 1
+}
 
 const myId = computed(() => currentUser.value?.id ?? -1)
 function isSelf(row: UserOut): boolean {
@@ -95,6 +138,12 @@ function openCreate() {
   dialog.editing = null
   dialog.form = { username: '', name: '', role: 'viewer', enabled: true, password: '' }
   dialog.visible = true
+}
+
+/** ADR-054：随机生成 12 位密码（去易混字符，含大小写+数字），仅新建弹窗可用 */
+function handleRandomPassword() {
+  dialog.form.password = generateRandomPassword()
+  ElMessage.success('已生成随机密码，请妥善告知用户')
 }
 
 function openEdit(row: UserOut) {
@@ -238,7 +287,7 @@ onMounted(() => {
       <div>
         <div class="crumb">基础设置 / 账号与审计</div>
         <h1>账号与审计</h1>
-        <div class="desc">管理平台账号（角色：管理员 / 商务人员 / 生态人员），并查询全部业务写操作与登录认证审计记录。</div>
+        <div class="desc">管理平台账号（角色：管理员 / 商务主管 / 商务人员 / 生态人员 / 财务），并查询全部业务写操作与登录认证审计记录。</div>
       </div>
       <div class="head-actions">
         <el-button type="primary" :icon="Plus" @click="openCreate">新增账号</el-button>
@@ -281,10 +330,30 @@ onMounted(() => {
         <el-tab-pane label="账号管理" name="accounts">
           <div class="table-head">
             <span class="t">账号列表</span>
-            <span class="c">共 {{ users.length }} 条</span>
+            <span class="c">共 {{ filteredUsers.length }} 条</span>
           </div>
 
-          <el-table v-loading="loadingUsers" :data="users" border stripe>
+          <!-- ADR-054：客户端过滤工具栏（仿审计日志 tab 的 .toolbar） -->
+          <div class="toolbar">
+            <el-input
+              v-model="userFilter.keyword"
+              placeholder="搜索用户名/姓名"
+              clearable
+              style="width: 220px;"
+              :prefix-icon="Search"
+            />
+            <el-select v-model="userFilter.role" style="width: 150px;">
+              <el-option value="" label="全部角色" />
+              <el-option v-for="r in ROLE_OPTIONS" :key="r.value" :label="r.label" :value="r.value" />
+            </el-select>
+            <el-select v-model="userFilter.enabled" style="width: 120px;">
+              <el-option value="" label="全部状态" />
+              <el-option value="1" label="启用" />
+              <el-option value="0" label="禁用" />
+            </el-select>
+          </div>
+
+          <el-table v-loading="loadingUsers" :data="pagedUsers" border stripe>
             <el-table-column prop="username" label="用户名" width="160" align="left">
               <template #default="{ row }">
                 <span style="font-weight: 500;">{{ row.username }}</span>
@@ -298,10 +367,15 @@ onMounted(() => {
             </el-table-column>
             <el-table-column label="角色" width="110" align="center">
               <template #default="{ row }">
+                <!-- ADR-051：五角色 tag 配色（与 MainLayout 角色 tag 同色系，走 global.css 既有 tag 色板） -->
                 <el-tag
                   size="small"
                   effect="light"
-                  :class="row.role === 'admin' ? 'tag-blue' : row.role === 'editor' ? 'tag-green' : 'tag-gray'"
+                  :class="row.role === 'admin' ? 'tag-blue'
+                    : row.role === 'supervisor' ? 'tag-purple'
+                    : row.role === 'editor' ? 'tag-green'
+                    : row.role === 'finance' ? 'tag-orange'
+                    : 'tag-gray'"
                 >
                   {{ roleLabel(row.role) }}
                 </el-tag>
@@ -337,6 +411,19 @@ onMounted(() => {
               <el-empty description="暂无账号" :image-size="80" />
             </template>
           </el-table>
+
+          <!-- ADR-054：客户端分页（仿审计日志 tab 的 .pagination） -->
+          <div class="pagination">
+            <el-pagination
+              v-model:current-page="userPage"
+              :page-size="userPageSize"
+              :total="filteredUsers.length"
+              :page-sizes="[10, 20, 50, 100]"
+              layout="total, prev, pager, next, sizes"
+              @current-change="onUserPageChange"
+              @size-change="onUserSizeChange"
+            />
+          </div>
         </el-tab-pane>
 
         <!-- ============ 审计日志 ============ -->
@@ -432,7 +519,12 @@ onMounted(() => {
             type="password"
             show-password
             :placeholder="dialog.editing ? '留空则不修改密码' : '初始登录密码'"
-          />
+          >
+            <!-- ADR-054：随机生成仅新建弹窗显示（编辑态密码框为「留空不改」语义） -->
+            <template v-if="!dialog.editing" #append>
+              <el-button @click="handleRandomPassword">随机生成</el-button>
+            </template>
+          </el-input>
         </el-form-item>
         <el-alert
           v-if="dialog.editing && isSelf(dialog.editing)"

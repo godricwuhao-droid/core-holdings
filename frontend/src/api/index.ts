@@ -40,6 +40,7 @@ import {
   type RefillResult,
   type RsItem,
   type RsItemWithSold,
+  type ReviewInput,
 } from '@/types'
 import { CATEGORY_UNITS, FEATURE_CATALOGS } from '@/constants'
 import {
@@ -260,6 +261,8 @@ export interface AssetInput {
   // 参考价格区间（ADR-018，PRICING-20261020）：元/份，选填（可单边）；两者都有时后端校验 min ≤ max
   priceMin?: number | null
   priceMax?: number | null
+  // 税点（ADR-053）：整数百分比（0-100），可空（null = 未设置/清空）
+  taxPoint?: number | null
   status: AssetStatus
   inboundDate: string
   expiryDate: string
@@ -523,6 +526,46 @@ export async function deleteUploadFile(filename: string): Promise<void> {
 }
 
 // ============================================================
+// ADR-055：销售项目列表服务端分页（GET /projects，仅列表页用）
+// bootstrap 的全量 projects 保持不动（13 个消费点依赖）
+// ============================================================
+export interface ProjectListQuery {
+  page: number
+  pageSize: number
+  keyword?: string
+  status?: string
+  rep?: string
+  businessOwner?: string
+  // ADR-056 §1：服务端排序——sortBy（status/amount/lastFollowDate/expectedSignDate/code）+ sortOrder（asc/desc）；
+  // 缺省不传 → 后端保持 id.desc()（最新在前）
+  sortBy?: string
+  sortOrder?: string
+}
+
+/** 销售项目列表服务端分页（ADR-055）：返回「可见 ∩ 全部过滤」的 {total, items}，id.desc 排序。
+ *  params 只带**有值**的字段（空值不传，避免后端误过滤）；
+ *  keyword 传 trim 后**原值**（大小写敏感，对齐改前前端 includes 行为）；
+ *  businessOwner 含特殊值 '__none__'（未指派），照传。 */
+export async function listProjects(
+  query: ProjectListQuery,
+): Promise<{ total: number; items: Project[] }> {
+  const { data } = await http.get<{ total: number; items: Project[] }>('/projects', {
+    params: {
+      keyword: query.keyword || undefined,
+      status: query.status || undefined,
+      rep: query.rep || undefined,
+      businessOwner: query.businessOwner || undefined,
+      // ADR-056 §1：排序参数有值才传（空值不传 → 后端缺省 id.desc 最新在前）
+      sortBy: query.sortBy || undefined,
+      sortOrder: query.sortOrder || undefined,
+      page: query.page,
+      pageSize: query.pageSize,
+    },
+  })
+  return data
+}
+
+// ============================================================
 // 写操作（调用后端 REST + refresh 同步镜像）
 // ============================================================
 export async function createAsset(input: AssetInput): Promise<Asset> {
@@ -630,24 +673,28 @@ export async function changeProjectStatus(
  * 订单审核（ADR-012，仅商务/管理员；生态人员 403）：
  * - confirm = 确认下单（items 可带行级改价：unit 行传 price 实际单价、amount/遥感行传 amount 实际合同金额，
  *   元，最多 6 位小数（ADR-048）；ADR-018 §4：改价只写 ProjectItem，**不再回写平台挂牌价**；
- *   ADR-020 PRICING-20261020：行级可改服务期限 serviceStart/serviceEnd，不传 = 保持原值）；
- * - reject = 驳回（reason 必填，释放锁定、项目终止并留痕）。
+ *   ADR-020 PRICING-20261020：行级可改服务期限 serviceStart/serviceEnd，不传 = 保持原值；
+ *   ADR-050（2026-11-03）：行级新增 qty（非遥感行数量，遥感行恒 1 忽略）；
+ *   新增 contracts[]（合同级：customer 客户名 / amount 合同总价，总价确认后按明细比例分摊，总额权威））；
+ * - reject = 驳回（reason 必填，释放锁定、项目终止并留痕；contracts 与 items[].qty 被后端忽略）。
  */
-export async function reviewProject(
-  id: number,
-  payload: {
-    action: 'confirm' | 'reject'
-    reason?: string
-    items?: {
-      itemId: number
-      price?: number
-      amount?: number
-      serviceStart?: string | null
-      serviceEnd?: string | null
-    }[]
-  },
-): Promise<void> {
+export async function reviewProject(id: number, payload: ReviewInput): Promise<void> {
   await http.post(`/projects/${id}/review`, payload)
+  await afterWrite()
+}
+
+/**
+ * 勾选驳回（ADR-056 §2）：对 pending 项目勾选部分（或全部）pending 合同逐个驳回。
+ * - contractIds：非空，须全部属于该项目且 status=pending（否则 400）；
+ * - reason：必填（strip 后非空，≤200 字；批量勾选共用一个原因）；
+ * 剩余 pending 合同项目保持 pending 可继续审核，全部驳回 → terminated。
+ * 鉴权 require_editor + 接手人守卫（同 review）；403/400 文案由后端 detail 给出。
+ */
+export async function rejectContracts(
+  id: number,
+  payload: { contractIds: number[]; reason: string },
+): Promise<void> {
+  await http.post(`/projects/${id}/reject-contracts`, payload)
   await afterWrite()
 }
 
@@ -1057,7 +1104,18 @@ export async function fetchMe(): Promise<CurrentUser> {
   return data
 }
 
-/** 用户输出（不含密码；后端 UserOut 未含 createdAt，前端按可选字段兜底展示） */
+/**
+ * 修改自己的密码（ADR-054，全角色）：POST /auth/change-password
+ * - 400「旧密码不正确」（detail 经拦截器解析进 Error.message）
+ * - 成功返回 { token, user }（与 login 同形）：token 已带新 tokenVersion，
+ *   调用方必须用其 setSession 换 token，否则下次请求 401 掉线
+ */
+export async function changeMyPassword(oldPassword: string, newPassword: string): Promise<LoginResult> {
+  const { data } = await http.post<LoginResult>('/auth/change-password', { oldPassword, newPassword })
+  return data
+}
+
+/** 用户输出（不含密码；ADR-054 起后端 UserOut 已含 createdAt） */
 export interface UserOut {
   id: number
   username: string

@@ -4,6 +4,125 @@
 
 ---
 
+## 2026-11-04 变更（ADR-056：销售项目列表服务端排序 + 合同级勾选驳回）
+
+> **依据 ADR-056（Proposed，2026-11-04）**。§1 `GET /api/projects` 加 `sortBy/sortOrder`（向后兼容，缺省行为不变）；§2 新增 `POST /api/projects/{id}/reject-contracts`（勾选部分 pending 合同驳回，复用整单驳回逐合同逻辑，零迁移）。
+
+### `GET /api/projects` 新增排序参数（sortBy / sortOrder）
+
+在 ADR-055 既有参数（page/pageSize/keyword/status/rep/businessOwner）基础上新增：
+
+- `sortBy`：可选。允许值 `status` / `amount` / `lastFollowDate` / `expectedSignDate` / `code`；**非法值按无排序处理**（不报错，等价不传）。
+- `sortOrder`：可选。`asc` / `desc`，默认 `asc`（**非 `desc` 一律当 `asc`**）。
+- 排序键映射：
+  - `status`：按**状态档位**排（SQL `case` 映射 rank：`pending=0 → active=1 → delivering=2 → delivered=3 → terminated=4`），**非字符串序**；terminated 三展示子型（已撤销/已驳回/已终止）同档聚排（与 status 过滤口径一致）。
+  - `amount`：`Project.contractAmount`（前端「销售金额」列绑定字段；存列，`_recompute_project` 每次合同变更后重算 = Σ 合同 contractAmount，与列显示同源）。
+  - `lastFollowDate` / `expectedSignDate`：对应 `Project` 字段（字符串日期 YYYY-MM-DD，字典序=时间序；空值 asc 排最前 / desc 排最后）。
+  - `code`：`Project.code`。
+- **分页稳定**：任何排序键后**恒定追加 `id DESC` 兜底**（同排序值行跨页稳定，避免重复/丢行）。
+- 缺省（不传 `sortBy`）→ 保持 `id DESC`（最新在前，与 ADR-055 现状一致）。
+- 4 过滤 / 可见性 / count / 切片均不变。
+
+实测（:8000，74 项目）：5 个排序键 × asc/desc 与本地排序逐位一致；`pageSize=5` 与 `pageSize=100` 翻页 id 序列完全一致（无重复/遗漏）、total 不变；`status asc` 实测序列 `pending×18 → active×45 → delivering×2 → terminated×9`（terminated 聚排）；`status=pending&sortBy=amount` 组合过滤+排序正确。
+
+### `POST /api/projects/{id}/reject-contracts`（勾选驳回，require_editor）
+
+**语义**：对一个 **pending** 项目，勾选其中**部分（或全部）pending 合同**逐个驳回；剩余 pending 合同项目保持 **pending** 可继续审核；全部驳回 → 项目 **terminated**。与 `POST /projects/{id}/review`（整单驳回）并存，两者共用同一逐合同驳回 helper（`services._reject_contracts`），口径一致。
+
+请求：`POST /api/projects/{id}/reject-contracts`，body：
+
+```json
+{"contractIds": [112, 113, 114], "reason": "单价需重新询价"}
+```
+
+- `contractIds`：`int[]`，**非空**（空 → 422）；须全部属于该项目且 `status == "pending"`（否则 400「销售记录 X 不属于该项目」/「销售记录 X 非待审核状态，不可驳回」）。
+- `reason`：**必填**（缺失/空串 → 422；strip 后空白 → 400「驳回原因不能为空」）；批量勾选共用一个原因。
+
+守卫（顺序固定，全部在写操作之前，单事务）：
+1. 项目存在（404）且 `status == "pending"`（否则 400「仅待审核项目可驳回订单」）；
+2. 接手人守卫（同 review）：未分配 → 400「该订单尚未分配，请先由商务主管分配」；非负责人且非 admin/supervisor → 403；
+3. 合同归属/状态校验（见上）。
+
+权限：`require_editor`（admin/supervisor/editor；**viewer/finance → 403**「只读账号不可执行该操作」）。
+
+逐合同步骤（复用整单驳回）：逐明细 `_apply_item_release` 释放锁定 → 合同 `status = "terminated"` → remark **追加** `驳回：{reason}`（原备注保留）→ `_sync_rs_item_statuses`（遥感明细回 `in_stock`）→ `_recompute_project` 派生项目状态 → 操作日志「驳回订单」。审计 `record_audit`（actionType=`sale`，「驳回订单」）。
+
+**项目状态派生（ADR-056 新增分支）**：`_derive_project_status` 对 `{pending, terminated}` 混合态——**仍有 pending 合同 → 项目 pending**（可续审）；无 pending（全 terminated）→ terminated。此前该混合态归入 terminated（整单驳回路径下不会出现此混合态，无存量影响）。
+
+响应（200）：更新后的完整 `ProjectOut`（与 review 返回口径一致，含 `status`/`items`），供前端刷新。
+
+```json
+{"id":80,"code":"SP-2026110410210098","name":"QA056-勾选驳回项目","status":"pending","contractAmount":3066834.0,"items":[…]}
+```
+
+实测（:8000，QA056- 前缀数据保留）：4 合同勾 3 → 200，3 合同 terminated + remark 留痕、剩余 1 合同 pending、**项目仍 pending**、锁定释放 3、日志/审计「驳回订单」；续审剩余 1 个（review confirm）→ 项目 active；遥感合同驳回 → rs_item 回 `in_stock`；全部驳回 → 项目 terminated；reason 空白 400 / contractIds 空 422 / 非 pending 项目 400 / 非本项目合同 400 / 已 terminated 合同 400 / 404；viewer/finance 403、非负责人 editor 403、admin 越过守卫、未分配 400；回归：review 整单 reject 行为不变（terminated + remark + 释放 + 日志）。
+
+---
+
+## 2026-11-04 变更（ADR-055：销售项目列表页服务端分页，新增 `GET /api/projects`）
+
+> **依据 ADR-055（Proposed，2026-11-04）**。仅 `/sales/projects` 列表页用；**`GET /api/bootstrap` 的全量 `projects` 保持不动**（13 个消费点依赖）。
+
+#### GET /api/projects（服务端分页，get_current_user）
+
+请求：`GET /api/projects?page=1&pageSize=20&keyword=QA&status=pending&rep=eco01&businessOwner=biz01`
+
+- query 参数：
+  - `page`：int ≥ 1，默认 1
+  - `pageSize`：int 1~100，默认 20
+  - `keyword`：可选。**trim 后**对 `name+code+customer` **拼接串**做**大小写敏感**子串匹配（与前端 `list` computed 的 `` `${p.name}${p.code}${p.customer}`.includes(kw) `` 逐字对齐；SQLite `instr` 实现）
+  - `status`：可选。过滤**存字段** `Project.status` 等值（前端过滤的即存 `p.status`，非派生 `projectOutcome`）
+  - `rep`：可选。`Project.rep` 等值
+  - `businessOwner`：可选。`__none__` → 空/None（未指派）；否则 `Project.businessOwner` 等值
+  - `sortBy` / `sortOrder`：可选，ADR-056 新增，见顶部「2026-11-04 变更（ADR-056）」小节
+- **可见性（与 bootstrap 同一口径，`build_visibility`/`user_sees_project`）**：restricted 角色（editor 按 businessOwner、viewer 按 creator、finance 空集）`Project.id.in_(vis.project_ids)`；admin/supervisor 不限定。
+- `total` = 「可见 ∩ 全部过滤条件」的 count（filter 之后 `q.count()`，非切片后、非全表）。
+- 排序：缺省 `id DESC`（与 bootstrap/audit-logs 一致）；传 `sortBy` 时按排序键 + `id DESC` 兜底（ADR-056）。
+
+响应（200，实测，`items[].items` 明细从略）：
+```json
+{"total":76,"items":[{"id":80,"code":"SP-2026110408371149","name":"QA053-D3-正常下单","customer":"QA053-D3","industry":"","rep":"","creator":"admin","businessOwner":"admin","subject":"测试主体","status":"pending","expectedAmount":121.0,"quoteAmount":0.0,"contractAmount":121.0,"paidAmount":0.0,"expectedSignDate":"2026-11-04","lastFollowDate":"2026-11-04","remark":"","items":[{"id":127,"assetId":53,"contractId":112,"itemId":null,"qty":1,"unit":"套","price":121.0,"…":"…"}],"contractCount":1,"cartRefilled":false,"createdAt":"2026-11-04","updatedAt":"2026-11-04"}]}
+```
+关键字段：`total`（int，可见∩过滤后总数）、`items[]`（`ProjectOut`，与 bootstrap `projects[]` 同结构）。
+
+**与 bootstrap 的区别**：bootstrap `projects` = 全量可见项目（Python 层过滤，无分页无过滤参数，13 消费点依赖）；本端点 = 服务端分页 + 4 过滤，仅列表页表格数据用。列表页 rep/owner 过滤**下拉选项**仍来自 bootstrap 全量可见集。
+
+---
+
+## 2026-11-04 变更（ADR-051：权限体系升级——固定五角色 + 商务主管分配制 + 财务只读，后端核心）
+
+> **依据 ADR-051（Proposed，2026-11-04）**。角色 3→5：`role ∈ {admin, supervisor, editor, viewer, finance}`（`User.role` String，**无 schema 迁移**）。
+> 能力守卫收口 `security.py`（`ROLES`/`EDITOR_ROLES`/`require_editor`/`require_order`/`require_supervisor`）；数据域收口 `user_sees_project` + `Visibility`（单一口径，bootstrap 与全部分页端点共用）。
+
+**销售项目可见性矩阵（⚠️ 收紧，editor 由全量改名下）**：
+
+| 角色 | 可见项目 | bootstrap 其它 |
+|---|---|---|
+| admin | 全部 | 全量 |
+| supervisor（商务主管） | 全部（含未分配池 `businessOwner=""`） | 全量 |
+| editor（商务） | **仅 `businessOwner==自己`** | 名下关联资源 |
+| viewer（生态） | 仅 `creator==自己`（存量 creator 空回退 rep 姓名，不变） | 不变 |
+| finance（财务） | **无**（projects/contracts/outbounds/flows/logs 全空） | assets/rsItems 全量只读；**`entities: []`** |
+
+**接口语义变更**：
+- `POST /projects/{id}/claim`（`require_editor`）：新增**主管分配/改派**分支——admin/supervisor 对无主单传 `newOwner` = **分配**（绑指定商务）；对他人负责单传 `newOwner` = **改派**（改绑）/不传 = 接手给自己；商务档规则不变（负责人转交必传 `newOwner`、他人负责 → 400 `该订单由商务负责人「X」负责，如需改派请联系商务主管处理`）。操作日志/审计动作 = `分配订单` / `改派订单` / `接手订单` / `转交订单`（detail 含 旧→新 账号）。`_validate_business_owner` 目标白名单 = 启用中的 `editor/admin/supervisor`。
+- `POST /projects/{id}/review`：守卫改为 `businessOwner`（被分配商务）**或 admin/supervisor 越过**（Q3 兜底）；未分配（无 owner）→ 400 文案改 `该订单尚未分配，请先由商务主管分配`。
+- `PATCH /contracts/{id}`：`signedDate` 守卫 = 负责人或 **admin/supervisor**（主管越过）；`scheduledDeliveryDate` **保持仅 admin**（supervisor → 403 `仅管理员可录入预计交付时间`，不变）。
+- `PUT /projects/{id}`：pending 基本信息守卫 = 负责人或 **admin/supervisor**（文案 `待审核项目仅商务负责人（或管理员/商务主管）可编辑基本信息`）。
+- `GET /entities`：finance → **200 `[]`**（不 403，避免前端报错）；其余角色不变。
+- `GET /bootstrap`：finance 的 `entities` = `[]`（省略主体）；projects/contracts/outbounds 按上表过滤。
+- **不变**：viewer 全部行为（下单/看自己单/撤销/数据隔离）；admin 全权；`_can_withdraw`（撤销 = 下单人本人 or admin，**不含 supervisor**）；`require_admin`（删项目/用户管理/审计）；`GET /users/options`（仍返回 editor+admin，分配下拉由前端过滤 editor）。
+
+实测（:8000 运行实例，真实 HTTP + 落库核对，测试账号 sup01/fin01/biz01/biz02/eco01 保留）：
+1. eco01(viewer) 下单 → SP-2026110404402994（id=55，pending，`businessOwner=""`）；biz01 bootstrap **不可见**（projects=0），sup01/admin **可见**（未分配池）。
+2. sup01 `claim {newOwner:"biz01"}` → 200，落库 `businessOwner=biz01`，日志/审计 `分配订单（商务负责人绑定为 biz01）`；biz01 bootstrap 立即可见。
+3. sup01 `review confirm` → 200（主管审核，项目 active）；再 `claim {newOwner:"biz02"}` → 落库 `biz02`，日志/审计 `改派订单（商务负责人 biz01 → biz02）`。
+4. biz01 对 biz02 名下单 claim → **400** `该订单由商务负责人「biz02」负责，如需改派请联系商务主管处理`（不可抢单）。
+5. fin01 bootstrap：assets=37、projects/contracts/outbounds=0、entities=0；`GET /entities` → 200 `[]`；`POST /cart` → 403 `财务账号为只读，不可执行该操作`；`POST /assets` → 403。
+6. 回归：eco01 下单/看自己单/撤销（id=57，withdraw 200 restored=1）正常；sup01 分配 id=56 给 biz01 → biz01 `review confirm` 200（名下可审核）；sup01 录 `signedDate` 200（合同 → delivering）、录 `scheduledDeliveryDate` → **403**（仍仅 admin）。
+
+---
+
 ## 2026-10-22 变更（DELIV-20261022-B：交付物外部链接 `url` + 协议白名单，ADR-044）
 
 > **纯加性（非 Breaking）**：`asset_deliverables` 新增 `url` 字段，交付物可「只有附件」「只有链接」「两者都有」「都没有（仅登记条目）」。
@@ -599,9 +718,10 @@ viewer POST /cart/checkout（行金额超上限 + 历史 discountRate=0.5）→ 
 
 > 主体清单从前端 `types.ts::ENTITIES` 硬编码改为后端 `entities` 表单一事实来源。契约见 `docs/api-contracts.md`「ENTITIES-20261022 批次」。元素形状：`{ id: number, name: string, short: string, createdAt: string, updatedAt: string }`。
 
-### `GET /api/entities`（登录即可，三角色放行）
+### `GET /api/entities`（登录即可；ADR-051：finance 返回 `[]`）
 
 请求：`GET /api/entities`（需 `Authorization: Bearer <jwt>`）
+ADR-051：`role=finance` → 200 `[]`（财务不看公司主体，不 403 避免前端报错）；其余角色全量返回。
 响应（200，实测节选，存量库回填 4 家）：
 ```json
 [{"id":1,"name":"安徽天枢智算人工智能科技有限公司","short":"安徽天枢智算人工智能科技有限公司","createdAt":"2026-10-22 15:03","updatedAt":"2026-10-22 15:03"}, ...]
@@ -651,7 +771,7 @@ viewer POST /cart/checkout（行金额超上限 + 历史 discountRate=0.5）→ 
 
 ### `GET /api/bootstrap` 新增顶层字段
 
-- `entities: EntityOut[]`（**全量，无角色过滤**——主体非敏感商业数据），位置在 `rsItems` 之后。实测（admin）：4 条，形状与 `GET /entities` 一致。前端删除 `types.ts::ENTITIES` 常量后由 `db.entities` 提供建产品「所在主体」下拉、产品列表主体筛选与 `entityShort()` 简称映射（查不到回退原值）。
+- `entities: EntityOut[]`（**全量，无角色过滤**——主体非敏感商业数据；**ADR-051：finance 返回 `[]`**），位置在 `rsItems` 之后。实测（admin）：4 条，形状与 `GET /entities` 一致。前端删除 `types.ts::ENTITIES` 常量后由 `db.entities` 提供建产品「所在主体」下拉、产品列表主体筛选与 `entityShort()` 简称映射（查不到回退原值）。
 
 ---
 
@@ -1180,7 +1300,7 @@ OpLog「更新交付物」的 `changes` 体现附件变化，与产品文件字�
 
 ### 新端点 `PATCH /api/contracts/{id}`（录入合同时间节点，ADR-019）
 
-权限：`require_order`（已认证）+ 服务层守卫——**viewer 直接 403**；`signedDate` 仅该单商务负责人（businessOwner）/admin；`scheduledDeliveryDate` **仅 admin**。
+权限：`require_order`（已认证）+ 服务层守卫——**viewer 直接 403**；`signedDate` 仅该单商务负责人（businessOwner）/admin/**supervisor**（ADR-051 主管越过）；`scheduledDeliveryDate` **仅 admin**（ADR-051 不变）。
 
 请求：`PATCH /api/contracts/{id}`，body 两字段均可选（按字段分别校验，未传字段不处理）：
 
@@ -1202,8 +1322,8 @@ OpLog「更新交付物」的 `changes` 体现附件变化，与产品文件字�
 | 场景 | 响应 |
 |---|---|
 | viewer 调用 | 403 `只读账号不可执行该操作` |
-| editor 非该单 businessOwner 录 signedDate | 403 `仅接手的商务负责人（{owner}）可录入合同签订时间，如需处理请先转交` |
-| 非 admin 录 scheduledDeliveryDate | 403 `仅管理员可录入预计交付时间` |
+| editor 非该单 businessOwner 录 signedDate（supervisor/admin 可越过，ADR-051） | 403 `仅接手的商务负责人（{owner}）可录入合同签订时间，如需处理请先转交` |
+| 非 admin 录 scheduledDeliveryDate（含 supervisor，ADR-051 不变） | 403 `仅管理员可录入预计交付时间` |
 | 合同非 active/delivering 录/改 signedDate（如 pending/delivered/terminated） | 400 `仅「合同签订中」状态的合同可录入/修改签订时间` |
 | signedDate 传 null/空清空（已有值） | 400 `签订时间录入后不可清空` |
 | 合同非 delivering 录/改/清空 scheduledDeliveryDate | 400 `仅「交付中」状态的合同可录入/修改/清空预计交付时间` |
@@ -1264,6 +1384,8 @@ OpLog「更新交付物」的 `changes` 体现附件变化，与产品文件字�
 - `contracts[]`：`signedDate` / `scheduledDeliveryDate`（'YYYY-MM-DD' | null）
 - `contracts[].status` / 项目 `status` 新增值 `delivering`（中文「交付中」）
 - viewer 过滤为行级（项目/合同/交付/流水/日志），对上述新字段无影响。
+
+ADR-053（2026-11-04）：`assets[]` 新增 `taxPoint`（int | null，税点百分比整数，`13` = 13%；存量产品为 `null`，前端展示 `-`）。纯展示字段，不参与计价/区间校验；`salePrice` 字段名不变，语义为「采购单价」。
 
 ### ⚠️ `POST /api/sales/order` deprecated（ADR-020）
 
@@ -1727,32 +1849,53 @@ POST /api/projects
 - 权限（2026-10-16）：`require_order`；viewer 仅自己项目 + 仅 `terminated`（`delivered` → 400）。
 - **ADR-012（2026-10-19）**：`pending`（待审核）项目 → 400 `待审核项目不可直接变更状态，请通过订单审核（确认下单/驳回）操作`。
 
-### POST /api/projects/{project_id}/review（ADR-012 订单审核，2026-10-19 新增）
+### POST /api/projects/{project_id}/review（ADR-012 订单审核，2026-10-19 新增；ADR-050 增强，2026-11-03；ADR-057 部分确认，2026-11-04）
 
 订单审核唯一入口（仅 `pending` 项目；权限 `require_editor`，viewer → 403）。
-请求：
+请求（ADR-050 起新增 `items[].qty` 与 `contracts[]`，ADR-057 起新增 `contractIds`，全部可选、向后兼容）：
 ```json
-{"action":"confirm","items":[{"itemId":12,"price":888888},{"itemId":15,"amount":50000}]}
+{"action":"confirm","items":[{"itemId":12,"price":888888,"qty":3},{"itemId":15,"amount":50000}],
+ "contracts":[{"contractId":7,"customer":"客户公司名","amount":123456.789}]}
+{"action":"confirm","contractIds":[7,8]}
 {"action":"reject","reason":"单价需重新询价"}
 ```
-- `itemId` = `project_items.id`（行 id，非产品 id）；`items` 可省略（不改价直接确认）。
-- **confirm（确认下单，可带改价）**：unit 行传 `price`（实际单价 >0，amount=price×qty 重算）；amount 行传 `amount`（整数元 >0，price 派生反算）；遥感明细行（含 itemId 的明细）传改价 → 400 `遥感数据明细行不接受审核改价（请在产品「可售明细」中维护明细单价）`；**数量不可改**。
-  - **写回平台**：改价行按 assetId 回写 `assets.salePrice`（unit=实际单价、amount=派生单价 amount÷qty；同产品多行最后遍历到的行生效），并写产品「挂牌价更新」日志——平台各展示位单价同步为最近成交价（ADR-012 §3）。
-  - 确认后存在 `amount<=0` 行 → 400 `存在未定价明细，请先填写单价/销售金额`。
-  - 销售记录 `pending→active`、项目派生 → `active`；记录 `contractAmount` 重算 = Σ行，项目 `expectedAmount/contractAmount` = Σ记录。
-- **reject（驳回）**：`reason` 必填（空 → 400）；逐明细释放锁定（仅 `it.locked`，cancel_release 流水带 contractId）；合同 `pending→terminated` 且 `remark="驳回：{reason}"` 留痕；项目 → `terminated`。
-- 日志：操作日志「确认下单（含改价 diff）/ 驳回订单」+ 审计日志（`actionType=sale`）。
-- 守卫：非 pending 项目 → 400 `仅待审核项目可审核（确认下单/驳回）`；**接手人守卫（§5.1）**：`businessOwner` 为空 → 400 `该订单尚未被商务接手，请先接手后再操作`；操作人 ≠ `businessOwner` 且非 admin → 400 `仅接手的商务负责人（X）可调整该订单价格，如需处理请先转交`；admin 可越过任意单（审计留痕实际操作人）。
+- `items[].itemId` = `project_items.id`（行 id，非产品 id）；`items`/`contracts` 可省略（不改价直接确认）。
+- **`contractIds`（ADR-057 §3，仅 confirm 生效，可选）**：部分确认——只确认勾选的 pending 合同：
+  - **缺省（不传 / `null`）= 整单确认**：项目下全部 pending 合同，行为与 ADR-057 前完全一致（向后兼容）；
+  - 提供时：须**全部属于该项目且 `status=pending`**（否则 400 `销售记录 X 不属于该项目` / `销售记录 HT-… 非待审核状态，不可确认`）；空列表 → 400 `contractIds 不能为空`；
+  - **只作用于选中集合（targets）**：行级改价/改数量、合同总价分摊（`contracts[]` 指向非选中合同 → 400 `销售记录 HT-… 不在本次确认范围内`）、库存锁定调整、服务期限、确认守卫（空单/0元/`pending_asset` **按选中集合判定**，未勾选合同的异常不影响本次确认）、`c.status="active"` 均只针对 targets；
+  - **未勾选合同保持 `pending` 一字不动**（锁定保持、明细不改）；项目在有 pending 合同时派生保持 **`pending`**（可续审，`_derive_project_status`：含 pending 且其余 ⊆ {active, delivering, delivered, terminated} → pending，与 ADR-056 部分驳回同口径），零 pending 后正常派生（active/delivering/delivered/terminated）；
+  - 操作日志：部分确认时「确认下单」detail 带份数（`项目 X 订单已确认（N 份）`）；整单确认日志格式不变；
+  - **驳回不走本参数**：勾选驳回用 ADR-056 `POST /projects/{id}/reject-contracts`（`contractIds` + `reason` 必填）。
+- **confirm（确认下单，可带改价/改数量/合同总价/客户名）**：
+  - **行级（按行 `pricingMode` 决定权威输入，ADR-050 §2）**：
+    - unit 行：`price` 权威（>0 且 ≤6 位小数）；`finalQty = qty ?? 原值`（≥1，否则 400 `数量必须大于 0`）；`amount = quantize(finalPrice × finalQty, 1e-6)`（即使传 `amount` 也以 price×qty 为准）；只传 `qty` 时按原单价重算金额。
+    - amount 行（包量/卫星 Token）：传 `amount` → 权威（元，>0 且 ≤6 位小数，price 派生反算）；只传 `qty` → **金额按数量比例缩放** `原amount × finalQty / 原qty`（price 随之派生）；都不传 → 保持原值。
+    - 遥感明细行（`itemId` 非空）：`qty ≡ 1` 不可改（传入忽略），仅可改本行 `amount`（不回写 `rs_items.price`）。
+    - **审核链路不走参考区间**（ADR-049，含改数量导致的折算单价变化）；**不回写平台挂牌价**（ADR-018 §4，`origPrice/origAmount` 快照永不触碰）。
+  - **合同级 `contracts[]`（ADR-050 §3/§4）**：`{contractId, customer?, amount?}`，`contractId` = `contracts.id`（销售记录主键，不属于该项目/重复 → 400）。
+    - **合同总价 `amount`**（元，>0 且 ≤6 位小数）：按该合同内各明细行**行级解析后**的金额比例分摊回写（`finalAmount/Σ×target` 量化 1e-6，**四舍五入残差落金额最大行**，使 Σ行 == 总额精确）；各行单价重新派生；`contractAmount = Σ行 = target`（ADR-029 不变式）。**合同总价最后生效**——同时改行与总价时，行先解析、再由总价按比例覆盖。
+    - **客户名称 `customer`**：trim 后非空且 ≤128 字（否则 400），写 `Contract.customer`（权威）；**冲突守卫**：同项目内另一合同改后客户相同且明细集合（`(assetId,itemId)` 集）相同 → 400 `客户「X」下相同的销售明细不可重复（与 HT-… 冲突，请调整客户名称）`（对齐建单期口径）；`Project.customer` 由 `_recompute_project` 重派生（单客户=该值，多客户=空串）。
+  - **数量与库存（ADR-050 §5，非 repeatSale、非遥感行）**：建单（pending）时已按原 qty 锁定，改数量 = 调整既有锁定（净效果 = 该订单持有 finalQty 锁定，仅 `it.locked` 行参与）：
+    - `delta > 0`：走既有原子条件更新（`quantity − lockedQty − shippedQty ≥ delta`，ADR-033），不足 → **400 `第 {行id} 行可用库存不足（需 {delta}，当前可售 {M}）`**，整个 confirm 事务回滚（不半提交）；
+    - `delta < 0`：释放（`lockedQty ≥ -delta` 条件更新），释放不足等不变量破坏 → **500 + 审计告警**（不静默，ADR-033）；
+    - **repeatSale 行**：不锁数量、只计次，改数量无库存约束。
+  - 确认后存在 `amount<=0` 行 → 400 `存在未定价明细，请先填写单价/销售金额`；空明细 400；`pending_asset` 行 400（既有守卫不变）。
+  - 销售记录 `pending→active`（ADR-057：仅 targets——缺省=全部 pending，部分确认=勾选集合，未勾选保持 pending）、项目派生 → `active`（零 pending 时；有 pending 时保持 `pending` 可续审）；未分摊合同的 `contractAmount` 重算 = Σ行，项目 `expectedAmount/contractAmount` = Σ记录。
+- **reject（驳回）**：`reason` 必填（空 → 400）；逐明细释放锁定（仅 `it.locked`，cancel_release 流水带 contractId）；合同 `pending→terminated` 且 `remark="驳回：{reason}"` 留痕；项目 → `terminated`。**`contracts` 与 `items[].qty` 被忽略**（行为与 ADR-050 前完全一致）。
+- 响应恒 `{"ok":true}`（前端 `refresh()`，不新增返回结构）。
+- 日志：操作日志「确认下单（含改价/改数量/客户/总价 diff）/ 驳回订单」+ 审计日志（`actionType=sale`）。
+- 守卫：非 pending 项目 → 400 `仅待审核项目可审核（确认下单/驳回）`；**接手人守卫（§5.1，ADR-051 更新）**：`businessOwner` 为空 → 400 `该订单尚未分配，请先由商务主管分配`；操作人 ≠ `businessOwner` 且非 admin/supervisor → **403** `仅接手的商务负责人（X）可调整该订单价格，如需处理请先转交`；admin/supervisor 可越过任意单（Q3 兜底，审计留痕实际操作人）。
 
-### POST /api/projects/{project_id}/claim（商务接手/转交，ADR-012 §5.1 **纯移交制**）
+### POST /api/projects/{project_id}/claim（商务接手/转交，ADR-012 §5.1 **纯移交制**；ADR-051 叠加主管分配/改派）
 
 请求：可选 body `{"newOwner":"账号"}`（缺省 `""`）→ 200 `{"ok":true}`（权限 `require_editor`）。
-- **无负责人**（pending/active 均可）：任意商务/管理员 → **接手**（绑定操作人 username）；
-- **已有负责人（移交）**：仅**当前负责人本人**可转交——body 必传 `newOwner`（缺省 → 400 `请指定转交的目标商务账号`；=自己 → 400 `转交目标不能是自己`）；目标校验 → 400 `「X」不是可用的商务账号，请重新选择`（须存在/启用/editor+admin 角色）；
-- **admin 越过**：他人单据可不传 `newOwner` 直接接手给自己，或传 `newOwner` 转交给任意账号；
-- **非负责人的普通商务 → 400** `该订单由商务负责人「X」负责，仅其本人可转交（如需介入请联系 admin 处理）`（原「拉取式抢单」已废除）；
+- **无负责人**（pending/active 均可）：admin/supervisor 传 `newOwner` → **分配**（绑定指定商务）；否则 → **接手**（绑定操作人 username，含主管自接）；
+- **已有负责人（移交）**：仅**当前负责人本人**可转交——body 必传 `newOwner`（缺省 → 400 `请指定转交的目标商务账号`；=自己 → 400 `转交目标不能是自己`）；目标校验 → 400 `「X」不是可用的商务账号，请重新选择`（须存在/启用/editor+admin+supervisor 角色，ADR-051）；
+- **admin/supervisor 越过**（ADR-051）：他人单据传 `newOwner` → **改派**（改绑指定商务），不传 → 接手给自己；
+- **非负责人的普通商务 → 400** `该订单由商务负责人「X」负责，如需改派请联系商务主管处理`（原「拉取式抢单」已废除，ADR-051 文案更新）；
 - `delivered`/`terminated` 终态 → 400 `该订单已完成/已终止，不可接手或转交`；
-- 不改变数量/锁定/记录状态，仅改 `businessOwner`；操作日志「接手订单 / 转交订单（X → Y）」+ 审计。
+- 不改变数量/锁定/记录状态，仅改 `businessOwner`；操作日志/审计动作 = `分配订单` / `改派订单` / `接手订单` / `转交订单`（detail 含 旧→新 账号）。
 
 ### GET /api/users/options（商务账号选项，ADR-012 §5.1，2026-10-19 新增）
 
@@ -1874,6 +2017,11 @@ Content-Disposition: attachment; filename*=UTF-8''%E5%BE%B7%E6%95%B0%E4%BA%A4%E9
 销售单价: 3,200,000 元 → 330,000 元；功能清单: → 测试文件.pdf
 ```
 
+ADR-053（2026-11-04）：
+- 新增可更新字段 `taxPoint`（int | null，`0 ≤ n ≤ 100`）：`exclude_unset` 语义同 `priceMin/priceMax`——**未传 = 保持原值，传 `null` = 清空**（恢复未设置）；越界 → 422。
+- 编辑日志中文映射：`salePrice` 由「销售单价」改为「**采购单价**」；新增 `taxPoint` → 「税点」（展示 `税点: 13 → None`，非金额字段不带「元」）。
+- 出参 `AssetOut`（`GET /api/bootstrap` 的 `assets[]`）新增 `taxPoint`（int | null，存量产品为 `null`）。
+
 ---
 
 ## 认证与权限（2026-10-15 新增，⚠️ Breaking）
@@ -1918,7 +2066,7 @@ Content-Disposition: attachment; filename*=UTF-8''%E5%BE%B7%E6%95%B0%E4%BA%A4%E9
 请求：`POST /api/auth/login`，body `{"username":"admin","password":"123456"}`
 响应（200）：
 ```json
-{"token":"eyJhbGciOiJIUzI1NiIs...","user":{"id":1,"username":"admin","name":"系统管理员","role":"admin","enabled":true}}
+{"token":"eyJhbGciOiJIUzI1NiIs...","user":{"id":1,"username":"admin","name":"系统管理员","role":"admin","enabled":true,"createdAt":"2026-10-15 01:14"}}
 ```
 错误：401 `{"detail":"用户名或密码错误"}`；禁用账号 401 `{"detail":"账号已被禁用"}`。
 关键字段：`token`（后续请求的 Bearer 凭证，7 天有效）、`user`（不含密码）。
@@ -1928,16 +2076,32 @@ Content-Disposition: attachment; filename*=UTF-8''%E5%BE%B7%E6%95%B0%E4%BA%A4%E9
 请求：`GET /api/auth/me`（需认证）
 响应（200）：
 ```json
-{"id":1,"username":"admin","name":"系统管理员","role":"admin","enabled":true}
+{"id":1,"username":"admin","name":"系统管理员","role":"admin","enabled":true,"createdAt":"2026-10-15 01:14"}
 ```
+
+#### POST /api/auth/change-password（自助改密，2026-11-04 新增，ADR-054）
+
+- 鉴权：`get_current_user`（**全角色**可改本人密码，含 viewer/finance；非仅 admin）。
+- 请求：`POST /api/auth/change-password`，body `{"oldPassword":"123456","newPassword":"newpass123"}`
+- 逻辑：校验旧密码（`verify_password`）→ 更新 `passwordHash` → **`tokenVersion += 1`**（同 `PUT /users/{id}` 改密逻辑）→ 记审计（`auth` / 「修改密码」；旧密码错记「修改密码失败」）。
+- 响应（200，**与 login 同形**，前端 `setSession` 后当前设备无缝续用）：
+```json
+{"token":"eyJhbGciOiJIUzI1NiIs...","user":{"id":33,"username":"biz01","name":"商务01","role":"editor","enabled":true,"createdAt":"2026-11-04 04:40"}}
+```
+- **关键**：返回的 `token` 携带**新** tokenVersion（payload `ver` 已 +1）；改密前签发的旧 token（旧 `ver`）立即 401「登录状态已失效，请重新登录」（其它设备/旧会话被踢）。
+- 错误：
+  - 400 `{"detail":"旧密码不正确"}` —— 旧密码校验失败；
+  - 422 —— `newPassword` 少于 6 位（`min_length=6`）；
+  - 401 —— 未登录 / token 失效（常规语义）。
 
 #### GET /api/users（仅 admin）
 
 请求：`GET /api/users`
 响应（200）：`UserOut[]`（不含 passwordHash）：
 ```json
-[{"id":1,"username":"admin","name":"系统管理员","role":"admin","enabled":true}]
+[{"id":1,"username":"admin","name":"系统管理员","role":"admin","enabled":true,"createdAt":"2026-10-15 01:14"}]
 ```
+`UserOut` 自 2026-11-04 起含 `createdAt`（分钟级字符串 `YYYY-MM-DD HH:MM`；存量老用户可能为空串，前端显 `-`）。
 
 #### POST /api/users（仅 admin）
 
@@ -1992,6 +2156,7 @@ Content-Disposition: attachment; filename*=UTF-8''%E5%BE%B7%E6%95%B0%E4%BA%A4%E9
 | GET | `/api/health` | 健康检查（匿名） |
 | **POST** | **`/api/auth/login`** | **登录（匿名，新增）** |
 | **GET** | **`/api/auth/me`** | **当前登录用户（新增）** |
+| **POST** | **`/api/auth/change-password`** | **自助改密（全角色，返回新 token，ADR-054）** |
 | **GET/POST** | **`/api/users`** | **用户列表 / 新增用户（仅 admin，新增）** |
 | **PUT/DELETE** | **`/api/users/{id}`** | **编辑 / 删除用户（仅 admin，新增）** |
 | **GET** | **`/api/audit-logs`** | **审计日志查询（仅 admin，新增）** |
@@ -2002,6 +2167,7 @@ Content-Disposition: attachment; filename*=UTF-8''%E5%BE%B7%E6%95%B0%E4%BA%A4%E9
 | **POST** | **`/api/assets/{asset_id}/rs-items`** | **新增遥感数据可售明细（ADR-011，admin+editor）** |
 | **PUT** | **`/api/rs-items/{item_id}`** | **编辑遥感数据可售明细（ADR-011，admin+editor）** |
 | **DELETE** | **`/api/rs-items/{item_id}`** | **删除遥感数据可售明细（ADR-011，有销售关联时 400）** |
+| **GET** | **`/api/projects`** | **销售项目列表服务端分页（page/pageSize + keyword/status/rep/businessOwner 过滤 + 可见性，ADR-055，仅列表页用）** |
 | POST | `/api/projects` | 新增项目（强制 active；支持 `contracts` 结构或 `items` 单合同包装） |
 | PUT | `/api/projects/{project_id}` | 编辑项目基本信息（存在 delivered 合同不可编辑） |
 | PATCH | `/api/projects/{project_id}/status` | 项目状态批量快捷（名下 active 合同批量执行） |
@@ -2125,6 +2291,11 @@ POST /api/projects
 ### POST /api/assets
 
 请求体校验（Pydantic v2，`Field(ge=0)`）：`quantity`、`salePrice` 必须 ≥ 0。
+
+ADR-053（2026-11-04）：
+- 新增入参 `taxPoint`（int | null，`0 ≤ n ≤ 100`，选填；null/不传 = 未设置），税点百分比整数（`13` = 13%），**纯展示元数据，不参与任何金额计算**；越界（如 101 / -1）→ 422。
+- `salePrice` 字段名/类型不变，**语义改为「采购单价」**（内部成本，对外不展示、仅编辑表单可见）；计价/区间校验逻辑不变。
+
 `quantity=-5` → 422：
 ```json
 {"detail":[{"type":"greater_than_equal","loc":["body","quantity"],

@@ -10,6 +10,7 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { useBack } from '@/composables/useBack'
 import {
   ArrowDown,
   ArrowLeft,
@@ -38,12 +39,10 @@ import {
   availableQty,
   boardLabel,
   checkDeliverableUrl,
-  displayUnitPrice,
   entityShort,
   expiryText,
   formatAssetQty,
   formatMoney,
-  isAmountMode,
   isAmountPrecisionValid,
   noSellableStock,
   priceRangeText,
@@ -92,6 +91,10 @@ const router = useRouter()
 const assetId = computed(() => Number(route.params.id))
 
 const asset = computed(() => getAsset(assetId.value))
+
+// 「返回」：回上一页；深链/刷新直达（无历史）时兜底到该产品所属板块列表
+// （back-link 仅在 v-if="asset" 内渲染，点击时 asset 必存在，故用非空断言）
+const { goBack } = useBack(() => `/assets/${asset.value!.board}`)
 
 const salesLinks = computed(() =>
   asset.value ? projectItemsOfAsset(asset.value.id) : [],
@@ -290,6 +293,8 @@ const activeTab = ref('info')
 onMounted(() => {
   const t = route.query.tab
   if (t === 'deliverables') activeTab.value = 'deliverables'
+  // 进入即预加载数量流水 / 操作记录（asset 可能已就绪，watch(asset) 不会再触发，故此处兜底）
+  preloadTabs()
 })
 
 // ============================================================
@@ -647,9 +652,29 @@ function ensureTabLoaded() {
     loadOpLogs()
   }
 }
+/**
+ * 进入页面即预加载数量流水 / 操作记录（不再等点 tab）。
+ * 仍走分页接口（listAssetFlows / listAssetLogs，保留服务端 total + 可见性过滤），
+ * 且尊重 loaded 标记（已加载不重拉）；切 tab 时 ensureTabLoaded 因 loaded=true 不再二次请求。
+ */
+function preloadTabs() {
+  const a = asset.value
+  if (!a) return
+  if (!flow.loaded) {
+    flow.page = 1
+    loadFlows()
+  }
+  if (!opLog.loaded) {
+    opLog.page = 1
+    loadOpLogs()
+  }
+}
 watch(activeTab, ensureTabLoaded)
-// bootstrap 晚于 tab 切换就绪时补拉（db 刷新后 asset computed 重新求值触发）
-watch(asset, ensureTabLoaded)
+// bootstrap 晚于 tab 切换就绪时补拉 + 进入即预加载（db 刷新后 asset computed 重新求值触发）
+watch(asset, () => {
+  ensureTabLoaded()
+  preloadTabs()
+})
 // PAGE-20261021：切换产品（路由参数变化复用组件）时重置三处分页状态
 watch(assetId, () => {
   rs.page = 1
@@ -664,6 +689,9 @@ watch(assetId, () => {
   opLog.loaded = false
   opLog.items = []
   opLog.total = 0
+  // 重置后若 asset 已就绪则立即重新预加载——watch(asset) 先于本 watch 触发时 loaded 尚未清零，
+  // 需在此处补拉，保证路由参数变化复用组件时预加载跟着重触发
+  preloadTabs()
 })
 
 /**
@@ -887,10 +915,25 @@ function contractCountText(p: Project): string {
   return p.contractCount ? `${p.contractCount} 份销售记录` : '1 份销售记录'
 }
 
-/** 流水操作人：空 → -；system → 系统 */
+/** 操作人账号→姓名：空 → -；system → 系统；其余账号走 repName（查不到回退原账号，不报错） */
+function operatorName(op?: string): string {
+  if (!op) return '-'
+  return op === 'system' ? '系统' : repName(op)
+}
+
+/** 流水操作人（数量流水 tab） */
 function operatorText(f: AssetFlow): string {
-  if (!f.operator) return '-'
-  return f.operator === 'system' ? '系统' : f.operator
+  return operatorName(f.operator)
+}
+
+/**
+ * 关联单号 SP-xxx → 销售项目 id：仅 SP- 前缀且在 db.projects（bootstrap 镜像，已按可见性过滤）
+ * 能按 code 映射到才返回 id；HT-/CK-/产品编号/已删单号 → null（保持纯文本）。
+ */
+function spProjectId(ref?: string): number | null {
+  if (!ref || !ref.startsWith('SP-')) return null
+  const p = db.projects.find((x) => x.code === ref)
+  return p ? p.id : null
 }
 </script>
 
@@ -899,9 +942,9 @@ function operatorText(f: AssetFlow): string {
     <template v-if="asset">
       <div class="detail-page">
         <!-- 返回入口 -->
-        <a class="back-link" @click="router.push(`/assets/${asset.board}`)">
+        <a class="back-link" @click="goBack">
           <el-icon><ArrowLeft /></el-icon>
-          返回{{ boardLabel(asset.board) }}
+          返回
         </a>
 
         <!-- 标题 + 元信息 + 动作 -->
@@ -1007,13 +1050,18 @@ function operatorText(f: AssetFlow): string {
                   </div>
                   <div class="info-item">
                     <span class="il">销售单价</span>
-                    <!-- ADR-025（2026-10-21）：包量定价（amount 模式）统一走百万Token 口径（与列表列同口径） -->
-                    <!-- ADR-018（PRICING-20261020）：有参考区间时追加区间提示（与列表列同口径） -->
+                    <!-- ADR-053：对外展示参考区间下限 priceMin（与列表列同口径，不再对外展示采购价）；
+                         ADR-018（PRICING-20261020）：有参考区间时追加区间提示 -->
                     <span class="iv">
-                      <template v-if="isAmountMode(asset)">{{ asset.salePrice ? displayUnitPrice(asset) : '-' }}</template>
-                      <template v-else>{{ asset.salePrice ? formatMoney(asset.salePrice) : '-' }}<template v-if="asset.repeatSale"> / {{ asset.unit }}</template></template>
+                      <template v-if="asset.priceMin != null">{{ formatMoney(asset.priceMin) }}<template v-if="asset.repeatSale"> / {{ asset.unit }}</template></template>
+                      <template v-else>-</template>
                       <template v-if="priceRangeText(asset)">（参考区间 {{ priceRangeText(asset) }}）</template>
                     </span>
+                  </div>
+                  <!-- ADR-053：税点（整数百分比，可空 → `-`） -->
+                  <div class="info-item">
+                    <span class="il">税点</span>
+                    <span class="iv">{{ asset.taxPoint != null ? `${asset.taxPoint}%` : '-' }}</span>
                   </div>
                   <div class="info-item">
                     <span class="il">登记时间</span>
@@ -1391,7 +1439,15 @@ function operatorText(f: AssetFlow): string {
                       <template v-if="f.amount"> · 金额 {{ formatMoney(f.amount) }}</template>
                     </div>
                     <div class="fl-meta muted">
-                      <template v-if="f.ref">关联单号：{{ f.ref }}</template>
+                      <template v-if="f.ref">
+                        关联单号：
+                        <a
+                          v-if="spProjectId(f.ref)"
+                          class="link"
+                          @click="router.push(`/sales/projects/${spProjectId(f.ref)}/detail`)"
+                        >{{ f.ref }}</a>
+                        <template v-else>{{ f.ref }}</template>
+                      </template>
                       <template v-if="f.ref && f.note"> · </template>
                       <template v-if="f.note">{{ f.note }}</template>
                     </div>
@@ -1430,7 +1486,7 @@ function operatorText(f: AssetFlow): string {
                 <el-timeline-item
                   v-for="log in opLog.items"
                   :key="log.id"
-                  :timestamp="`${log.time} · ${log.operator}`"
+                  :timestamp="`${log.time} · ${operatorName(log.operator)}`"
                   placement="top"
                 >
                   <div class="log-action">{{ log.action }}</div>
