@@ -923,10 +923,9 @@ async function submitDateDialog() {
 </template>
 
 <style scoped>
-/* 内容区最大 1080px，居中 */
+/* 内容区满宽（对齐 .page-container / 列表页）——原 max-width:1080px 居中导致宽屏右侧留白；
+   24px 侧边距由外层全局 .page-container 提供，此处不再叠加 padding */
 .detail-wrap {
-  max-width: 1080px;
-  margin: 0 auto;
   width: 100%;
 }
 .title-row {

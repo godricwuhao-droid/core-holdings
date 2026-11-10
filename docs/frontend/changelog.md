@@ -2388,5 +2388,6 @@
 | 2026-11-04 | 修复 | ADR-057 修复：部分确认/驳回后剩余 pending 合同丢失默认勾选(watch 改幂等默认全选) + 勾全选省略 contractIds 走整单(日志格式回归) | src/views/sales/projects/review.vue | ADR-057 | BUG-ADR057-001/OBS-ADR057-01 |
 | 2026-11-10 | 修改 | 流转日志(抽屉+详情)+分配下拉显示姓名而非账号：抽共享 username→name helper(最长优先+词边界+回退)、detail 展示处解析(存量+新日志生效)、TransferDialog 选项只显示姓名(值仍 username) | src/utils/userName.ts、src/views/sales/projects/{index,detail}.vue、src/components/TransferDialog.vue、src/api/index.ts | ADR-058 | 纯前端显示层 |
 | 2026-11-10 | 新增 | 销售项目「待分配」状态 pending_assign：types.ts 加 label/中性色、状态筛选/tag 自动生效、按钮可见性审计(待分配: 主管/管理员显分配改派、不显审核、下单人显撤销)、outbound/bootstrap 过滤含 pending_assign、复用 TransferDialog 分配 | src/types.ts、src/views/sales/projects/index.vue、src/views/sales/projects/detail.vue、src/views/sales/outbound/index.vue、src/api/index.ts | ADR-064 | 后端已返回 pending_assign |
+| 2026-11-10 | 修改 | 销售项目详情页 .detail-wrap 去 max-width:1080px 居中、改满宽+24px padding(对齐 .page-container/列表页)，宽屏不再右侧留白；基本信息/清单随宽自适应 | src/views/sales/projects/detail.vue | UI 优化 | |
 
 > 验证：`vue-tsc --noEmit` EXIT=0，`read_lints` 0 诊断；后端区间口径已在副本库实测（超上限放行、低于下限 400、审核改价不受限）。未构建、未 commit。
