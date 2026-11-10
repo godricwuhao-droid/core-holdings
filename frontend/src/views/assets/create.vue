@@ -501,10 +501,9 @@ onMounted(async () => {
 </template>
 
 <style scoped>
-/* 内容区最大 720px，居中（单列表单下 1080px 过宽，长文本输入框拉得过散，720px 更整齐） */
+/* 2026-11-10 UI：页面铺满（参考销售项目详情页满宽同一套）——去掉 720px 限宽居中，
+   外层 .page-container 已提供 24px padding，此处不叠加 */
 .create-wrap {
-  max-width: 720px;
-  margin: 0 auto;
   width: 100%;
 }
 
@@ -520,14 +519,21 @@ onMounted(async () => {
 .asset-form :deep(.el-form-item:last-child) {
   margin-bottom: 0;
 }
-/* 单列表单：覆盖全局 .form-grid 的 3/2 列（scoped 仅作用于本页），行距沿用组件既有 18px */
+/* 2026-11-10 UI：页面满宽后表单字段宽屏两列（遵循 core-holdings-ui form-grid「中 2 列」规格），
+   避免单列输入框过宽显散；窄屏（≤999px）回落单列不破版。行距沿用组件既有 18px（margin-bottom） */
 .form-grid {
-  grid-template-columns: 1fr;
-  gap: 0;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 0 16px;
+}
+@media (max-width: 999px) {
+  .form-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
-/* 遥感提示条（ADR-011：位于基本信息 grid 内、产品类型正下方），下边距与表单行距一致 */
+/* 遥感提示条（ADR-011：位于基本信息 grid 内、产品类型正下方）——两列下横跨整行，下边距与表单行距一致 */
 .form-grid .info-bar {
+  grid-column: 1 / -1;
   margin-bottom: 18px;
 }
 
@@ -542,8 +548,9 @@ onMounted(async () => {
   flex-shrink: 0;
 }
 
-/* 可重复售卖警示行：紧跟开关下方，muted 12px */
+/* 可重复售卖警示行：紧跟开关下方，muted 12px；两列 grid 下横跨整行 */
 .repeat-sale-hint {
+  grid-column: 1 / -1;
   font-size: 12px;
   line-height: 18px;
   margin: -10px 0 18px;

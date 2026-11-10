@@ -546,13 +546,10 @@ const pageReady = computed(() => proj.value != null)
                只展示 pending 合同（部分确认后已确认/已驳回自动移出，剩余可续审） -->
           <div class="rv-contracts">
             <div v-for="c in pendingContracts" :key="c.id" class="rv-ct">
-              <!-- 合同头（仿购物车 .table-head 范式，单行）：左 = 勾选 + 客户名（点击即改，ADR-060）+ 主体 tag；
-                   右 = 合同总价（点击总价数字直接编辑，ADR-060；默认 = Σ 明细派生） -->
+              <!-- 合同头（仿购物车 .table-head 范式，单行）：左 = 客户名（点击即改，ADR-060）+ 主体 tag；
+                   右 = 合同总价（点击总价数字直接编辑，ADR-060；默认 = Σ 明细派生）
+                   2026-11-10 UI：勾选框自合同头移至明细表首列（语义不变：按合同一个，见下方首列） -->
               <div class="rv-ct-head">
-                <el-checkbox
-                  :model-value="checkedIds.includes(c.id)"
-                  @change="(v: boolean | string | number) => toggleContract(c.id, v)"
-                />
                 <!-- ADR-050：客户公司名称可改（trim 后非空、≤128 字，前端校验 + 后端兜底）；
                      ADR-060：改点击即改（ClickEditText：常态文本，点击出 el-input，失焦/回车提交 trim、Esc 还原）；
                      空客户名 → 弱警示提示（会拦「确认下单」） -->
@@ -593,6 +590,17 @@ const pageReady = computed(() => proj.value != null)
               <!-- 明细表：无竖线 + stripe；列宽由 column 声明（删 Grid 硬编码）；
                    行结构 = 主区 40px + 副区 18px（仿购物车 .cart-cell，行高统一、跨列输入框对齐） -->
               <el-table :data="linesOf(c.id)" stripe size="small" class="rv-table">
+                <!-- 2026-11-10 UI：勾选框自合同头移至明细表首列（纯挪位）——每行渲染同一个 el-checkbox，
+                     与合同头原实现完全同源（checkedIds.includes(c.id) / toggleContract(c.id, v)）：
+                     整表所有行勾选框状态一致、控制同一张合同；confirm 逻辑一字未动 -->
+                <el-table-column width="48" align="center" header-align="center">
+                  <template #default>
+                    <el-checkbox
+                      :model-value="checkedIds.includes(c.id)"
+                      @change="(v: boolean | string | number) => toggleContract(c.id, v)"
+                    />
+                  </template>
+                </el-table-column>
                 <el-table-column label="产品" min-width="180" align="left" header-align="left">
                   <template #default="{ row: l }">
                     <div class="rv-cell">
@@ -809,10 +817,11 @@ const pageReady = computed(() => proj.value != null)
 </template>
 
 <style scoped>
+/* 2026-11-10 UI：项目名放大 + 改深色（原 18px 灰不显眼）——与 h1 标题（22px/600）同规格，醒目 */
 .rh-name {
-  font-size: 18px;
-  color: var(--text-secondary);
-  font-weight: 500;
+  font-size: 22px;
+  color: var(--text-primary);
+  font-weight: 600;
   margin-left: 4px;
 }
 .back-link {
@@ -877,6 +886,12 @@ const pageReady = computed(() => proj.value != null)
   padding: 12px 16px;
   background: #f8fafc;
   border-bottom: 1px solid var(--border-color);
+}
+/* 2026-11-10 UI：合同总价常态文字改深蓝（品牌主色 #1769D4 的深色变体，比原正文色更醒目）；
+   hover/编辑态沿用 ClickEditNumber 既有浅蓝可编辑提示，不冲突。
+   选择器带 .rv-ct-right 前缀提升特异性，稳定压过组件内 .cen-view 常态色 */
+.rv-ct-right .rv-ct-amount :deep(.cen-view) {
+  color: #0f4c9e;
 }
 /* ADR-060：客户名称点击即改（ClickEditText）——常态文本 14px/600（合同头最醒目之一）；
    空客户名弱警示（会拦「确认下单」，复用「建设中」橙 token，不新增色值） */

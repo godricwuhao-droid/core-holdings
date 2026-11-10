@@ -427,8 +427,10 @@ async function submitDateDialog() {
         </div>
         <!-- FIX-20261022 / BUG-39：原 tooltip 包裹了整块动作按钮（hover 撤销/重新提交也会弹「已完成/已终止不可编辑」），
              现收窄到「编辑 / 审核订单」按钮本身 -->
+        <!-- 2026-11-10 UI：移除包裹全部按钮的外层 <span>——span 是行内元素，
+             使 .head-actions 的 flex gap 失效、按钮边框贴死重叠；
+             按钮直接作为 flex 子项，间距走全局 .page-head .head-actions（gap:8px + wrap，窄屏不破版） -->
         <div class="head-actions" v-if="project">
-          <span>
             <!-- ADR-051：商务主管/管理员「分配/改派」——任意项目（pending/active）可分配给某商务（editor），
                  复用 TransferDialog assign 模式 + claim 接口；editor 视角仍走下方「接手/转交」（ADR-012）
                  ADR-064：pending_assign（待分配）为主操作场景——主管/管理员在此分配后回落 pending -->
@@ -512,7 +514,6 @@ async function submitDateDialog() {
             <el-tooltip v-if="project.status === 'pending' && !canReview && !isViewer" :content="'待审核项目仅商务负责人（或管理员）可进入，请先接手'" placement="top">
               <el-button :icon="EditPen" type="warning" disabled>审核订单</el-button>
             </el-tooltip>
-          </span>
         </div>
       </div>
 

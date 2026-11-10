@@ -519,8 +519,15 @@ async function handleDelete(p: Project) {
           @change="onFilterChange"
           @keyup.enter="onFilterChange"
         />
-        <el-select v-model="statusFilter" placeholder="全部状态" clearable style="width: 140px;">
-          <el-option v-for="(s, k) in PROJECT_STATUS" :key="k" :label="s.label" :value="k" />
+        <!-- 2026-11-10 UI：状态筛选「待分配」同紫——选中展示（.sel-assign）与下拉选项（.opt-assign）均上同色 -->
+        <el-select v-model="statusFilter" placeholder="全部状态" clearable style="width: 140px;" :class="{ 'sel-assign': statusFilter === 'pending_assign' }">
+          <el-option
+            v-for="(s, k) in PROJECT_STATUS"
+            :key="k"
+            :label="s.label"
+            :value="k"
+            :class="k === 'pending_assign' ? 'opt-assign' : ''"
+          />
         </el-select>
         <el-select v-model="repFilter" placeholder="全部生态人员" clearable style="width: 150px;">
           <!-- 2026-10-20：label 显示姓名（value 保持原值用于匹配行数据） -->
@@ -577,7 +584,14 @@ async function handleDelete(p: Project) {
           <template #default="{ row }">
             <!-- ADR-041 / FLOW-20261022：终止态细分展示（已撤销 / 已驳回 / 已终止）——纯展示，
                  筛选下拉与按钮可用性仍按真实 status（后端只有 terminated） -->
-            <el-tag :type="projectOutcome(row, db.logs, db.contracts).tag" size="small" effect="light">
+            <!-- 2026-11-10 UI：待分配（pending_assign）自定义紫色（Element 无紫色 type，.tag-assign 见下方非 scoped 样式）；
+                 其余状态 tag 颜色不动 -->
+            <el-tag
+              :type="projectOutcome(row, db.logs, db.contracts).tag"
+              size="small"
+              effect="light"
+              :class="row.status === 'pending_assign' ? 'tag-assign' : ''"
+            >
               {{ projectOutcome(row, db.logs, db.contracts).label }}
             </el-tag>
           </template>
@@ -751,7 +765,13 @@ async function handleDelete(p: Project) {
             <div class="dr-title">
               <span class="dr-name">{{ drawerProject.name }}</span>
               <!-- ADR-041 / FLOW-20261022：抽屉头部同样细分终止成因（已撤销 / 已驳回 / 已终止） -->
-              <el-tag :type="projectOutcome(drawerProject, db.logs, db.contracts).tag" size="small" effect="light">
+              <!-- 2026-11-10 UI：与列表状态列同口径——待分配紫色 -->
+              <el-tag
+                :type="projectOutcome(drawerProject, db.logs, db.contracts).tag"
+                size="small"
+                effect="light"
+                :class="drawerProject.status === 'pending_assign' ? 'tag-assign' : ''"
+              >
                 {{ projectOutcome(drawerProject, db.logs, db.contracts).label }}
               </el-tag>
             </div>
@@ -956,6 +976,27 @@ async function handleDelete(p: Project) {
 
 <!-- 抽屉样式（非 scoped：抽屉内容挂载到 body，scoped 选择器无法命中） -->
 <style>
+/* 2026-11-10 UI：「待分配」（pending_assign）自定义紫色——Element 无紫色 type，
+   浅底深字仿 light 效果（#7C4DFF 系）；仅 pending_assign 用，其余状态色不动。
+   非 scoped：状态筛选下拉 teleport 到 body、选中展示为 EP 内部节点，scoped 选择器无法命中（同 ADR-040 口径） */
+.el-tag.tag-assign {
+  --el-tag-bg-color: rgba(124, 77, 255, 0.08);
+  --el-tag-text-color: #7c4dff;
+  --el-tag-border-color: rgba(124, 77, 255, 0.3);
+}
+/* 状态筛选下拉：「待分配」选项（含选中态）同紫 */
+.el-select-dropdown__item.opt-assign {
+  color: #7c4dff;
+}
+.el-select-dropdown__item.opt-assign.is-selected {
+  color: #7c4dff;
+  font-weight: 600;
+}
+/* 状态筛选选中后，选择框内展示文本同紫 */
+.sel-assign .el-select__placeholder {
+  color: #7c4dff;
+}
+
 /* ============ 项目快览抽屉（结构对齐产品快览抽屉） ============ */
 .project-drawer .el-drawer__header {
   margin-bottom: 0;
