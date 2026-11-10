@@ -2,6 +2,46 @@
 
 > 记录 core-holdings 前端（Vue3 + TS + Element Plus + Vite）的页面/组件/接口封装变更。
 
+## 2026-11-10 ｜ 购物车：库存行内提示回移数量列（修跨列错位）+ 删顶部 .cart-notice 说明条（ADR-063）
+
+> 范围：`src/views/cart/index.vue`。纯前端展示层，数据/接口/计算链/数量校验（ADR-061/062）/下单校验/参考区间逻辑零改动。① 库存提示（`已达上限 {x}` / `可售 {x}`）原在销售金额列副提示区（ADR-052 删「销售单价」列时迁入的遗留），与数量列数值跨列错位——回移数量列 `.cell-hint` 作 `v-else-if="typeof availOf(row) === 'number'"` 分支（前序 rsItem/isAmount/repeatSale 分支已排除，avail 为 null 不渲染，防 "可售 null"），`cart-sellable-max` 着色/文案原样保留，列内居中（两列均 align=center，回移后与数量值同轴）；金额列 `.cell-hint` 只留参考区间提示。② 删顶部 `.cart-notice` 说明条：模板（含 `InfoFilled` 图标）+ CSS 三组规则 + import 中 `InfoFilled` + 4 处引用「顶部提示条/迁移至销售金额列」的陈旧注释更新（必填口径/参考区间/数量约束仍由列头红星 + 列头 tooltip + 行内提示覆盖，必填校验不受影响）。isAmount（Token）行核实：`availOf` 对非 repeatSale 的 amount 模式行返回 **number**（`availableQty` = quantity−locked−shipped，后端 `set_cart_qty` 同样按 `_avail` 卡合计），即 Token 行**有** per-unit 库存上限——但数量列 isAmount 分支在前，Token 行仍只显 `X Token`（不堆两条提示），是否补库存提示待产品定夺。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-11-10 | 修改 | 购物车：①库存行内提示(已达上限/可售)从销售金额列回移数量列(v-else、列内居中)修跨列错位，金额列只留参考区间提示；②删顶部 .cart-notice 说明条(模板+CSS+InfoFilled import+陈旧注释) | src/views/cart/index.vue | ADR-063 | 纯前端展示层 |
+
+## 2026-11-10 ｜ 数量输入统一：购物车点击即改 + 审核页超库存截断（ADR-062）
+
+> 范围：`src/components/ClickEditNumber.vue`、`src/views/cart/index.vue`、`src/views/sales/projects/review.vue`。纯前端，后端不动（`PUT /cart/{id}`、review 确认接口、400 口径全不变），"只传变更"/`lineAmount→contractTotal` 计算链/派生/校验零改动。① `ClickEditNumber` 加 `max`（null/undefined=不限）/`maxMessage`/`disabled`：commit（失焦/回车）超上限 → 截断到 max + `ElMessage.warning(maxMessage)` 一次；Esc 还原不触发截断/提示；max 截断统一在 `closeEdit`（不透传 `:max` 给 el-input-number，避免 EP 原生钳值吞掉警告，保证只弹一次）；disabled 时常态文本不可点（cursor 非 pointer）。② 购物车：步进器（`.cart-stepper`/`.step-btn`/`.step-input` CSS、`stepQty`/`onQtyInput`/`onQtyCommit`/`qtyDrafts`/`qtyText`）整体删除，数量格换 `ClickEditNumber`（`:max="qtyMax(row)"` + 新增 `qtyMaxMsg(row)`、commit 走既有 `applyQty` PUT 链路、`qtyBusy` 在飞期间 disabled）；rs 明细行保持只读 `1`（`.step-value` 保留去边框）、repeatSale 不限、库存副提示保留；`applyQty` 截断分支因组件 emit 值恒 ≤ max 不触发（不双弹）。③ 审核页：`ReviewLine` 加 `assetId`（展开逻辑补存 `it.assetId`）+ `import availableQty`；新增 `qtyMax(l)` = rs→null / repeatSale→null / `max(origQty + availableQty(asset), 1)`（asset 缺失→max=origQty，与后端确认 400 口径 delta ≤ availableQty 一致）+ `qtyMaxMsg(l)`；数量 `ClickEditNumber` 加 `:max`/`:max-message`。提示文案两页统一：`「{产品名}」可用数量仅 {max}{单位}，已按上限填写`。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-11-10 | 修改 | 数量输入统一：购物车去+/-改点击即改(复用ClickEditNumber、max=avail截断+提示) + 审核页数量超库存截断对齐购物车(max=origQty+availableQty、Row存assetId+import availableQty)；ClickEditNumber 加 max/maxMessage/disabled；后端不动、只传变更/计算链不变 | src/components/ClickEditNumber.vue、src/views/cart/index.vue、src/views/sales/projects/review.vue | ADR-062 | 纯前端 |
+
+## 2026-11-10 ｜ 购物车数量输入优化：去 6 位硬限 + 长数字可见（ADR-061）
+
+> 范围：`src/views/cart/index.vue`（步进器内联）。纯前端，后端 400 口径不变。① 去 6 位硬限：`onQtyInput` 删 `.slice(0,6)`（保留 `\D` 非数字过滤）——库存上限（`qtyMax(row)=avail`、`applyQty` 超限截断+`ElMessage.warning`、加号到上限禁用、`PUT /cart/{id}` 400 回滚）成为唯一约束；`repeatSale` 行保持不限（`qtyMax=undefined`）；rs 明细行 qty 恒 1（不渲染 input）均不变。② 长数字可见：`.step-input` `text-align: center→left`（数字左锚定、光标在输入端）+ `onQtyInput` 值被过滤改变时 `setSelectionRange(len,len)` 把光标滚入可视区（scrollCaretIntoView 兜底）；适度加宽 `.cart-stepper` 104→128px、数量列 120→148px，让 ≤6-7 位免滚动完整显示（实测布局可接受，未退化）。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-11-10 | 修改 | 购物车数量输入优化：去6位硬限(onQtyInput 删 slice(0,6)→库存上限成唯一约束、repeatSale不限) + 长数字可见(text-align左对齐+输入滚到末尾+适度加宽/或退化) | src/views/cart/index.vue | ADR-061 | 纯前端，后端400不变 |
+
+## 2026-11-10 ｜ 审核订单页 review.vue 合同头字段点击即改 + 合同头字号调大（ADR-060）
+
+> 范围：`src/views/sales/projects/review.vue`、`src/components/ClickEditText.vue`（新增）。纯展示层改动：① 合同头「客户名称」常驻 `el-input` 改**点击即改**——新建文本型组件 `ClickEditText`（交互与 `ClickEditNumber` 完全一致：常态文本 + hover 主蓝提示、点击出 `el-input` 预填聚焦、失焦/回车提交（trim）、Esc 还原、模块级单编辑态、仅值变 emit；`maxlength=128`）；空客户名常态显弱警示「未填写客户名称」（`--warning-color`，会拦确认）。② 合同头「合同总价」常驻 `el-input-number` 改**点击即改**——复用 `ClickEditNumber`（`:min=0` + `amountInputFormatter/Parser` 组件内部复用）；`amount=null` 常态显弱提示「留空 = 明细合计」，有值显 `formatMoney(amount)`。③ 合同头字号调大：客户名 14px/600、「合同总价（元）」/「小计」标签 12px→13px、小计金额维持 16px/700 主色。小计 `.rv-ct-subtotal-val` 保持只读（仍显 `contractTotal(c.id)`）。客户名/合同总价提交仍写回同一响应式字段（`setContractField(c.id, 'customer'|'amount', v)`）→ 合同级"只传变更"（`contractsPayload` 变更检测）、确认校验（客户名空→拦）、`lineAmount→contractTotal→checkedTotal` 计算链、小计 `contractTotal` 全部零改动。清理旧 `.rv-ct-customer-input`/`.rv-ct-amount-input` 输入框样式与不再使用的 `amountInputFormatter/Parser` 导入；模板新增 `reviewContractOf(id)` 辅助函数取合同级字段。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-11-10 | 修改 | 审核页 review.vue 合同头：客户名称+合同总价改点击即改(客户名新建 ClickEditText/合同总价复用 ClickEditNumber、失焦/回车提交/Esc还原、小计只读) + 合同头字号调大(客户名~14px、标签~13px、小计金额维持16px)；纯展示层，合同级只传变更/确认校验/计算链不变 | src/views/sales/projects/review.vue、src/components/ClickEditText.vue(新增) | ADR-060 | |
+
+## 2026-11-10 ｜ 审核订单页 review.vue 优化（ADR-059：删说明条 + 点击即改 + 服务期限拆两列）
+
+> 范围：`src/views/sales/projects/review.vue`、`src/components/ClickEditNumber.vue`（新增）。纯展示层改动：① 删顶部 4 行 `.info-bar` 说明条（细节由合同头/列头 tooltip 覆盖）；② 实际单价(unit 行)/销售金额(amount·rs 行)/数量(非 rs 行) 常驻 `el-input-number` 改**点击即改**——新组件 `ClickEditNumber`（v-model 直绑 `l.price/l.qty/l.amount`，常态数值文本 + hover 主蓝提示，点击就地出框预填聚焦，失焦/回车提交、Esc 恢复原值，模块级注册保证全局单编辑态）；派生/不适用格保持静态不可点（unit 行销售金额派生只读+副区、amount/rs 行实际单价 `-`、rs 行数量 `1`）；③ 服务期限单列拆「开始时间/结束时间」两列表头（各自 `el-date-picker` 分别绑 `l.serviceStart/l.serviceEnd`，rs 行两列 `-`，列头 tooltip 保留）。计算链（lineAmount→contractTotal→checkedTotal）/只传变更（targetLines/contractsPayload）/orig* 变更检测/校验范围=勾选/派生与锁定零改动。注意：EP 2.14 `el-input-number` 无内置 Enter 处理，组件内 keydown capture 兜底回车提交。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-11-10 | 修改 | 审核页 review.vue 优化：删顶部说明条 + 实际单价/销售金额/数量改点击即改(保留6列、失焦/回车提交/Esc取消、派生/不适用格静态) + 服务期限拆"开始时间/结束时间"两列；纯展示层，计算链/只传变更/派生/校验不变 | src/views/sales/projects/review.vue、src/components/ClickEditNumber.vue(新增) | ADR-059 | |
+
 ## 2026-11-04 ｜ 账号/用户管理：列表客户端分页+过滤 + 建号随机密码 + 顶栏自助改密
 
 > 范围：`src/views/settings/users.vue`、`src/layouts/MainLayout.vue`、`src/api/index.ts`、`src/utils/randomPassword.ts`（新增）。① 账号列表客户端分页+过滤（`GET /users` 不变）：工具栏（关键字 username/name 忽略大小写 + 角色 + 状态）→ `filteredUsers`/`pagedUsers` computed 切片，`el-pagination`（10 条/页可切 10/20/50/100），过滤变更回第 1 页，统计卡保持基于全量。② 建号随机密码：`generateRandomPassword()`（crypto.getRandomValues，12 位，去易混 0/O/1/l/I，保证大小写+数字各至少 1，洗牌），新建弹窗密码框 `#append`「随机生成」按钮（编辑态不显示）。③ 顶栏 user-chip 改 `el-dropdown`（修改密码/退出登录，全角色可见，原独立退出按钮并入下拉）；改密弹窗（旧/新/确认，前端校验 ≥6 位 + 新=确认）→ `changeMyPassword` → **成功用返回的新 token `setSession` 换 token**（tokenVersion+1，不换则下次请求 401）+ 同步 currentUser；400「旧密码不正确」走 toast。
@@ -2329,5 +2369,6 @@
 | 2026-11-04 | 新增 | ADR-056 前端：销售项目列表 5 列服务端排序 + 详情页合同列表勾选/单一驳回(pending) + 新增产品统计页(按 subject 主体聚合、可展开对账、采购口径、viewer 不可见、finance 放开) | src/views/sales/projects/{index,detail}.vue、src/views/statistics/index.vue、src/router/index.ts、src/layouts/MainLayout.vue、src/api/index.ts | ADR-056 | 配合后端排序/reject-contracts |
 | 2026-11-04 | 重构 | 审核订单页 review.vue 美化（方案A 每合同一张表：合同头+el-table 明细、金额 center、info-bar、客户名降级）+ sticky 底部条（已选 N/M+勾选合计+确认/驳回）+ 每合同勾选(默认全选)部分确认/驳回（确认走 review contractIds、驳回复用 reject-contracts、reviewContracts 过滤 pending） | src/views/sales/projects/review.vue | ADR-057 | 配合后端部分确认 |
 | 2026-11-04 | 修复 | ADR-057 修复：部分确认/驳回后剩余 pending 合同丢失默认勾选(watch 改幂等默认全选) + 勾全选省略 contractIds 走整单(日志格式回归) | src/views/sales/projects/review.vue | ADR-057 | BUG-ADR057-001/OBS-ADR057-01 |
+| 2026-11-10 | 修改 | 流转日志(抽屉+详情)+分配下拉显示姓名而非账号：抽共享 username→name helper(最长优先+词边界+回退)、detail 展示处解析(存量+新日志生效)、TransferDialog 选项只显示姓名(值仍 username) | src/utils/userName.ts、src/views/sales/projects/{index,detail}.vue、src/components/TransferDialog.vue、src/api/index.ts | ADR-058 | 纯前端显示层 |
 
 > 验证：`vue-tsc --noEmit` EXIT=0，`read_lints` 0 诊断；后端区间口径已在副本库实测（超上限放行、低于下限 400、审核改价不受限）。未构建、未 commit。

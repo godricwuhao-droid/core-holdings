@@ -16,8 +16,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { useBack } from '@/composables/useBack'
 import { ArrowLeft, CircleCheck, InfoFilled, Money, UserFilled } from '@element-plus/icons-vue'
 import {
-  amountInputFormatter,
-  amountInputParser,
+  availableQty,
   entityShort,
   formatAmountValue,
   formatMoney,
@@ -42,6 +41,8 @@ import {
 } from '@/api'
 import { canAssign, canWrite, currentUser, isAdmin, isSupervisor } from '@/auth'
 import TransferDialog from '@/components/TransferDialog.vue'
+import ClickEditNumber from '@/components/ClickEditNumber.vue'
+import ClickEditText from '@/components/ClickEditText.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -77,6 +78,10 @@ function toggleContract(id: number, v: boolean | string | number) {
 function linesOf(contractId: number): ReviewLine[] {
   return reviewLines.value.filter((l) => l.contractId === contractId)
 }
+/** 某合同的审核级状态（模板取 customer/amount 用；reviewContracts 与 contracts 同序展开，find 兜底） */
+function reviewContractOf(contractId: number): ReviewContract | undefined {
+  return reviewContracts.value.find((x) => x.id === contractId)
+}
 
 function editItemName(it: { assetId?: number | null }): string {
   if (!it.assetId) return '未关联产品'
@@ -89,6 +94,7 @@ interface ReviewLine {
   contractId: number
   customer: string
   name: string
+  assetId: number | null // ADR-062：数量上限取 availableQty 用（asset 缺失 → 上限按 origQty 兜底）
   qty: number
   unit: string
   mode: 'unit' | 'amount' | 'rs' // rs=遥感明细行（2026-10-20：金额可改，仅本单生效不回写明细单价）
@@ -136,6 +142,7 @@ watch(contracts, (cs) => {
       return {
         id: it.id, contractId: c.id, customer: c.customer,
         name: editItemName(it) + (rs ? ` · ${rsItemName(rs)}` : ''),
+        assetId: it.assetId ?? null, // ADR-062：展开时已有 it.assetId，补存（qtyMax 用）
         qty: it.qty, unit: a?.unit || '',
         mode,
         // ADR-018 §2（PRICING-20261020）：原价取下单时快照 origPrice/origAmount（只读）；
@@ -154,6 +161,20 @@ watch(contracts, (cs) => {
   )
 }, { immediate: true })
 
+/** ADR-062：数量输入上限（对齐购物车截断口径）——审核行已锁定库存，
+ *  该行 max = origQty + 该资产剩余可售 availableQty（与后端确认 400 口径 delta ≤ availableQty 一致）；
+ *  repeatSale 行不限（null）；rs 明细行恒 1 不可改（不走本函数）；asset 缺失 → availableQty 取 0（max=origQty） */
+function qtyMax(l: ReviewLine): number | null {
+  if (l.mode === 'rs') return null
+  const a = l.assetId ? getAsset(l.assetId) : undefined
+  if (a?.repeatSale) return null
+  return Math.max(l.origQty + (a ? availableQty(a) ?? 0 : 0), 1)
+}
+/** 超上限截断警告文案（ADR-062，与购物车统一；max 不限时不用） */
+function qtyMaxMsg(l: ReviewLine): string {
+  const max = qtyMax(l)
+  return max == null ? '' : `「${l.name}」可用数量仅 ${max}${l.unit}，已按上限填写`
+}
 /** 行当前金额（unit=单价×数量 派生；amount/rs=行金额）——ADR-048：按 1e-6 规整 */
 function lineAmount(l: ReviewLine): number {
   if (l.mode === 'unit') return roundAmount((l.price ?? 0) * l.qty)
@@ -519,38 +540,35 @@ const pageReady = computed(() => proj.value != null)
               <div class="bh-title">订单审核<span class="muted" style="font-weight: 400;">（待审核 → 确认生效）</span></div>
             </div>
           </div>
-          <!-- 单一分层说明（ADR-057：换全局 .info-bar，删自造浅蓝样式）：收敛原 3 处重复操作说明（细节进 tooltip） -->
-          <div class="info-bar rv-rules">
-            <el-icon aria-hidden="true"><InfoFilled /></el-icon>
-            <ul class="rv-rules-list">
-              <li>可调整：合同总价 / 客户名称 / 实际单价 / 销售金额 / 数量 / 服务期限，点「确认下单」后生效</li>
-              <li>「确认下单 / 驳回」只作用于勾选的合同（默认全选）；未勾选合同保持待审核，可继续审核</li>
-              <li>终审价格仅作用于本订单，不回写平台产品单价</li>
-              <li>合同总价留空 = 按明细合计；填写后按明细行金额比例分摊（总额权威）；遥感明细行数量固定为 1，仅可改销售金额</li>
-            </ul>
-          </div>
+          <!-- ADR-059：顶部 4 行说明条已删（细节由合同头/列头 tooltip 覆盖） -->
           <!-- ADR-057 方案 A：每合同一张表——容器块（圆角 + 边框）= 合同头（勾选 + 客户名 + 主体 + 合同总价 + 小计）
                + 明细 el-table（表头一次声明列语义、行高统一、金额/数字列 center）；
                只展示 pending 合同（部分确认后已确认/已驳回自动移出，剩余可续审） -->
           <div class="rv-contracts">
             <div v-for="c in pendingContracts" :key="c.id" class="rv-ct">
-              <!-- 合同头（仿购物车 .table-head 范式，单行）：左 = 勾选 + 客户名（常规字号）+ 主体 tag；
-                   右 = 合同总价输入 + 小计（实时） -->
+              <!-- 合同头（仿购物车 .table-head 范式，单行）：左 = 勾选 + 客户名（点击即改，ADR-060）+ 主体 tag；
+                   右 = 合同总价（点击即改，ADR-060）+ 小计（实时只读） -->
               <div class="rv-ct-head">
                 <el-checkbox
                   :model-value="checkedIds.includes(c.id)"
                   @change="(v: boolean | string | number) => toggleContract(c.id, v)"
                 />
                 <!-- ADR-050：客户公司名称可改（trim 后非空、≤128 字，前端校验 + 后端兜底）；
-                     ADR-057：降级为常规 small 输入（原 16px/600 标题级删除） -->
-                <el-input
-                  :model-value="reviewContracts.find((x) => x.id === c.id)?.customer"
-                  @update:model-value="(v: string) => setContractField(c.id, 'customer', v)"
-                  size="small"
-                  class="rv-ct-customer-input"
-                  maxlength="128"
+                     ADR-060：改点击即改（ClickEditText：常态文本，点击出 el-input，失焦/回车提交 trim、Esc 还原）；
+                     空客户名 → 弱警示提示（会拦「确认下单」） -->
+                <ClickEditText
+                  class="rv-ct-customer"
+                  width="260px"
+                  :maxlength="128"
                   placeholder="客户公司名称"
-                />
+                  :model-value="reviewContractOf(c.id)?.customer ?? ''"
+                  @update:model-value="(v: string) => setContractField(c.id, 'customer', v)"
+                >
+                  <span v-if="(reviewContractOf(c.id)?.customer ?? '').trim()" class="rv-ct-customer-val">
+                    {{ reviewContractOf(c.id)?.customer }}
+                  </span>
+                  <span v-else class="rv-ct-customer-empty">未填写客户名称</span>
+                </ClickEditText>
                 <el-tag v-if="c.subject" size="small" effect="plain" class="rv-ct-subject">{{ entityShort(c.subject) }}</el-tag>
                 <div class="rv-ct-right">
                   <!-- ADR-050：合同总价（总额权威）——留空 = 按 Σ 明细派生；填写后确认后按明细行金额比例分摊 -->
@@ -558,17 +576,20 @@ const pageReady = computed(() => proj.value != null)
                   <el-tooltip content="填写后按各明细行金额比例分摊到明细（总额权威），合同总额 = 所填总价；留空则按明细合计。" placement="top">
                     <span class="rv-lbl-tip"><el-icon><InfoFilled /></el-icon></span>
                   </el-tooltip>
-                  <el-input-number
-                    :model-value="reviewContracts.find((x) => x.id === c.id)?.amount"
-                    @update:model-value="(v: number | null) => setContractField(c.id, 'amount', v)"
-                    size="small"
+                  <!-- ADR-060：合同总价改点击即改（复用 ClickEditNumber）；amount=null 常态显弱提示 -->
+                  <ClickEditNumber
+                    class="rv-ct-amount"
+                    width="150px"
                     :min="0"
-                    :controls="false"
-                    :formatter="amountInputFormatter"
-                    :parser="amountInputParser"
-                    class="rv-ct-amount-input"
+                    :model-value="reviewContractOf(c.id)?.amount ?? null"
+                    @update:model-value="(v: number | null) => setContractField(c.id, 'amount', v)"
                     placeholder="留空 = 明细合计"
-                  />
+                  >
+                    <span v-if="reviewContractOf(c.id)?.amount != null" class="rv-ct-amount-val">
+                      {{ formatMoney(reviewContractOf(c.id)!.amount!) }}
+                    </span>
+                    <span v-else class="rv-ct-amount-empty">留空 = 明细合计</span>
+                  </ClickEditNumber>
                   <span class="rv-ct-subtotal-lbl">小计</span>
                   <span class="rv-ct-subtotal-val">{{ formatMoney(contractTotal(c.id)) }}</span>
                 </div>
@@ -588,20 +609,27 @@ const pageReady = computed(() => proj.value != null)
                     </div>
                   </template>
                 </el-table-column>
-                <!-- ADR-050：数量可编辑（非遥感行，整数 ≥1，放大时后端校验可用库存）；遥感行恒 1 禁用 -->
+                <!-- ADR-050：数量可编辑（非遥感行，整数 ≥1，放大时后端校验可用库存）；
+                     ADR-059：点击即改（常态整数文本，点击出框）；遥感行恒 1 静态不可点；
+                     ADR-062：超上限（origQty+availableQty）截断 + 一次黄警告（repeatSale 不限） -->
                 <el-table-column label="数量" width="100" align="center" header-align="center">
                   <template #default="{ row: l }">
                     <div class="rv-cell">
                       <div class="cell-main cell-main-center">
-                        <el-input-number
+                        <ClickEditNumber
+                          v-if="l.mode !== 'rs'"
                           v-model="l.qty"
                           :min="1"
                           :precision="0"
                           :step="1"
-                          :controls="false"
-                          :disabled="l.mode === 'rs'"
-                          class="rv-qty-input"
-                        />
+                          :max="qtyMax(l)"
+                          :max-message="qtyMaxMsg(l)"
+                          width="64px"
+                          placeholder="数量"
+                        >
+                          {{ l.qty }}
+                        </ClickEditNumber>
+                        <span v-else class="muted rv-dash">1</span>
                         <span class="muted rv-unit">{{ l.unit }}</span>
                       </div>
                       <div class="cell-hint" aria-hidden="true"></div>
@@ -620,20 +648,20 @@ const pageReady = computed(() => proj.value != null)
                     </div>
                   </template>
                 </el-table-column>
-                <!-- 实际单价：unit 行可编辑（ADR-048：最多 6 位小数）；amount/rs 行不适用（显示 -） -->
+                <!-- 实际单价：unit 行可编辑（ADR-048：最多 6 位小数）；
+                     ADR-059：点击即改（常态 ¥ 千分位文本，点击出框）；amount/rs 行不适用（静态 -） -->
                 <el-table-column label="实际单价（元）" width="140" align="center" header-align="center">
                   <template #default="{ row: l }">
                     <div class="rv-cell">
-                      <div class="cell-main">
-                        <el-input-number
+                      <div class="cell-main cell-main-center">
+                        <ClickEditNumber
                           v-if="l.mode === 'unit'"
                           v-model="l.price"
                           :min="0"
-                          :controls="false"
-                          :formatter="amountInputFormatter"
-                          :parser="amountInputParser"
-                          class="rv-amount-input"
-                        />
+                          placeholder="实际单价"
+                        >
+                          {{ formatMoney(l.price) }}
+                        </ClickEditNumber>
                         <span v-else class="muted rv-dash">-</span>
                       </div>
                       <div class="cell-hint" aria-hidden="true"></div>
@@ -641,20 +669,20 @@ const pageReady = computed(() => proj.value != null)
                   </template>
                 </el-table-column>
                 <!-- 销售金额：amount/rs 行可编辑（ADR-048：最多 6 位小数；rs 行仅本单生效不回写明细单价）；
-                     unit 行 = 派生只读（单价×数量）+ 副区「参考单价 ≈ …」 -->
+                     ADR-059：点击即改（常态 ¥ 千分位文本，点击出框）；
+                     unit 行 = 派生只读（单价×数量，静态不可点）+ 副区「参考单价 ≈ …」 -->
                 <el-table-column label="销售金额（元）" width="160" align="center" header-align="center">
                   <template #default="{ row: l }">
                     <div class="rv-cell">
-                      <div class="cell-main">
-                        <el-input-number
+                      <div class="cell-main cell-main-center">
+                        <ClickEditNumber
                           v-if="l.mode !== 'unit'"
                           v-model="l.amount"
                           :min="0"
-                          :controls="false"
-                          :formatter="amountInputFormatter"
-                          :parser="amountInputParser"
-                          class="rv-amount-input"
-                        />
+                          placeholder="销售金额"
+                        >
+                          {{ formatMoney(l.amount) }}
+                        </ClickEditNumber>
                         <span v-else class="rv-line-amt">{{ formatMoney(lineAmount(l)) }}</span>
                       </div>
                       <div class="cell-hint">
@@ -665,22 +693,51 @@ const pageReady = computed(() => proj.value != null)
                     </div>
                   </template>
                 </el-table-column>
-                <!-- ADR-020（PRICING-20261020）：服务期限并入单列（原「每行第二层」删除，行变单层高）；
-                     普通行可改（选填）；遥感明细行按期数售卖不展示 -->
-                <el-table-column label="服务期限" min-width="320" align="center" header-align="center">
+                <!-- ADR-020（PRICING-20261020）：服务期限可改（选填）；
+                     ADR-059：单列拆「开始时间 / 结束时间」两个表头列（各自 el-date-picker，
+                     分别绑 l.serviceStart / l.serviceEnd，数据模型不变）；遥感明细行按期数售卖两列均 - -->
+                <el-table-column label="开始时间" width="150" align="center" header-align="center">
                   <template #header>
                     <el-tooltip content="选填（开始/结束日期需成对填写；遥感明细行按期数售卖，不填期限）" placement="top">
-                      <span>服务期限</span>
+                      <span>开始时间</span>
                     </el-tooltip>
                   </template>
                   <template #default="{ row: l }">
                     <div class="rv-cell">
                       <div class="cell-main cell-main-center">
-                        <div v-if="l.mode !== 'rs'" class="rv-service-row">
-                          <el-date-picker v-model="l.serviceStart" type="date" value-format="YYYY-MM-DD" size="small" placeholder="开始" class="rv-date" />
-                          <span class="muted">~</span>
-                          <el-date-picker v-model="l.serviceEnd" type="date" value-format="YYYY-MM-DD" size="small" placeholder="结束" class="rv-date" />
-                        </div>
+                        <el-date-picker
+                          v-if="l.mode !== 'rs'"
+                          v-model="l.serviceStart"
+                          type="date"
+                          value-format="YYYY-MM-DD"
+                          size="small"
+                          placeholder="开始"
+                          class="rv-date"
+                        />
+                        <span v-else class="muted rv-dash">-</span>
+                      </div>
+                      <div class="cell-hint" aria-hidden="true"></div>
+                    </div>
+                  </template>
+                </el-table-column>
+                <el-table-column label="结束时间" width="150" align="center" header-align="center">
+                  <template #header>
+                    <el-tooltip content="选填（开始/结束日期需成对填写；遥感明细行按期数售卖，不填期限）" placement="top">
+                      <span>结束时间</span>
+                    </el-tooltip>
+                  </template>
+                  <template #default="{ row: l }">
+                    <div class="rv-cell">
+                      <div class="cell-main cell-main-center">
+                        <el-date-picker
+                          v-if="l.mode !== 'rs'"
+                          v-model="l.serviceEnd"
+                          type="date"
+                          value-format="YYYY-MM-DD"
+                          size="small"
+                          placeholder="结束"
+                          class="rv-date"
+                        />
                         <span v-else class="muted rv-dash">-</span>
                       </div>
                       <div class="cell-hint" aria-hidden="true"></div>
@@ -798,18 +855,6 @@ const pageReady = computed(() => proj.value != null)
 .st-tag {
   flex-shrink: 0;
 }
-/* 单一分层说明（ADR-057：换全局 .info-bar 浅蓝信息条，删自造样式；此处只补间距与列表缩进） */
-.rv-rules {
-  margin-bottom: 16px;
-}
-.rv-rules-list {
-  margin: 0;
-  padding-left: 16px;
-}
-.rv-rules-list li {
-  margin: 2px 0;
-}
-
 /* ==================== ADR-057 方案 A：每合同一张表 ====================
    合同 = 容器块（10px 圆角 + --border-color 边框，合同间 16px 间距清晰分隔）：
    合同头（勾选 + 客户名 small + 主体 tag | 合同总价输入 + 小计）+ 明细 el-table
@@ -834,10 +879,18 @@ const pageReady = computed(() => proj.value != null)
   background: #f8fafc;
   border-bottom: 1px solid var(--border-color);
 }
-/* ADR-050：客户公司名称可改；ADR-057：降级为常规 small 输入（原 16px/600 标题级删除） */
-.rv-ct-customer-input {
-  width: 260px;
+/* ADR-060：客户名称点击即改（ClickEditText）——常态文本 14px/600（合同头最醒目之一）；
+   空客户名弱警示（会拦「确认下单」，复用「建设中」橙 token，不新增色值） */
+.rv-ct-customer {
   max-width: 100%;
+}
+.rv-ct-customer :deep(.cet-view) {
+  font-size: 14px;
+  font-weight: 600;
+}
+.rv-ct-customer-empty {
+  color: var(--warning-color);
+  font-weight: 500;
 }
 .rv-ct-subject {
   flex-shrink: 0;
@@ -853,7 +906,7 @@ const pageReady = computed(() => proj.value != null)
 .rv-lbl {
   flex-shrink: 0;
   white-space: nowrap;
-  font-size: 12px;
+  font-size: 13px; /* ADR-060：合同头标签 12px → 13px */
   color: var(--text-secondary);
 }
 /* 合同总价说明图标（tooltip 触发点） */
@@ -867,16 +920,14 @@ const pageReady = computed(() => proj.value != null)
 .rv-lbl-tip .el-icon {
   font-size: 14px;
 }
-.rv-ct-amount-input {
-  width: 150px;
-}
-.rv-ct-amount-input :deep(.el-input__inner) {
-  text-align: center;
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
+/* ADR-060：合同总价点击即改（ClickEditNumber）——常态数值文本（组件自带 13px/600 主色）；
+   amount=null 常态弱提示"留空 = 明细合计" */
+.rv-ct-amount-empty {
+  color: var(--text-secondary);
+  font-weight: 400;
 }
 .rv-ct-subtotal-lbl {
-  font-size: 12px;
+  font-size: 13px; /* ADR-060：小计标签 12px → 13px */
   color: var(--text-secondary);
   white-space: nowrap;
 }
@@ -930,32 +981,13 @@ const pageReady = computed(() => proj.value != null)
   font-size: 13px;
   color: var(--text-primary);
 }
-/* 数量输入（数字居中）+ 单位 */
-.rv-qty-input {
-  width: 64px;
-  flex-shrink: 0;
-}
-.rv-qty-input :deep(.el-input__inner) {
-  text-align: center;
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-}
+/* 数量单位（ADR-059：数量值由 ClickEditNumber 渲染，此处仅留单位） */
 .rv-unit {
   margin-left: 4px;
   font-size: 12px;
   white-space: nowrap;
 }
-/* 单价/金额输入框：占满列宽（仿购物车 .cart-amount-input），值居中、等宽数字 */
-.rv-amount-input {
-  width: 100%;
-  min-width: 0;
-}
-.rv-amount-input :deep(.el-input__inner) {
-  text-align: center;
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-}
-/* unit 行销售金额（派生只读：单价×数量） */
+/* unit 行销售金额（派生只读：单价×数量；ADR-059：单价/金额可编辑格由 ClickEditNumber 渲染） */
 .rv-line-amt {
   font-size: 13px;
   font-weight: 600;
@@ -971,17 +1003,12 @@ const pageReady = computed(() => proj.value != null)
   text-overflow: ellipsis;
   color: #71829a;
 }
-/* 服务期限双日期输入（各 136px，仿购物车；~ 分隔） */
-.rv-service-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-.rv-service-row :deep(.rv-date) {
+/* 服务期限日期输入（ADR-059：拆「开始时间/结束时间」两列，各 136px） */
+.rv-date {
   width: 136px;
   flex-shrink: 0;
 }
-/* 不适用占位「-」（amount/rs 行实际单价列、rs 行服务期限列）：整列宽内居中 */
+/* 不适用占位「-」（amount/rs 行实际单价列、rs 行数量/开始/结束时间列）：整列宽内居中 */
 .rv-dash {
   display: block;
   text-align: center;

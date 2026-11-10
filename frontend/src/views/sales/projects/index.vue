@@ -28,10 +28,13 @@ import {
   type Project,
   type ProjectStatus,
 } from '@/types'
-import { allUserOptions, changeProjectStatus, claimProject, db, deleteProject, getAsset, listProjects, refresh, showError, userOptions, type UserOption } from '@/api'
+import { changeProjectStatus, claimProject, db, deleteProject, getAsset, listProjects, refresh, showError, userOptions, type UserOption } from '@/api'
 import { canAssign, canWrite, currentUser, isViewer, isAdmin, isSupervisor, NO_PERM_TIP } from '@/auth'
 // ADR-042 / REFILL-20261022：「重新提交」动线收敛到 composable（与详情页共用同一套弹窗/失败/归属逻辑）
 import { useResubmitProject } from '@/composables/useResubmitProject'
+// ADR-058：全量启用账号（/users/options/all）模块级缓存 + username→name 展示解析
+import { useUserNameOptions } from '@/composables/useUserNameOptions'
+import { nameOf, resolveUserNames } from '@/utils/userName'
 import TransferDialog from '@/components/TransferDialog.vue'
 import WithdrawProjectDialog from '@/components/WithdrawProjectDialog.vue'
 
@@ -44,8 +47,8 @@ const repFilter = ref('')
 const ownerFilter = ref('') // ''=全部 | '__none__'=未指派 | username
 // 2026-10-20：显示映射（商务/生态 账号→姓名）用**全量**名册（/users/options/all）——
 // 原 /users/options 只有商务，生态 rep 查不到导致列表「生态人员」列裸账号外露
-const ownerOptions = ref<UserOption[]>([])
-allUserOptions().then((u) => { ownerOptions.value = u }).catch(() => {})
+// ADR-058：改走模块级缓存 composable（多页复用同一请求，不重复拉取）
+const ownerOptions = useUserNameOptions()
 // 商务负责人**筛选下拉**保持商务专属（businessOwner 只可能是商务账号）
 // FIX-20261022 / BUG-32（ADR-030 §5）：`GET /users/options` 已提权为 require_editor，
 // viewer 调用会 403 → 仅商务/管理员请求；viewer 侧筛选控件整块不渲染（见模板 v-if）
@@ -54,11 +57,10 @@ if (!isViewer.value) {
   userOptions().then((u) => { ownerFilterOptions.value = u }).catch(() => {})
 }
 
-/** username → 展示名（2026-10-20：只显示姓名，不带账号；对不上账号的存量自由文本原样显示） */
+/** username → 展示名（2026-10-20：只显示姓名，不带账号；对不上账号的存量自由文本原样显示）
+ *  ADR-058：口径统一收敛到共享 helper（nameOf，空 name 回退 username） */
 function ownerLabel(username?: string): string {
-  if (!username) return ''
-  const u = ownerOptions.value.find((x) => x.username === username)
-  return u?.name || username
+  return nameOf(username, ownerOptions.value)
 }
 /** 生态人员展示（rep 存 username，存量可能存姓名 → 统一显示姓名） */
 function repName(rep?: string): string {
@@ -833,7 +835,8 @@ async function handleDelete(p: Project) {
               :type="flowDotType(l)"
             >
               <div class="tl-action">{{ l.action }}</div>
-              <div class="tl-detail muted">{{ l.detail }}</div>
+              <!-- ADR-058：detail 自由文本中的 username 解析为姓名（最长优先+词边界，未知/空 name 回退原样） -->
+              <div class="tl-detail muted">{{ resolveUserNames(l.detail, ownerOptions) }}</div>
               <div v-if="isOutcomeEvent(l)" class="tl-reason">
                 原因：{{ outcomeReason(drawerProject, db.logs, db.contracts) || '（未填写）' }}
               </div>

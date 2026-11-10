@@ -11,10 +11,11 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Delete, InfoFilled, ShoppingCart, WarningFilled } from '@element-plus/icons-vue'
+import { Delete, ShoppingCart, WarningFilled } from '@element-plus/icons-vue'
 import { availableQty, entityShort, formatMoney, formatTokens, isAmountMode, isAmountTextValid, priceRangeText, roundAmount, rsItemName, sanitizeAmountInput, type Asset, type CartItem, type RsItem } from '@/types'
 import { checkoutCart, clearCart, db, genRequestId, getAsset, patchCartItem, refresh, removeCartItem, rsItemById, setCartAmount, setCartQty, setCartService, showError, type OrderFields } from '@/api'
 import SalesOrderDialog from '@/components/SalesOrderDialog.vue'
+import ClickEditNumber from '@/components/ClickEditNumber.vue'
 import type { OrderItem } from '@/components/SalesOrderDialog.vue'
 
 const router = useRouter()
@@ -337,6 +338,12 @@ function qtyMax(row: CartRow): number | undefined {
   return row.asset.repeatSale ? undefined : Math.max(availOf(row) ?? 0, 1)
 }
 
+/** 超上限截断警告文案（ADR-062，与审核页统一；max 不限时不用） */
+function qtyMaxMsg(row: CartRow): string {
+  const max = qtyMax(row)
+  return max == null ? '' : `「${row.asset.name}」可用数量仅 ${max}${row.asset.unit}，已按上限填写`
+}
+
 function goAssetDetail(assetId: number) {
   router.push(`/assets/${assetId}/detail`)
 }
@@ -364,7 +371,7 @@ function typeIcon(type: string): string {
   }
 }
 
-/** 数量变更提交；返回是否成功（stepQty 需据此决定是否提示重填销售金额） */
+/** 数量变更提交；返回是否成功（applyQty 据此决定是否提示重填销售金额） */
 async function onQtyChange(row: CartRow): Promise<boolean> {
   // ADR-011：遥感明细行数量恒 1（输入禁用，双保险拦截）
   if (row.rsItem) return false
@@ -386,59 +393,17 @@ async function onQtyChange(row: CartRow): Promise<boolean> {
   }
 }
 
-/** 步进器行级 in-flight 互斥（FIX-20261022 / BUG-25）：同行请求在飞期间禁用 ± 按钮/输入框，
- *  避免连点产生并发 PUT、响应乱序把镜像写回旧数量/旧金额 */
+/** 行级 in-flight 互斥（FIX-20261022 / BUG-25）：同行请求在飞期间禁用数量编辑
+ *  （ClickEditNumber disabled，ADR-062），避免连点产生并发 PUT、响应乱序把镜像写回旧数量/旧金额 */
 const qtyBusy = reactive<Record<number, boolean>>({})
 
-/** 数量输入本地草稿（2026-10-27 DIRECT-QTY-INPUT）：数量改为可直接键入——
- *  敲字只写草稿、不碰共享镜像，失焦/回车才提交（与 amountDrafts 同模式，按行 id 存） */
-const qtyDrafts = reactive<Record<number, string>>({})
-
-/** 输入框显示值：草稿优先，未编辑时回落到镜像值 */
-function qtyText(row: CartRow): string {
-  return qtyDrafts[row.cart.id] ?? String(row.cart.qty)
-}
-
-/** 键入过滤：只留数字（去掉负号/小数点/字母），最多 6 位（数量级远小于此） */
-function onQtyInput(row: CartRow, e: Event) {
-  const el = e.target as HTMLInputElement
-  const filtered = el.value.replace(/\D/g, '').slice(0, 6)
-  if (el.value !== filtered) el.value = filtered // 非法字符立即清掉，光标位置由浏览器保持
-  qtyDrafts[row.cart.id] = filtered
-}
-
-/** 数量提交（失焦 / 回车）：空、0、非整数 → 静默回退显示镜像值；未变更 → 直接收起草稿；
- *  变更 → 走 applyQty 的 PUT 提交链路（上限截断 / 400 回滚 / 金额被清空提示与 ± 同口径） */
-async function onQtyCommit(row: CartRow, e?: Event) {
-  const el = e?.target as HTMLInputElement | undefined
-  const raw = qtyDrafts[row.cart.id]
-  if (raw === undefined) return // change 与 blur 双触发：第二次已无草稿
-  delete qtyDrafts[row.cart.id]
-  if (row.rsItem || qtyBusy[row.cart.id]) {
-    if (el) el.value = String(row.cart.qty)
-    return
-  }
-  const n = Number(raw)
-  if (!raw.trim() || !Number.isInteger(n) || n < 1) {
-    if (el) el.value = String(row.cart.qty) // 非法输入静默回退，不弹提示（避免误触打扰）
-    return
-  }
-  if (n === row.cart.qty) {
-    if (el) el.value = String(n)
-    return
-  }
-  await applyQty(row, n, true)
-  // 提交后回写 DOM：可能被上限截断、400 回退或被 refresh 替换镜像（用最新镜像值兜底）
-  const fresh = db.cart.find((c) => c.id === row.cart.id)
-  if (el) el.value = String(fresh ? fresh.qty : row.cart.qty)
-}
-
-/** 数量落库（± 按钮与手工输入共用）：
- *  clampMax=true → 超可用上限时截断到上限并提示（手工输入 999 比「静默不生效」更易理解）；
- *  false → 直接忽略（± 按钮本就在上限处禁用，双保险） */
+/** 数量落库（ClickEditNumber commit 提交值，ADR-062）：
+ *  clampMax=true → 超可用上限时截断到上限并提示（双保险：主截断已由组件 max 完成，
+ *  组件 emit 的值恒 ≤ max，本分支实际不会触发，保证超上限只弹一次警告）；
+ *  false → 直接忽略 */
 async function applyQty(row: CartRow, next: number, clampMax = false) {
   if (row.rsItem) return // ADR-011：遥感明细行数量恒 1
-  if (qtyBusy[row.cart.id]) return // 本行上一次请求未回：忽略连点（按钮同时置灰）
+  if (qtyBusy[row.cart.id]) return // 本行上一次请求未回：忽略连点（编辑态同时禁用）
   if (next < 1) return
   let target = next
   const max = qtyMax(row)
@@ -468,12 +433,6 @@ async function applyQty(row: CartRow, next: number, clampMax = false) {
   } finally {
     delete qtyBusy[row.cart.id] // 只清自己的行锁（行 id 唯一，天然不误清新行）
   }
-}
-
-/** 步进器 ±1（2026-10-22 视觉优化：替代 el-input-number）：
- *  改数量后复用 applyQty 的 PUT 提交链路（含上限拦截 / 400 回滚），业务逻辑零变更 */
-async function stepQty(row: CartRow, delta: number) {
-  await applyQty(row, row.cart.qty + delta)
 }
 
 async function removeRow(row: CartRow) {
@@ -624,17 +583,8 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
     </el-card>
 
     <template v-else>
-      <!-- 规则提示条（2026-10-22 视觉优化：借鉴 cart-ui-demo.html notice 条，压缩为「标题 + 要点」，关键规则语义全保留） -->
-      <div class="cart-notice">
-        <el-icon aria-hidden="true"><InfoFilled /></el-icon>
-        <div>
-          <b>下单前请完善关键信息</b>
-          <!-- 2026-10-24（ADR-022）：必填口径——客户/销售金额必填；2026-10-26（ADR-047）服务期限改选填 -->
-          <!-- ADR-052（2026-11-04，取代 ADR-049 购物车只卡下限）：参考区间双向约束——销售金额须在区间内（不得低于下限、不得高于上限）；商务审核改价不限 -->
-          <span>每件产品必填客户、销售金额（元，最多 6 位小数且 &gt; 0），服务期限为选填（填则开始/结束日期须成对且开始不晚于结束；遥感明细行按期数售卖，不填期限）；设参考区间时销售金额须在参考区间内（<b>不得低于下限、不得高于上限</b>）；数量受产品可用数量约束（可重复售卖不受限）。下单后按「产品 + 客户」分组各生成一条销售记录，销售项目进入「待审核」并锁定数量，商务确认（可改价）后生效，再执行「交付」生成交付记录。</span>
-        </div>
-      </div>
-
+      <!-- ADR-063（2026-11-10）：顶部 .cart-notice 规则说明条已删——必填口径/参考区间/数量约束已由
+           列头红星 + 列头 tooltip + 行内提示覆盖，不再重复整段说明 -->
       <!-- 表格卡 -->
       <el-card shadow="never">
         <div class="table-head">
@@ -696,7 +646,7 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
                        :model-value 草稿优先（无草稿读已提交值），敲字只写草稿不碰 db.cart 镜像
                        （cartRows 不重算、无整表重建）；标红/placeholder 改读合并口径 customerValue
                        （草稿优先 trim 后），标红跟随输入草稿实时变化 -->
-                  <!-- 2026-10-25：用户反馈输入框 hover 提示「太碍事」，删除客户输入框 tooltip（分组规则见顶部提示条） -->
+                  <!-- 2026-10-25：用户反馈输入框 hover 提示「太碍事」，删除客户输入框 tooltip（分组规则见结算校验 + 列头 tooltip；ADR-063 后顶部说明条已删） -->
                   <el-input
                     :model-value="customerDraft(row)"
                     size="small"
@@ -711,62 +661,48 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
             </template>
           </el-table-column>
           <!-- ADR-052（2026-11-04）：「销售单价」列已删除——纯展示派生（挂牌价/明细价），小计/结算 payload 均不依赖；
-               其「可售/已达上限」库存提示已迁移至「销售金额」列副提示区；价格参考由「销售金额」列下参考区间提示承接 -->
-          <!-- 2026-10-22 视觉优化：数量列改自定义步进器 [−] 数值 [+]（借鉴 cart-ui-demo.html stepper，
-               替代上一批 96px el-input-number 写法）；± 点击走现有 onQtyChange PUT 提交链路，
-               上限（min=1 / max=可用上限）与「已达上限」语义保留（上限时 + 号禁用置灰） -->
+               其「可售/已达上限」库存提示 ADR-063（2026-11-10）已回移本列副提示区（修跨列错位）；
+               价格参考由「销售金额」列下参考区间提示承接 -->
+          <!-- ADR-062（2026-11-10）：去 +/- 步进器，数量改「点击即改」（复用 ClickEditNumber，与审核页统一）——
+               点击数值出框、失焦/回车提交走既有 applyQty PUT 链路、Esc 还原；
+               超上限截断 + 一次黄警告由组件 max/maxMessage 负责（applyQty 截断分支因值已 ≤ max 不触发，不双弹）；
+               遥感明细行数量恒 1 只读；repeatSale 行 max=undefined（不限）；列宽 148 维持（保证长数字可见） -->
           <!-- FT-20261022-F：表头显式居中（原缺省靠 align=center 继承，改为显式，避免日后改 align 波及表头） -->
-          <el-table-column label="数量" width="120" align="center" header-align="center">
+          <el-table-column label="数量" width="148" align="center" header-align="center">
             <template #default="{ row }">
-              <!-- 2026-10-23 修复①：统一单元格结构——步进器进主内容区，hint 进 18px 副提示区（无 hint 也渲染空占位） -->
+              <!-- 2026-10-23 修复①：统一单元格结构——数量控件进主内容区，hint 进 18px 副提示区（无 hint 也渲染空占位） -->
               <div class="cart-cell">
                 <div class="cell-main cell-main-center">
-                  <div class="cart-stepper">
-                    <!-- FIX-20261022 / BUG-25：本行请求在飞期间（qtyBusy）两个按钮一并禁用，
-                         避免连点造成并发 PUT / 响应乱序 -->
-                    <button
-                      type="button"
-                      class="step-btn"
-                      :disabled="!!row.rsItem || row.cart.qty <= 1 || !!qtyBusy[row.cart.id]"
-                      :aria-label="`减少${row.asset.name}数量`"
-                      @click="stepQty(row, -1)"
-                    >
-                      −
-                    </button>
-                    <!-- 2026-10-27（DIRECT-QTY-INPUT）：数量支持直接键入（原为只读 span，只能点 ±）——
-                         原生 input + 本地草稿：敲字不写镜像，失焦/回车提交，非法值静默回退、超上限截断提示；
-                         遥感明细行数量恒 1，保留只读展示 -->
-                    <input
-                      v-if="!row.rsItem"
-                      class="step-input"
-                      type="text"
-                      inputmode="numeric"
-                      autocomplete="off"
-                      :value="qtyText(row)"
-                      :disabled="!!qtyBusy[row.cart.id]"
-                      :aria-label="`${row.asset.name}数量，可直接输入`"
-                      @input="onQtyInput(row, $event)"
-                      @change="onQtyCommit(row, $event)"
-                      @keyup.enter="onQtyCommit(row, $event)"
-                      @blur="onQtyCommit(row, $event)"
-                    />
-                    <span v-else class="step-value">{{ row.cart.qty }}</span>
-                    <button
-                      type="button"
-                      class="step-btn"
-                      :disabled="!!row.rsItem || !!qtyBusy[row.cart.id] || (qtyMax(row) != null && row.cart.qty >= qtyMax(row)!)"
-                      :aria-label="`增加${row.asset.name}数量`"
-                      @click="stepQty(row, 1)"
-                    >
-                      ＋
-                    </button>
-                  </div>
+                  <ClickEditNumber
+                    v-if="!row.rsItem"
+                    :model-value="row.cart.qty"
+                    :min="1"
+                    :precision="0"
+                    :step="1"
+                    :max="qtyMax(row)"
+                    :max-message="qtyMaxMsg(row)"
+                    :disabled="!!qtyBusy[row.cart.id]"
+                    width="128px"
+                    @update:model-value="(v) => v != null && applyQty(row, v, true)"
+                  >
+                    {{ row.cart.qty }}
+                  </ClickEditNumber>
+                  <!-- ADR-011：遥感明细行数量恒 1，只读展示 -->
+                  <span v-else class="step-value">{{ row.cart.qty }}</span>
                 </div>
-                <!-- ADR-011：遥感明细行数量恒 1（双按钮禁用 + 提示）；「已达上限/可售」信息已移至单价列副文案 -->
+                <!-- ADR-011：遥感明细行数量恒 1（只读 + 提示）
+                     ADR-063（2026-11-10）：「已达上限/可售」库存提示回移本列（原在销售金额列，跨列错位）；
+                     前序分支已排除 rsItem/isAmount/repeatSale，avail 为 null（不限）时不渲染 -->
                 <div class="cell-hint">
                   <span v-if="row.rsItem" class="muted">遥感明细数量固定 1</span>
                   <span v-else-if="row.isAmount" class="muted">{{ formatTokens(row.cart.qty) }} Token</span>
                   <span v-else-if="row.asset.repeatSale" class="muted">不限</span>
+                  <span
+                    v-else-if="typeof availOf(row) === 'number'"
+                    :class="row.cart.qty >= (availOf(row) ?? 0) ? 'cart-sellable-max' : ''"
+                  >
+                    {{ row.cart.qty >= (availOf(row) ?? 0) ? `已达上限 ${availOf(row)}` : `可售 ${availOf(row)}` }}
+                  </span>
                 </div>
               </div>
             </template>
@@ -791,7 +727,7 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
                   <!-- CART-PERF-20261021（2026-10-21）：金额输入改本地草稿——
                        :model-value 草稿优先（无草稿读已提交值），敲字只写草稿不碰 db.cart 镜像 -->
                   <!-- 2026-10-25：用户反馈输入框 hover 提示「太碍事」，删除金额输入框 tooltip
-                       （必填口径见列头红星 + 顶部提示条，参考区间见下方提示行）
+                       （必填口径见列头红星，参考区间见下方提示行；ADR-063 后顶部说明条已删）
                        2026-10-29（ADR-048）：placeholder 改「必填，最多 6 位小数」（原「必填，整数元」） -->
                   <el-input
                     :model-value="amountDraft(row)"
@@ -810,16 +746,9 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
                        2026-10-20 修复：提示可见性——显式辅助色 #71829A（原 .muted #9aa9bf 过淡）、11px；
                        遥感行单位按 ADR-021 口径展示「份」（父产品 unit 为「份（可售明细）」容器口径，不宜直接展示）
                        ADR-039（NO-DISCOUNT-20261022）：提示行原「快捷换算摘要优先」分支删除，恒走参考区间
-                       ADR-052：原「销售单价」列删除，其「可售/已达上限」库存提示迁移至此（与区间提示同区，信息不丢） -->
+                       ADR-063（2026-11-10）：「可售/已达上限」库存提示回移数量列（修跨列错位），本列只留参考区间提示 -->
                   <span v-if="rowRangeText(row)" class="cart-amount-range">
                     参考区间 {{ rowRangeText(row) }} 元/{{ row.rsItem ? '份' : (row.asset.unit || '单位') }}（须在此范围内）
-                  </span>
-                  <!-- ADR-052：从已删除的「销售单价」列迁来的库存提示（可重复售卖/遥感行不展示） -->
-                  <span
-                    v-if="!row.rsItem && !row.asset.repeatSale"
-                    :class="row.cart.qty >= (availOf(row) ?? 0) ? 'cart-sellable-max' : ''"
-                  >
-                    {{ row.cart.qty >= (availOf(row) ?? 0) ? `已达上限 ${availOf(row)}` : `可售 ${availOf(row)}` }}
                   </span>
                 </div>
               </div>
@@ -1043,31 +972,6 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
   border-color: var(--warning-color);
 }
 
-/* 规则提示条：浅蓝底 + 蓝边框 + 圆角 12px + ⓘ 图标，「加粗标题 + 正文要点」 */
-.cart-notice {
-  display: flex;
-  gap: 10px;
-  align-items: flex-start;
-  background: #f0f6ff;
-  border: 1px solid #e0ecff;
-  border-radius: 12px;
-  padding: 13px 16px;
-  font-size: 13px;
-  color: var(--text-body);
-  line-height: 1.7;
-}
-.cart-notice .el-icon {
-  color: var(--primary-color);
-  font-size: 16px;
-  margin-top: 3px;
-  flex-shrink: 0;
-}
-.cart-notice b {
-  display: block;
-  color: var(--text-primary);
-  margin-bottom: 2px;
-}
-
 /* 产品信息列：42px 渐变圆角图标块（浅蓝→浅紫，系统色 --primary-light → --info-purple-bg） */
 .cart-product {
   display: flex;
@@ -1125,80 +1029,17 @@ async function onOrderSubmit(payload: { fields: OrderFields; items: { assetId: n
   font-weight: 600;
 }
 
-/* 数量步进器 [−] 数值 [+]：圆角 8px 边框容器、按钮 28px 灰底、数值居中可键入
-   2026-10-27（DIRECT-QTY-INPUT）：中区改 input 后由 96px 加宽到 104px（中区 48px），
-   保证 6 位数字（如 472）完整显示不被裁切；数量列宽 120px 内仍居中 */
-.cart-stepper {
-  display: inline-flex;
-  align-items: center;
-  width: 104px;
-  border: 1px solid var(--input-border);
-  border-radius: 8px;
-  overflow: hidden;
-  background: #fff;
-}
-.step-btn {
-  width: 28px;
-  height: 30px;
-  border: 0;
-  padding: 0;
-  background: #f7f9fc;
-  color: var(--text-body);
-  font-size: 15px;
-  line-height: 1;
-  cursor: pointer;
-  display: grid;
-  place-items: center;
-  flex-shrink: 0;
-}
-.step-btn:hover:not(:disabled) {
-  color: var(--primary-color);
-  background: var(--primary-light);
-}
-.step-btn:disabled {
-  color: #c3cddb;
-  cursor: not-allowed;
-}
+/* ADR-062（2026-11-10）：步进器（.cart-stepper/.step-btn/.step-input）已删——
+   数量改 ClickEditNumber 点击即改；.step-value 仅保留给遥感明细行只读「1」（去步进器边框） */
 .step-value {
-  flex: 1;
+  display: inline-block;
   min-width: 40px;
   text-align: center;
   font-size: 14px;
   font-weight: 600;
   color: var(--text-primary);
   font-variant-numeric: tabular-nums;
-  border-left: 1px solid var(--divider-color);
-  border-right: 1px solid var(--divider-color);
   line-height: 30px;
-}
-/* 2026-10-27（DIRECT-QTY-INPUT）：中间数值区改可键入 input——外观与只读态完全一致
-   （无边框/透明底/等宽数字），聚焦时浅蓝底提示「可编辑」，禁用态（请求在飞）灰字 */
-.step-input {
-  flex: 1;
-  min-width: 0;
-  width: 40px;
-  height: 30px;
-  border: 0;
-  padding: 0 2px;
-  background: transparent;
-  text-align: center;
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--text-primary);
-  font-variant-numeric: tabular-nums;
-  border-left: 1px solid var(--divider-color);
-  border-right: 1px solid var(--divider-color);
-  outline: none;
-  transition: background-color 0.15s;
-}
-.step-input:focus {
-  background: var(--primary-light);
-  color: var(--primary-color);
-}
-.step-input:disabled {
-  color: #c3cddb;
-  background: #f7f9fc;
-  cursor: not-allowed;
 }
 /* 2026-10-23 修复③：× 图标不明显，改回文字按钮「删除」；
    2026-10-24（ADR-022 批次）：默认即系统警示红 + 浅红底（danger-light-9，沿用系统色板），

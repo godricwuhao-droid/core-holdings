@@ -11,6 +11,8 @@ import { computed, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { claimProject, showError, userOptions, type UserOption } from '@/api'
 import { currentUser, isAdmin } from '@/auth'
+// ADR-058：username→name 展示解析（value 仍提交 username，仅显示层换姓名）
+import { nameOf } from '@/utils/userName'
 
 const SELF_KEY = '__self__'
 
@@ -49,7 +51,8 @@ const targets = computed(() =>
     .filter((o) => (isAssign.value ? o.role === 'editor' : true))
     .filter((o) => o.username !== props.project?.businessOwner),
 )
-const label = (o: UserOption) => (o.name ? `${o.name}（${o.username}）` : o.username)
+// ADR-058：选项只显示姓名（原「姓名（账号）」）；空 name 回退 username；value 仍提交 username（不动）
+const label = (o: UserOption) => (o.name || '').trim() || o.username
 const submitLabel = computed(() => {
   if (isAssign.value) return props.project?.businessOwner ? '确认改派' : '确认分配'
   return selected.value === SELF_KEY ? '确认接手' : '确认转交'
@@ -87,7 +90,8 @@ async function onConfirm() {
       <p class="tf-line">
         销售订单：<b>{{ project.name }}</b>
         <template v-if="project.businessOwner">
-          （当前负责人：<b>{{ project.businessOwner }}</b>）
+          <!-- ADR-058：当前负责人显示姓名（businessOwner 是 username，经 nameOf 解析；选项来自 /users/options，查不到回退原值） -->
+          （当前负责人：<b>{{ nameOf(project.businessOwner, options) }}</b>）
         </template>
       </p>
       <p class="tf-tip muted">
@@ -98,10 +102,11 @@ async function onConfirm() {
       <el-select v-model="selected" placeholder="请选择目标商务账号" style="width: 100%">
         <!-- 2026-10-19 排查修复：无主单 admin 也提供「接手给我」（原条件要求有主，admin 在编辑页无法接手）；
              ADR-051 分配模式不含该选项（下拉只列商务 editor） -->
+        <!-- ADR-058：显示当前用户姓名（name 为空回退 username） -->
         <el-option
           v-if="isAdmin && !isAssign"
           :value="SELF_KEY"
-          :label="`接手给我（admin · ${currentUser?.username}）`"
+          :label="`接手给我（admin · ${(currentUser?.name || '').trim() || currentUser?.username}）`"
         />
         <el-option v-for="o in targets" :key="o.username" :value="o.username" :label="label(o)" />
       </el-select>

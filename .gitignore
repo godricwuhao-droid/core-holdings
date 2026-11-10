@@ -12,6 +12,7 @@ npm-debug.log*
 # 本地数据（不入库）
 backend/core_holdings.db
 backend/core_holdings.db.bak*
+backend/backups/
 backend/uploads/
 
 # 日志
