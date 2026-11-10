@@ -1198,11 +1198,19 @@ function handleCancel() {
 </template>
 
 <style scoped>
-/* 内容区最大 1080px，居中 */
+/* 2026-11-10 UI：页面铺满（与 detail.vue / assets/create.vue 同一套）——去掉 max-width:1080px 居中，
+   24px 侧边距由外层全局 .page-container 提供，此处不再叠加 padding/margin（避免双重留白）；
+   表单整齐度：基本信息区已用 .form-grid-2（宽屏 2 列 / ≤680px 回落 1 列，全局规格），
+   明细行 el-table 自然铺满整宽，无需额外处理 */
 .create-wrap {
-  max-width: 1080px;
-  margin: 0 auto;
   width: 100%;
+}
+
+/* 2026-11-10 UI：满宽后窄屏（≤999px）基本信息两列回落单列（对齐 assets/create.vue 满宽表单窄屏规格），不破版 */
+@media (max-width: 999px) {
+  .create-form .form-grid-2 {
+    grid-template-columns: 1fr;
+  }
 }
 
 .create-form :deep(.el-form-item__label) {

@@ -2,6 +2,14 @@
 
 > 记录 core-holdings 前端（Vue3 + TS + Element Plus + Vite）的页面/组件/接口封装变更。
 
+## 2026-11-10 ｜ UI 优化：销售项目编辑页（create.vue，/projects/:id/edit）铺满
+
+> 范围：`src/views/sales/projects/create.vue`（新建/编辑复用同一页）。纯前端展示层，后端/接口/数据模型零改动。① `.create-wrap` 去 `max-width:1080px; margin:0 auto` 居中、改 `width:100%` 满宽（与 detail.vue `.detail-wrap`、assets/create.vue 同一套）；24px 侧边距由外层全局 `.page-container` 提供，`.create-wrap` 不叠加 padding/margin（避免双重留白）。② 满宽下表单整齐：基本信息区沿用全局 `.form-grid-2`（宽屏 2 列）；补 scoped `@media (max-width:999px)` 回落单列（对齐 assets/create.vue 满宽表单窄屏规格）；明细行 el-table 自然铺满整宽。create/edit 两模式同 `.create-wrap` 均满宽。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-11-10 | 修改 | 销售项目编辑页(create.vue, /projects/:id/edit)铺满(去 max-width:1080 居中, 外层 .page-container 供 24px; 表单满宽下按 core-holdings-ui 保持整齐) | src/views/sales/projects/create.vue | UI 优化 | |
+
 ## 2026-11-10 ｜ UI 优化：review 合同总价改"点击总价数字直接编辑" + 明细表列对齐/数量最大提示；statistics 金额列右对齐
 
 > 范围：`src/views/sales/projects/review.vue`、`src/views/statistics/index.vue`。纯前端展示层，后端/接口/数据模型零改动。① review 合同头：合同总价合并为单一可点击总价数字（`ClickEditNumber` model-value 绑 `contractTotal`——amount=null 时 = Σ 明细派生、已填时 = 所填值；点击编辑初始值即当前有效总价，提交写 `amount`、清空 → null 回退派生）；删"留空 = 明细合计"slot/placeholder 与独立"小计"标签+值；tooltip 文案更新；`min=0`/6 位小数校验（`contractInvalid`）/变更检测（amount vs origAmount）语义不变。② review 明细表：产品列表头 center→left；原单价/金额、实际单价、销售金额三列 `align="right" header-align="center"` + 新增 `.cell-main-right`（含 ClickEditNumber 常态文本/编辑框贴右、"参考单价 ≈ …"副提示 `.rv-derived` 右对齐）；数量列 `.cell-hint` 显"最大 {qtyMax(l)}"（repeatSale 不限不显、rs 行显"1"）。③ statistics：外层表剩余金额/采购总价 + 展开行内层表剩余金额/采购单价/采购总价 → `align="right" header-align="center"`（数量/产品数/剩余量/销售状态/主体/名称不动）。
