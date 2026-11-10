@@ -2,6 +2,14 @@
 
 > 记录 core-holdings 前端（Vue3 + TS + Element Plus + Vite）的页面/组件/接口封装变更。
 
+## 2026-11-10 ｜ UI 优化：review 合同总价改"点击总价数字直接编辑" + 明细表列对齐/数量最大提示；statistics 金额列右对齐
+
+> 范围：`src/views/sales/projects/review.vue`、`src/views/statistics/index.vue`。纯前端展示层，后端/接口/数据模型零改动。① review 合同头：合同总价合并为单一可点击总价数字（`ClickEditNumber` model-value 绑 `contractTotal`——amount=null 时 = Σ 明细派生、已填时 = 所填值；点击编辑初始值即当前有效总价，提交写 `amount`、清空 → null 回退派生）；删"留空 = 明细合计"slot/placeholder 与独立"小计"标签+值；tooltip 文案更新；`min=0`/6 位小数校验（`contractInvalid`）/变更检测（amount vs origAmount）语义不变。② review 明细表：产品列表头 center→left；原单价/金额、实际单价、销售金额三列 `align="right" header-align="center"` + 新增 `.cell-main-right`（含 ClickEditNumber 常态文本/编辑框贴右、"参考单价 ≈ …"副提示 `.rv-derived` 右对齐）；数量列 `.cell-hint` 显"最大 {qtyMax(l)}"（repeatSale 不限不显、rs 行显"1"）。③ statistics：外层表剩余金额/采购总价 + 展开行内层表剩余金额/采购单价/采购总价 → `align="right" header-align="center"`（数量/产品数/剩余量/销售状态/主体/名称不动）。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-11-10 | 修改 | review 合同总价改"点击总价数字直接编辑"(去"留空=明细合计"与独立小计、默认显Σ明细)、明细表产品表头靠左/原单价·实际单价·销售金额数据右对齐(表头居中)/数量下方显最大可填数；statistics 剩余金额·采购单价·采购总价数据右对齐(表头居中) | src/views/sales/projects/review.vue、src/views/statistics/index.vue | UI 优化 | |
+
 ## 2026-11-10 ｜ 卫星Token 计价归一 unit：去登记页特判 + 各页随 isAmountMode 归零自动走 unit 口径（ADR-065）
 
 > 范围：`src/views/assets/create.vue`、`src/constants.ts`。后端已迁（6 资产 `pricingMode` amount→unit、购物车/结算/审核对卫星Token 走 unit 口径），前端只读该值。① `create.vue` `isAmount` computed 去掉 `type==='卫星Token'` 特判——仅由资产实际 `pricingMode` 决定（迁移后恒 unit → 恒 false；新建无存量值 → false），「参考单价不参与计价」info-bar 与「X 份（可售份数）」提示随 `v-if` 自动隐（模板保留不删）；价格区间字段同普通商品保留。② `constants.ts` 卫星Token note 从「包量计价，合同金额最多 6 位小数」改 unit 口径「单价×数量计价，同普通商品」（`unit:'个'` 保留）。③ 购物车/审核/详情/交付的 amount 分支（cart 小计/`amountOutOfRange` 豁免/「X Token」副文案、review `mode`/实际单价列、outbound `qtyText`）因 `isAmountMode` 恒 false 自动走 unit 路径，未逐删死代码。
