@@ -1819,3 +1819,16 @@ repeatSale 明细短路，交付/终止都不再触碰它）。此时 `available
 
 > 验证（副本库）：区间 `[3,036,767, 3,066,834]` 下金额 3,680,200.80（超上限 20%）PATCH/PUT/checkout 全部通过且金额一致；2,429,413.60（低于下限）400；审核改价 9,200,502（3 倍上限）通过、7 位小数 400。`py_compile` + `vue-tsc` 通过，临时脚本已清理。
 > 未构建、未 commit；后端 `--reload` 已热加载。
+
+## 2026-11-10 ｜ 生产库（20261110）数据迁移至当前版本
+
+**关联任务**：数据迁移（生产旧库 → 当前代码版本，执行 + 校验 + 报告）。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-11-10 | 迁移 | 生产库(20261110)→当前版本：补 assets.taxPoint + 跑 ADR064/065/066（6 卫星Token→unit、1 购物车清空、遥感下架）；行数不变、contractAmount==Σitems 成立 | backend/core_holdings.db | 数据迁移 | 生产源只读、dev 已备份可回滚 |
+
+> 执行记录：`_ensure_migration` 幂等补 `assets.taxPoint`（31→32 列）；`ADR064_pending_assign_backfill` 回填 1 条（项目 27「生学」pending+无商务负责人→pending_assign）；`ADR066_rs_offshelf` 遥感数据资产 1 条（id 29）status→all_sold；`ADR065_sat_token_to_unit` 卫星Token 资产 6 条 amount→unit、购物车项 amount 清空 1 条（id 20）、明细一致性修正 0 条。
+> 终态校验（只读）：schema_migrations 12 个 marker；行数 projects=23/contracts=37/assets=33/project_items=37/rs_items=60 不变；37 份合同 contractAmount==Σ(project_items.amount) 全部成立；projects/contracts 状态值均在合法集内；无合同项目=0。
+> 冒烟：`GET /api/health` 200；`POST /api/auth/login` admin/123456 → 401（生产 admin 密码哈希与 dev 不同，需用生产凭据登录，端点正常）。
+> 备份：`backend/backups/core_holdings.db.dev-before-migrate-20261110.db`（回滚用）、`backend/backups/core_holdings.db.prod-src-20261110.db`（生产源双保险）；启动日志 `/tmp/migrate-start-20261110.log`。
