@@ -9,6 +9,7 @@
 | 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务 | 备注 |
 |---|---|---|---|---|---|
 | 2026-11-10 | 修改 | review 合同总价改"点击总价数字直接编辑"(去"留空=明细合计"与独立小计、默认显Σ明细)、明细表产品表头靠左/原单价·实际单价·销售金额数据右对齐(表头居中)/数量下方显最大可填数；statistics 剩余金额·采购单价·采购总价数据右对齐(表头居中) | src/views/sales/projects/review.vue、src/views/statistics/index.vue | UI 优化 | |
+| 2026-11-10 | 修改 | review/statistics 金额列表头改为右对齐(原单价/金额·实际单价·销售金额 + 剩余金额/采购单价/采购总价 表头 center→right；数量/产品表头保持) | src/views/sales/projects/review.vue、src/views/statistics/index.vue | UI 优化 | |
 
 ## 2026-11-10 ｜ 卫星Token 计价归一 unit：去登记页特判 + 各页随 isAmountMode 归零自动走 unit 口径（ADR-065）
 

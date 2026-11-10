@@ -124,15 +124,15 @@ const totalAvailable = computed(() => db.assets.reduce((s, a) => s + availQty(a)
                 <el-table-column label="剩余量" width="100" align="center">
                   <template #default="{ row: a }">{{ availQty(a) }}</template>
                 </el-table-column>
-                <el-table-column label="剩余金额" width="140" align="right" header-align="center">
+                <el-table-column label="剩余金额" width="140" align="right" header-align="right">
                   <template #default="{ row: a }">{{ formatMoney(availValue(a)) }}</template>
                 </el-table-column>
-                <el-table-column label="采购单价" width="130" align="right" header-align="center">
+                <el-table-column label="采购单价" width="130" align="right" header-align="right">
                   <template #default="{ row: a }">
                     <span :class="{ muted: a.salePrice == null }">{{ a.salePrice != null ? formatMoney(a.salePrice) : '-' }}</span>
                   </template>
                 </el-table-column>
-                <el-table-column label="采购总价" width="140" align="right" header-align="center">
+                <el-table-column label="采购总价" width="140" align="right" header-align="right">
                   <template #default="{ row: a }">{{ formatMoney(purchaseTotal(a)) }}</template>
                 </el-table-column>
                 <el-table-column label="销售状态" width="100" align="center">
@@ -154,10 +154,10 @@ const totalAvailable = computed(() => db.assets.reduce((s, a) => s + availQty(a)
         <el-table-column label="剩余量" width="110" align="center">
           <template #default="{ row }">{{ row.availableQty }}</template>
         </el-table-column>
-        <el-table-column label="剩余金额" width="150" align="right" header-align="center">
+        <el-table-column label="剩余金额" width="150" align="right" header-align="right">
           <template #default="{ row }">{{ formatMoney(row.availableValue) }}</template>
         </el-table-column>
-        <el-table-column label="采购总价" width="160" align="right" header-align="center">
+        <el-table-column label="采购总价" width="160" align="right" header-align="right">
           <template #default="{ row }">{{ formatMoney(row.purchaseTotal) }}</template>
         </el-table-column>
         <template #empty>

@@ -637,7 +637,7 @@ const pageReady = computed(() => proj.value != null)
                 </el-table-column>
                 <!-- ADR-018 §2（PRICING-20261020）：原价列只读——展示下单时挂牌价快照（unit=原单价、amount/rs=原金额）；
                      存量订单 orig 为空时数据层已按当前 price/amount 兜底（见 reviewLines 展开逻辑），恒展示 -->
-                <el-table-column label="原单价/金额（元）" width="120" align="right" header-align="center">
+                <el-table-column label="原单价/金额（元）" width="120" align="right" header-align="right">
                   <template #default="{ row: l }">
                     <div class="rv-cell">
                       <div class="cell-main cell-main-right">
@@ -649,7 +649,7 @@ const pageReady = computed(() => proj.value != null)
                 </el-table-column>
                 <!-- 实际单价：unit 行可编辑（ADR-048：最多 6 位小数）；
                      ADR-059：点击即改（常态 ¥ 千分位文本，点击出框）；amount/rs 行不适用（静态 -） -->
-                <el-table-column label="实际单价（元）" width="140" align="right" header-align="center">
+                <el-table-column label="实际单价（元）" width="140" align="right" header-align="right">
                   <template #default="{ row: l }">
                     <div class="rv-cell">
                       <div class="cell-main cell-main-right">
@@ -670,7 +670,7 @@ const pageReady = computed(() => proj.value != null)
                 <!-- 销售金额：amount/rs 行可编辑（ADR-048：最多 6 位小数；rs 行仅本单生效不回写明细单价）；
                      ADR-059：点击即改（常态 ¥ 千分位文本，点击出框）；
                      unit 行 = 派生只读（单价×数量，静态不可点）+ 副区「参考单价 ≈ …」 -->
-                <el-table-column label="销售金额（元）" width="160" align="right" header-align="center">
+                <el-table-column label="销售金额（元）" width="160" align="right" header-align="right">
                   <template #default="{ row: l }">
                     <div class="rv-cell">
                       <div class="cell-main cell-main-right">
