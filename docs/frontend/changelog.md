@@ -2,6 +2,14 @@
 
 > 记录 core-holdings 前端（Vue3 + TS + Element Plus + Vite）的页面/组件/接口封装变更。
 
+## 2026-11-10 ｜ 卫星Token 计价归一 unit：去登记页特判 + 各页随 isAmountMode 归零自动走 unit 口径（ADR-065）
+
+> 范围：`src/views/assets/create.vue`、`src/constants.ts`。后端已迁（6 资产 `pricingMode` amount→unit、购物车/结算/审核对卫星Token 走 unit 口径），前端只读该值。① `create.vue` `isAmount` computed 去掉 `type==='卫星Token'` 特判——仅由资产实际 `pricingMode` 决定（迁移后恒 unit → 恒 false；新建无存量值 → false），「参考单价不参与计价」info-bar 与「X 份（可售份数）」提示随 `v-if` 自动隐（模板保留不删）；价格区间字段同普通商品保留。② `constants.ts` 卫星Token note 从「包量计价，合同金额最多 6 位小数」改 unit 口径「单价×数量计价，同普通商品」（`unit:'个'` 保留）。③ 购物车/审核/详情/交付的 amount 分支（cart 小计/`amountOutOfRange` 豁免/「X Token」副文案、review `mode`/实际单价列、outbound `qtyText`）因 `isAmountMode` 恒 false 自动走 unit 路径，未逐删死代码。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务 | 备注 |
+|---|---|---|---|---|---|
+| 2026-11-10 | 修改 | 卫星Token 计价归一 unit：assets/create.vue isAmount 去 type==='卫星Token' 特判(去"参考单价不参与计价"提示)、constants note 改 unit 口径；购物车/审核/详情/交付随 isAmountMode 归零自动走 unit 口径(小计=单价×数量、超区间硬拦、实际单价列正常) | src/views/assets/create.vue、src/constants.ts | ADR-065 | 后端已迁 pricingMode=unit |
+
 ## 2026-11-10 ｜ 购物车：库存行内提示回移数量列（修跨列错位）+ 删顶部 .cart-notice 说明条（ADR-063）
 
 > 范围：`src/views/cart/index.vue`。纯前端展示层，数据/接口/计算链/数量校验（ADR-061/062）/下单校验/参考区间逻辑零改动。① 库存提示（`已达上限 {x}` / `可售 {x}`）原在销售金额列副提示区（ADR-052 删「销售单价」列时迁入的遗留），与数量列数值跨列错位——回移数量列 `.cell-hint` 作 `v-else-if="typeof availOf(row) === 'number'"` 分支（前序 rsItem/isAmount/repeatSale 分支已排除，avail 为 null 不渲染，防 "可售 null"），`cart-sellable-max` 着色/文案原样保留，列内居中（两列均 align=center，回移后与数量值同轴）；金额列 `.cell-hint` 只留参考区间提示。② 删顶部 `.cart-notice` 说明条：模板（含 `InfoFilled` 图标）+ CSS 三组规则 + import 中 `InfoFilled` + 4 处引用「顶部提示条/迁移至销售金额列」的陈旧注释更新（必填口径/参考区间/数量约束仍由列头红星 + 列头 tooltip + 行内提示覆盖，必填校验不受影响）。isAmount（Token）行核实：`availOf` 对非 repeatSale 的 amount 模式行返回 **number**（`availableQty` = quantity−locked−shipped，后端 `set_cart_qty` 同样按 `_avail` 卡合计），即 Token 行**有** per-unit 库存上限——但数量列 isAmount 分支在前，Token 行仍只显 `X Token`（不堆两条提示），是否补库存提示待产品定夺。
@@ -2370,5 +2378,6 @@
 | 2026-11-04 | 重构 | 审核订单页 review.vue 美化（方案A 每合同一张表：合同头+el-table 明细、金额 center、info-bar、客户名降级）+ sticky 底部条（已选 N/M+勾选合计+确认/驳回）+ 每合同勾选(默认全选)部分确认/驳回（确认走 review contractIds、驳回复用 reject-contracts、reviewContracts 过滤 pending） | src/views/sales/projects/review.vue | ADR-057 | 配合后端部分确认 |
 | 2026-11-04 | 修复 | ADR-057 修复：部分确认/驳回后剩余 pending 合同丢失默认勾选(watch 改幂等默认全选) + 勾全选省略 contractIds 走整单(日志格式回归) | src/views/sales/projects/review.vue | ADR-057 | BUG-ADR057-001/OBS-ADR057-01 |
 | 2026-11-10 | 修改 | 流转日志(抽屉+详情)+分配下拉显示姓名而非账号：抽共享 username→name helper(最长优先+词边界+回退)、detail 展示处解析(存量+新日志生效)、TransferDialog 选项只显示姓名(值仍 username) | src/utils/userName.ts、src/views/sales/projects/{index,detail}.vue、src/components/TransferDialog.vue、src/api/index.ts | ADR-058 | 纯前端显示层 |
+| 2026-11-10 | 新增 | 销售项目「待分配」状态 pending_assign：types.ts 加 label/中性色、状态筛选/tag 自动生效、按钮可见性审计(待分配: 主管/管理员显分配改派、不显审核、下单人显撤销)、outbound/bootstrap 过滤含 pending_assign、复用 TransferDialog 分配 | src/types.ts、src/views/sales/projects/index.vue、src/views/sales/projects/detail.vue、src/views/sales/outbound/index.vue、src/api/index.ts | ADR-064 | 后端已返回 pending_assign |
 
 > 验证：`vue-tsc --noEmit` EXIT=0，`read_lints` 0 诊断；后端区间口径已在副本库实测（超上限放行、低于下限 400、审核改价不受限）。未构建、未 commit。

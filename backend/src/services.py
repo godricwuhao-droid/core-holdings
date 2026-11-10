@@ -662,9 +662,10 @@ def create_asset(db: Session, data: schemas.AssetInput, operator: str = "") -> m
         featureDoc=data.featureDoc,
         contractFile=data.contractFile,
         remark=data.remark, updatedAt=today(),
-        # ADR-008：计价模式由后端按类型权威决定（卫星Token → 'amount'，其余恒 'unit'），
-        # 不接受前端传 pricingMode 篡改类型映射
-        pricingMode="amount" if data.type == "卫星Token" else "unit",
+        # ADR-065：计价模式恒 'unit'（单价×数量）——卫星Token 归一为普通商品，
+        # ADR-008 的「卫星Token → amount」类型特判已去除；不接受前端传 pricingMode
+        # （字段保留，amount 模式代码路径保留为死代码，归一后不再命中）
+        pricingMode="unit",
     )
     # 状态两态规则：由数量自动判定，不采信前端 status（与 update_asset/refresh_status 口径一致）
     # ——修复：此前直接信任 data.status（前端恒传 in_stock），quantity=0 的非重复售卖产品会被误存为「可售」
@@ -790,10 +791,11 @@ def update_asset(db: Session, asset_id: int, patch: dict, operator: str = "admin
         else:
             unit = {"quantity": a.unit}.get(k, "")
             changes.append(f"{label}: {old} → {v}" + (f" {unit}" if unit else ""))
-    # FIX-20261020-#8：type 变更时重算 pricingMode（卫星Token → amount，其余 → unit），
+    # FIX-20261020-#8：type 变更时重算 pricingMode——
+    # ADR-065：恒 'unit'（卫星Token 归一为普通商品，不再按类型置 amount），
     # 与新建逻辑（create_asset）一致——pricingMode 不在可更新白名单内，只能由类型权威推导
     if "type" in patch and patch["type"] != old_type:
-        new_mode = "amount" if patch["type"] == "卫星Token" else "unit"
+        new_mode = "unit"
         if a.pricingMode != new_mode:
             changes.append(f"计价模式: {a.pricingMode} → {new_mode}")
             a.pricingMode = new_mode
@@ -1344,9 +1346,14 @@ def _refill_owner_brief(u: models.User | None) -> dict | None:
 
 
 def _refill_cart_from_project(db: Session, p: models.Project, target_user_id: str, *,
-                              mode: str = "merge") -> dict:
+                              mode: str = "merge",
+                              items: list[models.ProjectItem] | None = None) -> dict:
     """把项目全部明细回填 `target_user_id` 的购物车（ADR-026 §4 口径，ADR-027 两处复用，
     ADR-042 增补「同键替换 / mode / 逐行结果」）。
+
+    ADR-066 撤单语义：`items` 可选——提供时只回填该子集（撤单只回填**被终止的 pending
+    合同**明细，保留的 active/delivering/delivered 合同不回填）；缺省 = 项目全部明细
+    （`refill_project_cart` 重新提交口径不变）。
 
     **唯一实现**：`withdraw_project`（撤销）与 `refill_project_cart`（重新提交）都调本函数，
     避免「客户/数量/金额/服务期限/折扣率/遥感明细 itemId」两套口径漂移。
@@ -1410,7 +1417,8 @@ def _refill_cart_from_project(db: Session, p: models.Project, target_user_id: st
     # planned = [(明细, 行级客户, 是否可行, 不可行原因, rows[].code)]，顺序 = p.items 顺序。
     # REFILL-20261022-B3：第 5 位 code 与第 4 位 reason 一一对应（reason 文案不动，只并出结构化类别）。
     planned: list[tuple[models.ProjectItem, str, bool, str, str]] = []
-    for it in list(p.items):
+    # ADR-066 撤单语义：items 子集（撤单只回填被终止的 pending 合同明细）；缺省 = 全部明细
+    for it in (list(items) if items is not None else list(p.items)):
         a = get_asset(db, it.assetId)
         if not it.assetId:
             planned.append((it, "", False, f"明细 #{it.id} 未关联产品，无法回填购物车",
@@ -1483,10 +1491,19 @@ def _refill_cart_from_project(db: Session, p: models.Project, target_user_id: st
             assetId=it.assetId, qty=it.qty, customer=customer, itemId=it.itemId,
             serviceStart=it.serviceStart, serviceEnd=it.serviceEnd,
         )
+        # ADR-066 #1（高 bug 修复）：unit 行回填**单价** `it.price`——购物车 unit 行
+        # `amount` 字段语义是单价（结算再 ×qty，见 checkout 计价注释）；原实现误填行总额
+        # `it.amount`(=price×qty) → 再结算 ×qty 放大（×qty² 多收）。
+        # rs 行（itemId 非空，qty≡1 单价=总额）/ amount 语义行（包量总额权威）保持 `it.amount`。
+        _a = get_asset(db, it.assetId)  # 预检阶段已取过，identity map 不再发 SQL
+        if it.itemId is None and _a is not None and not _is_amount_mode(_a):
+            refill_amount = it.price or None
+        else:
+            refill_amount = it.amount or None
         first_err = ""
         try:
             # ADR-042 §1：回填走「同键替换」，不累加（重试不翻倍）
-            _cart_add_inner(db, schemas.CartItemInput(amount=it.amount or None, **base),
+            _cart_add_inner(db, schemas.CartItemInput(amount=refill_amount, **base),
                             user_id=target_user_id,  # type: ignore[arg-type]
                             existing_policy="replace")
             restored += 1
@@ -1494,8 +1511,8 @@ def _refill_cart_from_project(db: Session, p: models.Project, target_user_id: st
             continue
         except HTTPException as exc:
             first_err = str(exc.detail)
-        if not it.amount:
-            # 订单行本就无折扣金额（原价成交口径），无降级空间 → 跳过
+        if not refill_amount:
+            # 订单行本就无折扣金额/单价（原价成交口径），无降级空间 → 跳过
             # REFILL-20261022-B3：写阶段校验失败（区间不符 / 金额校验等）统一归 "other"
             skipped += 1
             reason = f"{label}：{first_err}"
@@ -1530,20 +1547,24 @@ def _refill_cart_from_project(db: Session, p: models.Project, target_user_id: st
 def withdraw_project(db: Session, project_id: int, reason: str, user: models.User) -> dict:
     """POST /projects/{id}/withdraw（ADR-026）：生态人员「撤销」自己提交的待审核订单。
 
-    语义 = **终止原单 + 全部明细自动回填下单人购物车**（原单保留 terminated 历史，不删除）：
+    语义 = **终止原单 + 明细自动回填下单人购物车**（原单保留 terminated 历史，不删除）：
     ① 逐合同 pending → terminated（复用 `_change_contract_status_core`：释放真实锁定 +
        `cancel_release` 流水 + OpLog），并在合同 remark 追加「撤销：{reason}」留痕
        （`_change_contract_status_core` 只把 reason 写进 OpLog，不写 remark，故此处补写；
        追加而非覆盖，且已含同文案时不重复追加）；
-    ② 项目 status 置 terminated（含存量无合同项目）+ `_recompute_project` 保持
-       金额/客户/主体派生口径一致；
-    ③ 有商务负责人则解绑（置空）并留痕；
+       **ADR-066 §1（撤单语义修正）：只终止 `status=='pending'` 的合同**——已确认/已交付
+       （active/delivering/delivered）合同保留不动；
+    ② ADR-066 §1：项目**剩余非 pending 合同** → 保留 businessOwner + `_recompute_project`
+       派生状态（通常 active/delivering，**不强制 terminated**）；**无剩余**（全 pending
+       被终止 / 存量无合同项目）→ 整单 terminated（维持现状行为）；
+    ③ 有商务负责人且无保留合同则解绑（置空）并留痕（ADR-066 §1：有保留合同不解绑）；
     ④ 逐明细调 `_refill_cart_from_project`（ADR-027 共享实现，ADR-042 传 `mode="merge"`）
        回填**下单人**购物车（保留客户/数量/金额/服务期限/遥感明细 itemId；判重键
        (userId, assetId, itemId, customer) 命中即**覆盖**，不累加——ADR-042 §1 顺带修掉
        「撤销后同键行翻倍」），并置 `p.cartRefilled = True`
        （幂等标记：之后点「重新提交」不再重复回填）；
-       ⚠️ 撤销**不清空**购物车（`mode="merge"`），OpLog 文案与本函数返回结构一字未改；
+       **ADR-066 §1：只回填被终止的 pending 合同明细**（保留合同不回填）；
+       ⚠️ 撤销**不清空**购物车（`mode="merge"`），本函数返回结构不变；
     ⑤ OpLog（`撤销订单`）+ 路由层审计。
 
     回填容错（ADR-026 §4）：单行因区间/可售/数据缺失无法回填时**不中断撤销**——
@@ -1555,8 +1576,9 @@ def withdraw_project(db: Session, project_id: int, reason: str, user: models.Use
         raise HTTPException(404, "销售项目不存在")
     if not _can_withdraw(p, user):
         raise HTTPException(403, "只能撤销自己提交的订单")
-    if p.status != "pending":
-        raise HTTPException(400, "仅待审核订单可撤销")
+    # ADR-064：待分配（pending_assign）与待审核同属审核前状态，均可撤销（保持现状口径）
+    if p.status not in ("pending", "pending_assign"):
+        raise HTTPException(400, "仅待分配/待审核订单可撤销")
     reason = (reason or "").strip()
     if not reason:
         raise HTTPException(400, "请填写撤销原因")
@@ -1569,9 +1591,16 @@ def withdraw_project(db: Session, project_id: int, reason: str, user: models.Use
     note = f"撤销：{reason}"
 
     # ① 合同 pending → terminated（复用终止链路：释放真实锁定 + cancel_release 流水 + 留痕）
+    # ADR-066 §1（撤单语义修正）：**只终止 status=='pending' 的合同**——已确认/已交付
+    # （active/delivering/delivered）合同保留不动（部分确认后撤销 = 撤未确认部分）；
+    # 全 pending 项目（无 active 等）行为与现状一致（全部终止）。
+    terminated_contracts: list[models.Contract] = []
     if p.contracts:
         for c in list(p.contracts):
+            if c.status != "pending":
+                continue  # ADR-066 §1：保留已确认/已交付合同
             _change_contract_status_core(db, c, "terminated", note, operator=user.username)
+            terminated_contracts.append(c)
             # remark 留痕：追加而非覆盖（保留下单备注）；已含同文案则不重复追加
             if note not in (c.remark or ""):
                 c.remark = f"{c.remark}｜{note}" if (c.remark or "").strip() else note
@@ -1580,20 +1609,37 @@ def withdraw_project(db: Session, project_id: int, reason: str, user: models.Use
         # 存量兼容（无合同项目）：沿用旧的全量释放语义
         _terminate_project(db, p, note, operator=user.username)
 
+    # ADR-066 §1：项目是否剩余非 pending 合同（active/delivering/delivered 保留）——
+    # 有 → 保留负责人 + 派生状态（通常 active/delivering，**不强制 terminated**）；
+    # 无（全 pending 被终止 / 无合同）→ 整单终止（解绑负责人 + terminated，维持现状）。
+    # 注：pending 合同终止后为 terminated，故「非 terminated 合同」即保留合同；
+    # 全 pending 项目（全部被终止）→ has_kept=False → 整单终止（同现状，不回归）。
+    has_kept = bool(p.contracts) and any(c.status != "terminated" for c in p.contracts)
+
     # ② 解绑商务负责人（留痕进下方 OpLog，避免额外日志噪声）
-    old_owner = (p.businessOwner or "").strip()
-    if old_owner:
-        p.businessOwner = ""
+    # ADR-066 §1：仅剩被终止合同（无保留合同）才解绑；有保留合同 → 负责人继续负责
+    old_owner = ""
+    if not has_kept:
+        old_owner = (p.businessOwner or "").strip()
+        if old_owner:
+            p.businessOwner = ""
 
     # ③ 项目终态 + 派生字段重算（金额/客户/主体随合同口径保持一致）
     _recompute_project(p)
-    p.status = "terminated"  # 显式终态（无合同项目派生结果为 active，必须覆盖）
+    if not has_kept:
+        p.status = "terminated"  # 显式终态（无合同项目派生结果为 active，必须覆盖）
     p.updatedAt = today()
 
     # ④ 逐明细回填下单人购物车（共享实现：单行失败绝不中断整体撤销）
     # ADR-042 §2：撤销固定 `mode="merge"`（**不清空**购物车），但自动获得 replace 的
     # upsert 语义（同键覆盖不累加）；返回结构与 OpLog 文案保持原样，不携带 mode 字段
-    refill = _refill_cart_from_project(db, p, target_user_id, mode="merge")
+    # ADR-066 §1：**只回填被终止的 pending 合同**明细（保留合同不回填）；
+    # 全 pending / 无合同项目 = 全部明细（与现状一致，不回归）
+    refill_items = (
+        [it for c in terminated_contracts for it in c.items]
+        if p.contracts else list(p.items)
+    )
+    refill = _refill_cart_from_project(db, p, target_user_id, mode="merge", items=refill_items)
     restored = refill["restored"]
     amount_fallback = refill["amountFallback"]
     skipped = refill["skipped"]
@@ -1605,8 +1651,14 @@ def withdraw_project(db: Session, project_id: int, reason: str, user: models.Use
     p.cartRefilled = (skipped == 0)
 
     # ⑤ OpLog（详情尾注解绑信息，保持「1 次撤销 = 1 条撤销日志」）
-    detail = (f"待审核订单已撤销，{restored} 行明细回填购物车"
+    # ADR-066 §1：部分确认场景注明保留合同数（只撤 pending 合同）
+    kept_count = (sum(1 for c in p.contracts if c.status != "terminated")
+                  if p.contracts else 0)
+    detail = (f"待审核订单已撤销，{len(terminated_contracts)} 条待审核销售记录已终止，"
+              f"{restored} 行明细回填购物车"
               f"（原价回填 {amount_fallback} 行，跳过 {skipped} 行），原因：{reason}")
+    if kept_count:
+        detail += f"；{kept_count} 条已确认/已交付销售记录保留"
     if old_owner:
         detail += f"；原商务负责人 {old_owner} 已解绑"
     if skipped:
@@ -2132,26 +2184,31 @@ def _apply_item_release(db: Session, it: models.ProjectItem, operator: str = "",
 
 
 def _derive_project_status(p: models.Project) -> str:
-    """项目状态派生（ADR-007；ADR-019 §3 扩展，PRICING-20261020 新增 delivering）：
+    """项目状态派生（ADR-007；ADR-019 §3 扩展，PRICING-20261020 新增 delivering；
+    ADR-064 新增 pending_assign）：
 
     | 合同状态集合 | 项目状态 |
     |---|---|
-    | 全 pending | pending（待审核） |
-    | {pending, terminated} 且含 pending（ADR-056 §2：部分驳回，剩余可续审） | pending（待审核） |
-    | 含 pending 且其余 ⊆ {active, delivering, delivered, terminated}（ADR-057 §3：部分确认，剩余可续审） | pending（待审核） |
+    | 全 pending | pending（待审核）；**businessOwner 为空 → pending_assign（待分配，ADR-064）** |
+    | {pending, terminated} 且含 pending（ADR-056 §2：部分驳回，剩余可续审） | pending（待审核）；同上无主 → pending_assign |
+    | 含 pending 且其余 ⊆ {active, delivering, delivered, terminated}（ADR-057 §3：部分确认，剩余可续审） | pending（待审核）；同上无主 → pending_assign |
     | 全 delivered | delivered（已完成） |
     | ⊆ {delivered, terminated} 且含 delivered（BUG-17：已交付 + 剩余作废） | delivered（已完成） |
     | 含 terminated 且其余全 terminated（无 pending） | terminated |
     | 全部合同 status ∈ {delivering, delivered}（即全部已签，含已交付） | delivering（交付中） |
     | 其余（含 active 未签完） | active（进行中） |
 
-    无合同→active（存量兼容）。"""
+    无合同→active（存量兼容）。
+    ADR-064：派生结果为 pending 的分支叠加 businessOwner 判定——**合同含 pending 且
+    businessOwner 为空 → pending_assign（待分配）**（仅 supervisor/admin 可见/可分配，
+    见 user_sees_project）；分配（claim 设 businessOwner）后重算回落 pending。
+    部分确认/部分驳回的混合态虽也派生 pending，但必然已分配 owner，不会误判待分配。"""
     contracts = p.contracts
     if not contracts:
         return "active"
     statuses = {c.status for c in contracts}
     if statuses == {"pending"}:
-        return "pending"
+        return _pending_or_pending_assign(p)
     # BUG-17 / ADR-032 §5：{delivered} 与 {delivered, terminated} 均判「已完成」
     # （已交付的部分作废，项目不再显示「进行中」，也不再让项目级接口永久 400）
     if statuses <= {"delivered", "terminated"} and "delivered" in statuses:
@@ -2165,13 +2222,23 @@ def _derive_project_status(p: models.Project) -> str:
     #   本分支为纯新增，无存量行为变化。
     if "pending" in statuses and statuses <= {"pending", "active", "delivering",
                                               "delivered", "terminated"}:
-        return "pending"
+        return _pending_or_pending_assign(p)
     if "terminated" in statuses and statuses <= {"pending", "terminated"}:
         return "terminated"
     # ADR-019 §3：全部已签（delivering/delivered 混合）→ 交付中
     if statuses <= {"delivering", "delivered"}:
         return "delivering"
     return "active"
+
+
+def _pending_or_pending_assign(p: models.Project) -> str:
+    """ADR-064：合同含 pending 时项目派生 pending（待审核）的子判定——
+    businessOwner 为空（未分配）→ `pending_assign`（待分配）；否则 `pending`。
+    仅 `_derive_project_status` 的两个 pending 分支调用（active/delivering/delivered/
+    terminated 分支不受影响）。"""
+    if not (p.businessOwner or "").strip():
+        return "pending_assign"
+    return "pending"
 
 
 def _recompute_project(p: models.Project) -> None:
@@ -2304,6 +2371,11 @@ def change_contract_status(db: Session, contract_id: int, status: str,
     p = get_project(db, c.projectId)
     if not p:
         raise HTTPException(404, "销售记录所属项目不存在")
+    # ADR-066 §2（交付数据域守卫）：editor（商务）仅可操作**自己名下**（businessOwner==自己，
+    # user_sees_project 唯一口径）项目的合同；admin/supervisor 越过。与 review_project
+    # 接手人守卫 / claim_project / 编辑 pending 同口径，堵住 editor 持 contractId 越权操作他人单。
+    if user is not None and user.role == "editor" and not user_sees_project(user, p):
+        raise HTTPException(403, "仅该订单商务负责人（或管理员/商务主管）可变更销售记录状态")
     if user is not None and user.role == "viewer":
         if not user_sees_project(user, p):
             raise HTTPException(403, "生态人员仅可操作自己下单的项目")
@@ -2463,6 +2535,10 @@ def claim_project(db: Session, project_id: int, user: models.User,
     else:
         add_log(db, "project", p.name, action,
                 f"商务负责人绑定为 {target}", operator=user.username, project_id=p.id)
+    # ADR-064：businessOwner 是 pending 派生的正交输入——分配/改派/接手/转交成功后
+    # 重算派生字段，使 pending_assign → pending（待审核）自动流转（owner 变化时
+    # 重算保持幂等：无 pending 合同的项目派生结果不变）。
+    _recompute_project(p)
     db.commit()
     return action
 
@@ -2902,7 +2978,9 @@ def update_project(db: Session, project_id: int, data: schemas.ProjectInput,
         raise HTTPException(403, "订单已提交，不可编辑；如需修改请「撤销」后重新下单")
     # ADR-012 §5.1：pending 项目基本信息仅负责人（或 admin/supervisor 越过，ADR-051）可编辑
     #（ADR-028：viewer 已在上面一律 403，此处判定实际只对商务生效）
-    if p.status == "pending" and user is not None and user.role not in ("viewer", "admin", "supervisor"):
+    # ADR-064：pending_assign（待分配，无负责人）与 pending 同守卫——editor 不可编辑
+    #（数据域上 editor 本就看不到待分配单，此处为 API 直调兜底）
+    if p.status in ("pending", "pending_assign") and user is not None and user.role not in ("viewer", "admin", "supervisor"):
         if (p.businessOwner or "").strip() != user.username:
             raise HTTPException(400, "待审核项目仅商务负责人（或管理员/商务主管）可编辑基本信息")
     # 项目名非空（防止被清空；与 _create_project_core 口径一致）
@@ -2959,12 +3037,19 @@ def change_project_status(db: Session, project_id: int, data: schemas.StatusInpu
         and user.role == "viewer"
         and user_sees_project(user, p)
     )
-    if p.status == "pending":
+    # ADR-066 §2（交付数据域守卫）：editor（商务）仅可操作**自己名下**（businessOwner==自己，
+    # user_sees_project 唯一口径）项目；admin/supervisor 越过。与 review_project 接手人守卫 /
+    # claim_project / 编辑 pending 同口径，堵住 editor 持 projectId 越权操作他人单。
+    if user is not None and user.role == "editor" and not user_sees_project(user, p):
+        raise HTTPException(403, "仅该订单商务负责人（或管理员/商务主管）可变更项目状态")
+    # ADR-064：pending_assign（待分配）与 pending 同守卫——审核前状态，
+    # 下单生态人员仍可终止（取消）自己的单，其余一律走审核/撤销链路
+    if p.status in ("pending", "pending_assign"):
         # ADR-012：待审核项目状态出口是订单审核接口（确认下单/驳回）；
         # 2026-10-19 新增：下单生态人员可终止（取消）自己的待审核订单——释放锁定、记录留存、不可再编辑
         if not (is_viewer_own and data.status == "terminated"):
             raise HTTPException(
-                400, "待审核项目不可直接变更状态，请通过订单审核（确认下单/驳回）操作")
+                400, "待分配/待审核项目不可直接变更状态，请通过订单审核（确认下单/驳回）操作")
     if user is not None and user.role == "viewer":
         if not is_viewer_own:
             raise HTTPException(403, "生态人员仅可操作自己下单的项目")
@@ -2978,9 +3063,10 @@ def change_project_status(db: Session, project_id: int, data: schemas.StatusInpu
         if p.status == "terminated" and status == "delivered":
             raise HTTPException(400, "项目已终止，不可再变更状态")
         # 2026-10-19：pending 项目（生态取消自己的待审核单）目标为 pending 记录；
+        # ADR-064：pending_assign（待分配）同口径——取消目标仍为 pending 合同；
         # 其余场景（批量交付 / 终止进行中）为 active 记录；
         # ADR-019（PRICING-20261020）：批量交付同样覆盖 delivering 记录（已签待交付）
-        target_states = ("pending",) if p.status == "pending" else ("active", "delivering")
+        target_states = ("pending",) if p.status in ("pending", "pending_assign") else ("active", "delivering")
         targets = [c for c in p.contracts if c.status in target_states]
         if not targets:
             raise HTTPException(400, "项目下没有可执行的销售记录（进行中/待审核），无可批量执行")
@@ -3230,13 +3316,21 @@ def delete_project(db: Session, project_id: int, operator: str = "") -> None:
 # ============================================================
 # 交付
 # ============================================================
-def create_outbound(db: Session, data: schemas.OutboundInput, operator: str = "") -> models.Outbound:
+def create_outbound(db: Session, data: schemas.OutboundInput, operator: str = "",
+                    user: "models.User | None" = None) -> models.Outbound:
     # FIX-20261020-#13a：qty=0 不再放行（此前 ge=0 可建 0 数量交付记录且仍 soldCount+1）
     if data.qty <= 0:
         raise HTTPException(400, "交付数量必须大于 0")
     a = get_asset(db, data.assetId)
     if not a:
         raise HTTPException(400, "产品不存在")
+    # ADR-066 §2（交付数据域守卫）：editor（商务）仅可对**自己名下**（businessOwner==自己，
+    # user_sees_project 唯一口径）项目登记交付；admin/supervisor 越过。无项目（纯补录）不受限。
+    # 与 review_project 接手人守卫 / claim_project / 编辑 pending 同口径。
+    if (user is not None and user.role == "editor" and data.projectId is not None):
+        p_guard = get_project(db, data.projectId)
+        if p_guard is not None and not user_sees_project(user, p_guard):
+            raise HTTPException(403, "仅该订单商务负责人（或管理员/商务主管）可登记交付")
     # FIX-20261020-#9 / BUG-45：遥感父产品（容器）不可直接交付——只能对其数据明细交付
     #（OutboundInput 无 itemId，任何挂容器的交付都属「父产品交付」，一律 400 明确拒绝）
     if a.type == "遥感数据":
@@ -3244,8 +3338,9 @@ def create_outbound(db: Session, data: schemas.OutboundInput, operator: str = ""
     # BUG-28：交付日期入参统一校验（YYYY-MM-DD，允许空串；只校验写入值）
     _validate_date_str(data.date, "交付日期", allow_empty=True)
     p = get_project(db, data.projectId)
-    # FIX-20261020-#9：项目归属校验——待审核（审核前不可产生交付）/已终止项目不可登记交付
-    if p is not None and p.status in ("pending", "terminated"):
+    # FIX-20261020-#9：项目归属校验——待分配/待审核（审核前不可产生交付）/已终止项目不可登记交付
+    # ADR-064：pending_assign 与 pending 同语义（均为审核前状态），一并拦截
+    if p is not None and p.status in ("pending", "pending_assign", "terminated"):
         raise HTTPException(400, "该项目当前状态不可登记交付")
     # FIX-20261020-#9：产品必须属于所选项目明细（任意产品挂任意项目会绕过审核产生销售额）
     if p is not None and not any(it.assetId == a.id for it in p.items):
@@ -3352,6 +3447,12 @@ def _revert_outbound_inner(db: Session, outbound_id: int, reason: str,
             # FIX-20261020-#7：交付记录已精确关联明细（合同交付写入 it.id）→ 按 id 定位，
             # 同合同同产品多明细不再取错行（明细已随项目删除时回退下方 limit(1) 兼容逻辑）
             it = db.get(models.ProjectItem, ob.projectItemId)
+            # ADR-066 #2（高 bug 修复）：标准路径（取到明细行）用**行级** repeatSale 口径
+            # `_item_repeat`（与交付侧 _apply_item_delivery、_apply_item_release、审核改数量
+            # 同口径）——原实现用容器 `a.repeatSale`（ADR-036 遥感容器恒 false），
+            # repeatSale=1 的 rs 行撤销时容器 shippedQty 被误回退（漂移/500）。
+            if it is not None:
+                eff_repeat = _item_repeat(db, a, it.itemId)
         if it is None and ob.contractId is not None:
             # 存量记录（projectItemId 为 NULL）：回退 contractId+assetId limit(1) 兼容逻辑
             it = db.execute(
@@ -3431,7 +3532,17 @@ def _revert_outbound_inner(db: Session, outbound_id: int, reason: str,
     return True
 
 
-def revert_outbound(db: Session, outbound_id: int, reason: str, operator: str = "") -> None:
+def revert_outbound(db: Session, outbound_id: int, reason: str, operator: str = "",
+                    user: "models.User | None" = None) -> None:
+    # ADR-066 §2（交付数据域守卫）：editor（商务）仅可撤销**自己名下**（businessOwner==自己，
+    # user_sees_project 唯一口径）项目的交付；admin/supervisor 越过。无项目关联（纯补录）不受限。
+    # 与 review_project 接手人守卫 / claim_project / 编辑 pending 同口径。
+    if user is not None and user.role == "editor":
+        ob = db.get(models.Outbound, outbound_id)
+        if ob is not None and ob.projectId is not None:
+            p = get_project(db, ob.projectId)
+            if p is not None and not user_sees_project(user, p):
+                raise HTTPException(403, "仅该订单商务负责人（或管理员/商务主管）可撤销交付")
     _revert_outbound_inner(db, outbound_id, reason, operator=operator)
     db.commit()
 

@@ -4,6 +4,78 @@
 
 ---
 
+## 2026-11-10 变更（ADR-066：业务一致性修正 + 交付数据域收口 + 遥感下架）
+
+> **依据 ADR-066（2026-11-10）**。无新端点、无入参/返回结构变更（前端零改动）；两处**行为变化**：① 交付/终止/撤销交付对 **editor（商务）的数据域 403 口径**；② **撤单只撤 pending 合同**（部分确认后撤销保留已确认部分）。
+
+### 契约 1：交付/终止/撤销的数据域守卫（editor 403，admin/supervisor 越过）
+
+以下 4 个端点对 **editor** 新增归属守卫：仅当 `user_sees_project(user, project)` 为真（即项目 `businessOwner == 自己`）才放行，否则 **403**；`admin`/`supervisor` 越过；`viewer`/`finance` 口径不变（viewer 仅本人单、finance 被 `require_editor`/`require_order` 拦截）。与 `review`（接手人守卫）/`claim`/编辑 pending 同口径。
+
+| 端点 | editor 越权（他人单） | 说明 |
+|---|---|---|
+| `PATCH /api/contracts/{id}/status` | **403**「仅该订单商务负责人（或管理员/商务主管）可变更销售记录状态」 | 按 contractId 定位所属项目后判 `user_sees_project` |
+| `PATCH /api/projects/{id}/status` | **403**「仅该订单商务负责人（或管理员/商务主管）可变更项目状态」 | 项目级批量交付/终止同守卫 |
+| `POST /api/outbounds` | **403**「仅该订单商务负责人（或管理员/商务主管）可登记交付」 | `projectId` 非空时判归属；纯补录（无项目）不受限 |
+| `POST /api/outbounds/{id}/revert` | **403**「仅该订单商务负责人（或管理员/商务主管）可撤销交付」 | 按交付记录 `projectId` 判归属；无项目关联不受限 |
+
+### 契约 2：撤单只撤 pending 合同（`POST /api/projects/{id}/withdraw`）
+
+- **只终止 `status='pending'` 的合同**；`active`/`delivering`/`delivered` 合同**保留不动**（部分确认后撤销 = 撤未确认部分）。
+- 项目**剩余非 pending 合同** → 保留 `businessOwner`、项目状态按剩余合同派生（通常 `active`/`delivering`，**非整单 terminated**）；**无剩余**（全 pending 被终止 / 无合同）→ 整单 `terminated` + 解绑负责人（维持现状，全 pending 单不回归）。
+- **回填购物车只回填被终止的 pending 合同明细**（保留合同不回填）；返回结构 `{ok, restored, amountFallback, skipped, skippedReasons}` 不变。
+- 回填金额口径修正（bug #1）：unit 行回填**单价** `price`（购物车 unit 行 `amount` 字段语义=单价，结算再 ×qty）；rs 行/amount 语义行保持行总额 `amount`。
+
+### 契约 3：遥感数据下架（数据动作，零代码改动）
+
+- 启动幂等迁移 `_run_once("ADR066_rs_offshelf")`：存量 2 个「遥感数据」资产 `assets.status → 'all_sold'`（现有枚举中唯一的「不可售」值；无独立「下架」值）。
+- `rs_items`/存量项目/订单行**不动**，存量仍可结算交付；`GET /api/bootstrap` 中该 2 资产 `status='all_sold'`（统计页显示「已售罄」）。
+- 注：`assets.status` 为派生展示值（`auto_status` 按数量重算），后续对该资产的产品维护（增删明细/锁定/释放）会按真值重算覆盖；可售/下单入口实际按可售数量（容器 = rs_items in_stock 条数）过滤。
+
+### 实测（:8000）
+
+- 部分确认撤单：2 合同项目 confirm 1 个（active）后撤单 → active 合同保留、pending 合同 terminated、项目 `status=active`、`businessOwner` 保留；回填仅 pending 合同 1 行（unit qty=3 price=10 → 购物车 `amount=10` 单价，再结算小计 30 非 90）。
+- 全 pending 撤单：2 合同全 terminated、项目 terminated、负责人解绑（不回归）。
+- editor 对他人单 4 端点均 403；admin/supervisor 同操作放行（交付/撤销交付/终止回归通过）。
+- repeatSale=1 的 rs 行交付→撤销交付：200、容器 `shippedQty` 不变（旧代码 500 不变量告警）。
+- 遥感 2 资产 `status='all_sold'`；5 存量遥感项目 bootstrap 正常可见。
+
+---
+
+## 2026-11-10 变更（ADR-065：卫星Token 计价归一为普通 unit 商品）
+
+> **依据 ADR-065（2026-11-10）**。卫星Token 彻底按普通商品计价：**`pricingMode` 恒 `unit`（单价×数量）**，去除 ADR-008 的 amount（包量/总额）特殊处理。无新端点，端点/入参/返回结构均不变，仅卫星Token 的**计价口径与校验行为**变化。
+
+### 契约
+- **`GET /api/bootstrap`（assets）**：卫星Token 资产 `pricingMode = "unit"`（原 `amount`）；`salePrice` 从「仅参考」变为**实际单价**，已设 `priceMin/priceMax` 现**作用于单价**。
+- **`POST /api/assets` / `PUT /api/assets/{id}`**：卫星Token 也落 `pricingMode="unit"`（后端权威，不再按类型置 amount；type 变更时重算亦恒 `unit`）。
+- **购物车/结算（`POST /api/cart`、`PUT /api/cart/{id}`、`POST /api/cart/checkout`）**：卫星Token 行走 **unit 口径**——`amount` 入参/存值 = **单价**（元/个），小计/合同行金额 = **单价 × 数量**；**超参考区间硬拦**（400「销售金额超出该产品参考区间（min~max 元/单位）」，`enforce_max=True` 双向，与普通商品一致，自动继承无需新增校验）。
+- **审核（`POST /api/projects/{id}/review`）**：confirm 改价**不卡区间**（同普通商品，仅 >0 + 6 位小数），未改。
+- **迁移**：启动一次性幂等迁移 `_run_once("ADR065_sat_token_to_unit")`——6 卫星Token 资产 amount→unit；4 购物车项 `amount` 清空 NULL（按 salePrice 参考单价重派生，用户按新口径确认）；明细 id 54 修正 price 0.03 / amount 3000（按资产参考价，**待业务复审确认**）+ 合同 52 / 项目 32 派生额重算。
+- **amount 模式代码保留**（`_is_amount_mode` 等分支归一后不命中，无商品走 amount 口径）。
+
+### 实测（:8000）
+- assetId 39（区间 0.03~0.03）qty 100000 单价 0.03 结算 → 明细 `price=0.03, amount=3000.0`，合同 `contractAmount=3000`（**非 0.03**）。
+- 同资产单价 0.033333（超区间）：`PUT /cart/{id}` 与 `POST /cart/checkout` 均 **400**「销售金额超出该产品参考区间（0.03~0.03 元/个）」。
+- 普通商品（assetId 9，区间 25250~25500）：超区间 400、区间内 25300×2 → 小计 50600；审核 confirm 改价 26000（超区间）→ 200 放行（审核不卡区间，不回归）。
+
+---
+
+## 2026-11-10 变更（ADR-064：销售项目「待分配」状态 pending_assign）
+
+> **依据 ADR-064（2026-11-10）**。`Project.status` 取值**新增 `pending_assign`（待分配）**——合同含 pending 且 `businessOwner` 为空的派生状态；`businessOwner` 非空则派生 `pending`（待审核）。`claim`（分配/改派/接手/转交）成功后自动流转 `pending_assign → pending`。
+
+### 影响
+- **`GET /api/projects`**：响应 `items[].status` 可为 `pending_assign`；`?status=pending_assign` 过滤未分配 pending（等值匹配，无需改）。**排序 rank 更新**：`pending_assign=0 → pending=1 → active=2 → delivering=3 → delivered=4 → terminated=5`（待分配最需处理排最前；原 ADR-056 的 `pending=0` 顺延为 1）。
+- **`POST /api/projects/{id}/review`**：`pending_assign` **不可审**（400「仅待审核项目可审核」+ businessOwner 空 400 双保险），守卫未改。
+- **`POST /api/projects/{id}/claim`**：端点/入参/返回动作串（分配订单/改派订单/…）**不变**；成功后 `_recompute_project` 使该项目 `status → pending`。
+- **`POST /api/projects/{id}/withdraw`**：放行 `pending_assign`（`status in (pending, pending_assign)`），待分配单可撤 → terminated。
+- **建单**（`POST /projects` / checkout）：新单 contract=pending + `businessOwner` 空 → 派生即 `pending_assign`。
+- **可见性**：`user_sees_project` 不变——editor 按 `businessOwner==自己` 过滤，**看不到**待分配单；admin/supervisor 全见。
+- **迁移**：启动一次性回填存量（`main.py` `_run_once("ADR064_pending_assign_backfill")`，幂等）。
+
+---
+
 ## 2026-11-04 变更（ADR-056：销售项目列表服务端排序 + 合同级勾选驳回）
 
 > **依据 ADR-056（Proposed，2026-11-04）**。§1 `GET /api/projects` 加 `sortBy/sortOrder`（向后兼容，缺省行为不变）；§2 新增 `POST /api/projects/{id}/reject-contracts`（勾选部分 pending 合同驳回，复用整单驳回逐合同逻辑，零迁移）。

@@ -2,6 +2,57 @@
 
 > 记录 core-holdings 后端（FastAPI + SQLAlchemy + SQLite）的接口与行为变更。
 
+## 2026-11-10 ｜ ADR-066：业务一致性修正 + 交付数据域收口 + 遥感下架
+
+> **依据 ADR-066（2026-11-10）**。六域只读 BUG 排查后落地 2 项业务一致性/权限修正 + 遥感软下架 + 3 个高 bug 修复。**前端零改动**（下架/守卫/撤单语义对前端透明），无新端点、无入参/返回结构变更。
+>
+> **① 撤单只撤 pending 合同**（`withdraw_project`）：撤销 `pending`/`pending_assign` 项目时**只终止 `status=='pending'` 的合同**，`active`/`delivering`/`delivered` 合同保留；项目剩余非 pending 合同 → 保留 `businessOwner` + `_recompute_project` 派生状态（通常 active/delivering，**不强制 terminated**）；无剩余（全 pending 被终止/无合同）→ 整单 terminated + 解绑（维持现状，全 pending 单不回归）；**回填购物车只回填被终止的 pending 合同明细**（`_refill_cart_from_project` 增可选 `items` 子集参数，`refill_project_cart` 重新提交口径不变）。
+>
+> **② 交付数据域守卫**（4 处补 `user_sees_project` 唯一口径）：`change_contract_status` / `change_project_status` / `create_outbound` / `revert_outbound` 对 **editor** 仅放行 `businessOwner==自己` 的项目，他人单 **403**；`admin`/`supervisor` 越过；viewer/finance 口径不变。`create_outbound`/`revert_outbound` 服务层签名增可选 `user` 参数（路由透传，无入参变化）。
+>
+> **③ 遥感只下架**（数据动作，代码/类型/rs_items 机制全保留）：幂等迁移 `_run_once("ADR066_rs_offshelf")` 把存量 2 个「遥感数据」资产 `assets.status → 'all_sold'`（现有枚举 in_stock/all_sold 中唯一的「不可售」值，**无独立「下架」值**；可售/下单入口实际按可售数量过滤，assets.status 为派生展示值，后续产品维护会按 `auto_status` 重算覆盖）。**不动** rs_items/5 项目/8 订单行，存量仍可结算交付。
+>
+> **④ 3 高 bug 修复**：**#1** 回填购物车 unit 行误把行总额 `it.amount`(=price×qty) 写进购物车「单价」字段 → 再结算 ×qty² 多收，改回填 `it.price`（rs 行/amount 语义行保持 `it.amount`，判定 = itemId 空 + 资产非 amount 模式）；**#2** 撤销交付 rs 行用容器 `a.repeatSale`（ADR-036 恒 false）而非行级口径 → repeatSale=1 的 rs 行撤销时容器 `shippedQty` 漂移/500，标准路径（取到明细行）改 `eff_repeat = _item_repeat(db, a, it.itemId)`（与交付侧同口径），`projectItemId` 为 NULL 的 legacy 回退保留；**#3** ADR-064 回填迁移对**全部**项目 `_recompute_project` → 无合同项目被派生成 `active` + 金额清零，改为**只处理有合同的项目**（无合同跳过、保留原状态；pending_assign 派生本就要求「合同含 pending」，跳过安全）。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-11-10 | ⚠️ 修改 | 撤单只撤 pending 合同：终止循环过滤 `status=='pending'`、剩余非 pending 合同保留 businessOwner + 派生状态（不强制 terminated）、回填只覆盖被终止合同明细 | `backend/src/services.py`（`withdraw_project` / `_refill_cart_from_project` 增 `items` 参数） | ADR-066 §1 | ⚠️ 部分确认后撤单行为变化：项目回 active/delivering 非整单 terminated；全 pending 单不回归 |
+| 2026-11-10 | ⚠️ 修改 | 交付数据域 4 处守卫：change_contract_status / change_project_status / create_outbound / revert_outbound 对 editor 补 `user_sees_project` 判定，他人单 403，admin/supervisor 越过 | `backend/src/services.py`（4 函数）+ `backend/src/routers/api.py`（2 路由透传 user） | ADR-066 §2 | ⚠️ editor 不能再互操作他人单（协作需经 admin/supervisor）；与 review/claim/编辑 pending 同口径 |
+| 2026-11-10 | 修改 | 遥感只下架：幂等迁移 `ADR066_rs_offshelf` 把 2 个「遥感数据」资产 status→'all_sold'（现有枚举唯一「不可售」值） | `backend/main.py` | ADR-066 §3 | 代码/类型/rs_items 机制全保留；rs_items/5 项目/8 订单行不动、存量仍可结算交付；status 为派生展示值，后续产品维护按 auto_status 重算 |
+| 2026-11-10 | 修复 | bug #1：回填购物车 unit 行回填单价 `it.price`（原误填行总额 `it.amount` → 再结算 ×qty² 多收）；rs/amount 语义行保持 `it.amount` | `backend/src/services.py`（`_refill_cart_from_project`） | ADR-066 §4 | 撤单/重新提交共用实现，两入口同时修复 |
+| 2026-11-10 | 修复 | bug #2：撤销交付标准路径（取到明细行）rs 口径改行级 `_item_repeat`（原容器 `a.repeatSale` 恒 false → repeatSale=1 行撤销 shippedQty 漂移/500）；legacy 回退保留 | `backend/src/services.py`（`_revert_outbound_inner`） | ADR-066 §4 | 与交付侧 `_apply_item_delivery` / `_apply_item_release` / 审核改数量同口径 |
+| 2026-11-10 | 修复 | bug #3：ADR-064 回填迁移只处理有合同项目（无合同项目跳过、保留原 status，防被覆写 active + 金额清零） | `backend/main.py`（`_backfill_pending_assign`） | ADR-066 §4 | 迁移前必修（旧生产库无 marker 会跑修正版）；dev 库该迁移已跑 0 条命中，无影响 |
+
+### 实测（:8000，curl + sqlite，QA066- 前缀数据保留）
+
+- **撤单只撤 pending**：2 合同项目部分确认（C1 active / C2 pending）后撤单 → C1 保留 active、C2 terminated、项目 `status=active`、`businessOwner` 保留（wuhao）、回填仅 C2 的 1 行；全 pending 项目撤单 → 2 合同全 terminated、项目 terminated、负责人解绑（不回归）。
+- **交付数据域**：editor（他人单 businessOwner=wuhao）对 `PATCH /contracts/{id}/status`、`PATCH /projects/{id}/status`、`POST /outbounds`、`POST /outbounds/{id}/revert` 均 **403**；admin/supervisor 同操作放行（主管交付 200、admin 撤销交付/终止 200）。
+- **#1 回填**：unit qty=3 price=10 撤单回填 → 购物车行 `amount=10`（单价，非 30）；按该行再结算 → 合同 `contractAmount=30`（单价×3，非 90）。
+- **#2 rs**：repeatSale=1 的 rs 行 交付（shippedQty 不扣、soldCount+1）→ 撤销交付 **200**（旧代码 500 不变量告警）、容器 `shippedQty` 保持 0、soldCount 回退、合同回 delivering。
+- **#3**：造无合同 terminated 项目 + 清 ADR064 marker 重跑 → 项目保持 terminated 不被覆写 active（marker 已恢复）。
+- **遥感下架**：2 资产 `status='all_sold'`（bootstrap 同）；rs_items 61 条/5 存量项目不受影响、bootstrap 正常可见。
+- **回归**：unit 下单小计=单价×数量（30500×2→61000）、超区间硬拦 400、审核 confirm/部分确认/驳回、交付/终止/撤销交付 均不回归。
+
+---
+
+## 2026-11-10 ｜ ADR-065：卫星Token 计价归一为普通 unit 商品（去 amount 特殊处理）
+
+> **依据 ADR-065（2026-11-10）**。卫星Token 彻底按普通商品计价（unit：单价×数量），去除 amount（包量/总额）特殊处理。**① 计价模式赋值去特判**：`create_asset` / `update_asset` 不再按类型把卫星Token 置 `amount`，`pricingMode` 恒 `unit`（其余类型逻辑不变）。**② 幂等迁移**（`main.py` `_run_once("ADR065_sat_token_to_unit")`，标记化只跑一次）：6 卫星Token 资产 `pricingMode` amount→unit（salePrice 从「仅参考」变为实际单价，已设 priceMin/Max 现作用于单价）；4 购物车项 `amount` 清空为 NULL（旧值是「合同总额」语义，unit 下当单价会 ×qty 放大/量纲错；清空后按 salePrice 参考单价重派生，用户按新口径确认）；项目明细一致性修正——通用规则「卫星Token 明细中 `price≈0` 或 `|amount − price×qty|>1e-6` 的不一致项，按所属资产参考价 `priceMin`（无则 salePrice）修正 price、amount=price×qty」，本次仅 **id 54** 命中（assetId 39，pending 项目 32：price 0.0→**0.03**、amount 0.03→**3000.0**，按资产参考价 0.03 的**合理默认，待业务复审确认**；项目 32 可复审），修正后重算其合同 52 `contractAmount`（0.03→3000）+ 项目派生额（复用 `_recompute_project`）；id 41/46（30500×3=91500 本就一致）规则不命中、不动。**③ 区间硬拦自动继承**：卫星Token 归一 unit 后，购物车/结算超区间硬拦（`_check_discount_range` 400「销售金额超出该产品参考区间」，`enforce_max=True` 双向）**自动生效，无需新增校验**；**审核确认不卡区间保持同普通商品**（仅 >0 + 6 位小数，`review_project` 不调区间函数，未改）。**④ amount 模式代码保留**（`_is_amount_mode` / `_cart_amount` / checkout amount 分支等，归一后不命中，降回归面，后续可清理）。实测（:8000）：迁移条数 资产 6 / 购物车 3（id 3 已 NULL 不计）/ 明细 1；assetId 39 qty 100000 单价 0.03 结算 → 明细 amount=**3000**（非 0.03）；单价 0.033333（超区间 0.03~0.03）行更新/结算均 400；普通商品（assetId 9）区间硬拦 + 小计=单价×数量 + 审核 confirm 改价不卡区间均不回归；迁移幂等（reload 不重跑）。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-11-10 | ⚠️ 修改 | 卫星Token 计价归一 unit：create_asset/update_asset 去「卫星Token→amount」特判（pricingMode 恒 unit） | `backend/src/services.py` | ADR-065 | ⚠️ 卫星Token 商品/购物车/结算口径变 unit（单价×数量）；区间硬拦自动继承；审核不卡区间保持 |
+| 2026-11-10 | 修改 | 幂等迁移 ADR065_sat_token_to_unit：6 资产 amount→unit / 4 购物车项 amount 清空 NULL / 明细 id54 修正 price 0.03·amount 3000 + 合同 52·项目 32 派生额重算 | `backend/main.py` | ADR-065 | `_run_once` 标记化只跑一次；id54 修正值为按资产参考价合理默认，待业务复审确认 |
+| 2026-11-10 | 保留 | amount 模式代码（`_is_amount_mode`/`_cart_amount`/checkout amount 分支等）保留为死代码，归一后不命中 | `backend/src/services.py` | ADR-065 | 降回归面，后续可清理 |
+
+## 2026-11-10 ｜ ADR-064：销售项目「待分配」状态 pending_assign（商务主管分配流程显性化）
+
+> **依据 ADR-064（2026-11-10）**。项目状态派生从「仅合同」扩到「合同 + businessOwner」：合同含 pending 且 `businessOwner` 为空 → `pending_assign`（待分配），否则 `pending`（待审核）。`claim_project` 分配/改派/接手/转交成功后补调 `_recompute_project`（`pending_assign↔pending` 自动流转）；`withdraw` 放行 `pending_assign`（保持可撤）；排序 rank 置 `pending_assign` 最前；启动一次性回填存量（`main.py` `SchemaMigration` `_run_once`，幂等，本次 0 条）。**review 守卫不改**（pending_assign 天然不可审：`!= pending` + businessOwner 空 400 双保险）；`user_sees_project` 数据域不改（editor 按 businessOwner 过滤天然看不到待分配）。`claim` 端点/入参/返回动作串**不变**，无新端点。`Project.status` 取值新增 `pending_assign`。
+
+| 日期 | 类型 | 变更内容 | 影响文件/范围 | 关联任务/ADR | 备注 |
+|---|---|---|---|---|---|
+| 2026-11-10 | 新增 | 销售项目「待分配」状态 pending_assign：派生(合同含 pending 且无 businessOwner)+claim 后重算流转+withdraw 放行+排序 rank 前置+启动幂等回填；review/可见性/claim 端点不变 | src/services.py、src/routers/api.py、main.py(迁移) | ADR-064 | 状态机 |
+
 ## 2026-11-04 ｜ ADR-057：审核页支持部分确认（review confirm 加可选 contractIds）
 
 > **依据 ADR-057（2026-11-04）**。`ReviewInput` 加可选 `contractIds`；`review_project` confirm 路径按 `contractIds` 过滤（行级改价/改数量、合同总价分摊、锁定调整、服务期限、守卫、`c.status="active"` 均只作用于选中集合 targets；未勾选合同保持 pending 一字不动）；`_derive_project_status` 补「含 pending 且其余 ⊆ {active, delivering, delivered, terminated} → pending」分支（与 ADR-056 `[terminated,pending]→pending` 同口径）。**缺省（不传）= 整单确认，行为与现状一致（向后兼容）**。reject 路径与 ADR-056 `reject-contracts` 不动。

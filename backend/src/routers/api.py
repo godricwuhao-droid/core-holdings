@@ -328,13 +328,15 @@ def list_projects(
     sort_col = None
     if sortBy == "status":
         # 状态档位映射（生命周期序），非字符串序
+        # ADR-064：pending_assign（待分配）置于 pending（待审核）之前——最需处理排最前
         sort_col = case(
-            (models.Project.status == "pending", 0),
-            (models.Project.status == "active", 1),
-            (models.Project.status == "delivering", 2),
-            (models.Project.status == "delivered", 3),
-            (models.Project.status == "terminated", 4),
-            else_=5,
+            (models.Project.status == "pending_assign", 0),
+            (models.Project.status == "pending", 1),
+            (models.Project.status == "active", 2),
+            (models.Project.status == "delivering", 3),
+            (models.Project.status == "delivered", 4),
+            (models.Project.status == "terminated", 5),
+            else_=6,
         )
     elif sortBy == "amount":
         # 「销售金额」列绑定 Project.contractAmount（存列，_recompute_project 重算=Σ合同金额）
@@ -724,7 +726,7 @@ def change_contract_status(contract_id: int, data: schemas.StatusInput, db: Sess
 @router.post("/outbounds", response_model=schemas.OutboundOut)
 def create_outbound(data: schemas.OutboundInput, db: Session = Depends(get_db),
                     user: models.User = Depends(security.require_editor)):
-    ob = services.create_outbound(db, data, operator=user.username)
+    ob = services.create_outbound(db, data, operator=user.username, user=user)  # ADR-066 §2：数据域守卫
     security.record_audit(db, user, "outbound", "新交付", "outbound", ob.assetName, ob.code)
     return ob
 
@@ -737,7 +739,8 @@ def revert_outbound(outbound_id: int, data: schemas.OutboundRevertInput,
     BUG-14：产品/明细已不存在时 400（不允许「静默成功、零回滚」）。"""
     ob = db.get(models.Outbound, outbound_id)
     name = ob.assetName if ob else str(outbound_id)
-    services.revert_outbound(db, outbound_id, data.reason, operator=user.username)
+    services.revert_outbound(db, outbound_id, data.reason, operator=user.username,
+                             user=user)  # ADR-066 §2：数据域守卫
     security.record_audit(db, user, "outbound", "撤销交付", "outbound", name)
     return {"ok": True}
 

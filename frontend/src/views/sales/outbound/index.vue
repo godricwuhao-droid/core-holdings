@@ -101,10 +101,11 @@ const summary = computed(() => {
   }
 })
 
-/** 可交付项目：排除已终止与待审核（2026-10-20 问题9：待审核项目不可登记交付——
- *  审核前不产生交付与销售额，后端 400「该项目当前状态不可登记交付」同口径） */
+/** 可交付项目：排除已终止、待审核与待分配（2026-10-20 问题9：待审核项目不可登记交付——
+ *  审核前不产生交付与销售额，后端 400「该项目当前状态不可登记交付」同口径；
+ *  ADR-064：pending_assign（待分配）是 pending 的前置态，同样排除） */
 const activeProjects = computed(() =>
-  db.projects.filter((p) => p.status !== 'terminated' && p.status !== 'pending'),
+  db.projects.filter((p) => p.status !== 'terminated' && p.status !== 'pending' && p.status !== 'pending_assign'),
 )
 
 /** 可选产品：新交付排除无可用数量产品；历史补录放开（仅登记台账） */

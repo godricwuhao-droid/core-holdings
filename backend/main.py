@@ -408,6 +408,133 @@ def _ensure_migration() -> None:
     _run_once("assets_status_backfill", _backfill_asset_status,
               "按 auto_status 规则一次性回填 assets.status（数据类动作，不再每次启动扫描）")
 
+    # ADR-064（2026-11-10）：销售项目「待分配」状态 pending_assign 存量回填——
+    # 派生口径从「仅合同」扩到「合同 + businessOwner」后，存量 `status='pending' AND
+    # businessOwner=''` 的项目需回填为 pending_assign。复用 services._recompute_project
+    # （避免规则二次实现产生分歧），逐项目重算、仅当状态变化才计数；
+    # 标记化只跑一次（ADR-031），幂等（重算本身幂等，二次执行结果不变）。
+    def _backfill_pending_assign() -> None:
+        from src import services as _services
+        db = SessionLocal()
+        try:
+            changed = 0
+            skipped = 0
+            for p in db.query(models.Project).all():
+                # ADR-066 #3（迁移前必修）：只处理**有合同**的项目——无合同项目派生恒为
+                # active（_derive_project_status 无合同分支）且金额会被清零覆写，
+                # 且其 pending_assign 派生分支本就要求「合同含 pending」，跳过安全
+                if not p.contracts:
+                    skipped += 1
+                    continue
+                before = p.status
+                _services._recompute_project(p)
+                if p.status != before:
+                    changed += 1
+            if changed:
+                db.commit()
+            print(f"[migration] ADR-064 项目状态回填 {changed} 条（pending + 无商务负责人 → pending_assign）"
+                  f"，跳过无合同项目 {skipped} 条（ADR-066 #3）")
+        finally:
+            db.close()
+
+    _run_once("ADR064_pending_assign_backfill", _backfill_pending_assign,
+              "ADR-064 存量项目派生状态回填（pending + businessOwner 空 → pending_assign，一次性数据迁移）")
+
+    # ADR-066 §3（2026-11-10）：遥感数据**只下架**（软处理，代码/类型/rs_items 机制全保留）——
+    # 把存量「遥感数据」资产置**不可售**。排查结论：assets.status 现有枚举仅
+    # in_stock/all_sold 两值（auto_status 按数量自动判定），**无独立「下架」值**，
+    # 「不可售」值 = 'all_sold'（已售罄）；可售/下单入口实际按**可售数量**过滤
+    # （容器 = rs_items in_stock 条数），assets.status 不参与下单路径拦截。
+    # 故本动作 = 按 type='遥感数据' 置 status='all_sold'（状态展示口径下架），
+    # **不动** rs_items / 存量项目 / 订单行（存量仍可结算交付）；后续重新设计时再动代码。
+    # 幂等：仅 UPDATE status != 'all_sold' 的行，可重跑。
+    def _rs_data_offshelf() -> None:
+        from sqlalchemy import text as _text
+        with engine.begin() as conn:
+            r = conn.execute(_text(
+                "UPDATE assets SET status='all_sold' "
+                "WHERE type='遥感数据' AND status != 'all_sold'"
+            ))
+            print(f"[migration] ADR-066 遥感数据资产下架（status→all_sold）{r.rowcount} 条")
+
+    _run_once("ADR066_rs_offshelf", _rs_data_offshelf,
+              "ADR-066 遥感数据资产下架（type='遥感数据' → status='all_sold'，rs_items/存量项目不动，一次性数据迁移）")
+
+    # ADR-065（2026-11-10）：卫星Token 计价归一为普通 unit 商品（去 amount 特殊处理）：
+    # 1) 卫星Token 资产 pricingMode amount→unit（salePrice 从「仅参考」变为实际单价，
+    #    已设 priceMin/Max 现作用于单价）；
+    # 2) 卫星Token 购物车项 amount 清空（旧值是「合同总额」语义，unit 下当单价会 ×qty
+    #    放大/量纲错）→ 清空后按 salePrice 参考单价重派生，用户按新口径确认；
+    # 3) 卫星Token 项目明细一致性修正：price≈0 或 |amount − price×qty|>1e-6 的不一致项，
+    #    按所属资产参考价 priceMin（无则 salePrice）修正 price、amount=price×qty，
+    #    并重算其合同 contractAmount + 项目派生额（复用 services._recompute_project，
+    #    避免规则二次实现产生分歧）。
+    # 注：id 54（assetId 39，pending 项目 32）price=0.03/amount=3000 为按资产参考价的
+    #    **合理默认，待业务复审确认**（项目 32 可复审）；id 41/46 本就一致，规则不命中。
+    def _sat_token_to_unit() -> None:
+        from sqlalchemy import text as _text
+        from src import services as _services
+        with engine.begin() as conn:
+            r1 = conn.execute(_text(
+                "UPDATE assets SET pricingMode='unit' "
+                "WHERE type='卫星Token' AND pricingMode='amount'"
+            ))
+            print(f"[migration] ADR-065 卫星Token 资产 pricingMode→unit {r1.rowcount} 条")
+            r2 = conn.execute(_text(
+                "UPDATE cart_items SET amount=NULL WHERE assetId IN "
+                "(SELECT id FROM assets WHERE type='卫星Token') AND amount IS NOT NULL"
+            ))
+            print(f"[migration] ADR-065 卫星Token 购物车项 amount 清空 {r2.rowcount} 条")
+        db = SessionLocal()
+        try:
+            fixed = 0
+            affected_contract_ids: set[int] = set()
+            for it in db.query(models.ProjectItem).all():
+                a = db.get(models.Asset, it.assetId)
+                if a is None or a.type != "卫星Token":
+                    continue
+                price = it.price or 0.0
+                amount = it.amount or 0.0
+                if price > 0 and abs(amount - price * it.qty) <= 1e-6:
+                    continue  # price×qty=amount 本就一致，不动（如 id 41/46）
+                ref = a.priceMin if a.priceMin is not None else a.salePrice
+                if not ref or ref <= 0:
+                    print(f"[migration] ADR-065 明细 id={it.id} 不一致但资产 {a.id} "
+                          f"无有效参考价，跳过（需人工处理）")
+                    continue
+                new_price = round(float(ref), 6)
+                new_amount = round(new_price * it.qty, 6)
+                print(f"[migration] ADR-065 明细 id={it.id} 修正 price {it.price}→{new_price}、"
+                      f"amount {it.amount}→{new_amount}（按资产 {a.id} 参考价 {ref}，"
+                      f"待业务复审确认）")
+                it.price = new_price
+                it.amount = new_amount
+                fixed += 1
+                if it.contractId is not None:
+                    affected_contract_ids.add(it.contractId)
+            if fixed:
+                db.commit()
+            # 仅重算受影响合同 contractAmount（= Σ 行 amount）+ 其所属项目派生额
+            # （复用 services._recompute_project，避免规则二次实现产生分歧；
+            #  未受影响合同/项目一字不动）
+            for cid in affected_contract_ids:
+                c = db.get(models.Contract, cid)
+                if c is None:
+                    continue
+                c.contractAmount = float(
+                    sum((i.amount or 0.0 for i in c.items), 0.0))
+                p = db.get(models.Project, c.projectId)
+                if p is not None:
+                    _services._recompute_project(p)
+            db.commit()
+            print(f"[migration] ADR-065 卫星Token 项目明细一致性修正 {fixed} 条"
+                  f"（受影响合同 {sorted(affected_contract_ids)} / 项目派生额已重算）")
+        finally:
+            db.close()
+
+    _run_once("ADR065_sat_token_to_unit", _sat_token_to_unit,
+              "ADR-065 卫星Token 计价归一 unit（6 资产 amount→unit / 购物车 amount 清空 / 不一致明细修正+重算）")
+
 
 def _ensure_unique_indexes() -> None:
     """轻量迁移：为存量表补唯一约束（create_all 不会修改已存在的表）。

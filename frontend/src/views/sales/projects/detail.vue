@@ -99,14 +99,15 @@ function openAssign() {
 }
 
 /**
- * 撤销待审核订单（ADR-026 / TASK-FE-029）：仅 `pending` 且「本人下单（creator==当前登录）或 admin」可见。
+ * 撤销待审核订单（ADR-026 / TASK-FE-029）：仅 `pending`/`pending_assign` 且「本人下单（creator==当前登录）或 admin」可见。
  * 商务（editor）不显示——商务走「驳回」；viewer 他人单不可见（后端 creator 归属守卫兜底）。
+ * ADR-064：`pending_assign`（待分配）同样可撤——后端 withdraw 守卫已放行 `status in (pending, pending_assign)`。
  * 注：`ProjectOut` 自 2026-10-21 起已输出 `creator`（bootstrap 同步），按账号精确比对；
  * 存量项目 creator 为空时按「可见即本人单」兜底（后端归属守卫兜底）。
  */
 const canWithdraw = computed(() => {
   const p = project.value
-  if (!p || p.status !== 'pending') return false
+  if (!p || (p.status !== 'pending' && p.status !== 'pending_assign')) return false
   if (isAdmin.value) return true
   if (canWrite.value) return false // 商务（editor）不显示，走驳回
   const creator = (p.creator || '').trim()
@@ -429,9 +430,10 @@ async function submitDateDialog() {
         <div class="head-actions" v-if="project">
           <span>
             <!-- ADR-051：商务主管/管理员「分配/改派」——任意项目（pending/active）可分配给某商务（editor），
-                 复用 TransferDialog assign 模式 + claim 接口；editor 视角仍走下方「接手/转交」（ADR-012） -->
+                 复用 TransferDialog assign 模式 + claim 接口；editor 视角仍走下方「接手/转交」（ADR-012）
+                 ADR-064：pending_assign（待分配）为主操作场景——主管/管理员在此分配后回落 pending -->
             <el-button
-              v-if="canAssign && (project.status === 'pending' || project.status === 'active')"
+              v-if="canAssign && (project.status === 'pending_assign' || project.status === 'pending' || project.status === 'active')"
               type="primary"
               @click="openAssign()"
             >
@@ -454,9 +456,12 @@ async function submitDateDialog() {
                  （连禁用态也不给；viewer 唯一改单路径 =「撤销」→ 购物车重下，后端 PUT 对 viewer 一律 403）
                  FIX-20261022 / BUG-21：「交付中」纳入可编辑（与列表页 canEditProject / 后端 PUT 一致，
                  原实现把 delivering 归到「不可编辑」分支，与列表页口径相反） -->
+            <!-- ADR-064：pending_assign（待分配）无负责人 → canReview 恒 false，单列 admin/supervisor 分支
+                 （与列表页 canEditProject / 后端 update_project 守卫同口径） -->
             <el-tooltip
               v-if="!isViewer && (project.status === 'active' || project.status === 'delivering'
-                   || (project.status === 'pending' && canReview))"
+                   || (project.status === 'pending' && canReview)
+                   || (project.status === 'pending_assign' && (isAdmin || isSupervisor)))"
               :content="canOwn ? '' : NO_PERM_TIP"
               :disabled="canOwn"
               placement="top"

@@ -84,11 +84,9 @@ const form = reactive({
 /** ADR-011：是否遥感数据类型（容器产品，仅显示 info-bar 提示；三维字段组已移除） */
 const isRemote = computed(() => form.type === '遥感数据')
 
-/** ADR-008：是否包量定价——新建时卫星 Token 即 amount 模式（后端登记置 pricingMode='amount'）；编辑读存量值 */
-const isAmount = computed(() => {
-  if (isEdit.value) return getAsset(assetId.value)?.pricingMode === 'amount'
-  return form.type === '卫星Token'
-})
+/** ADR-065：卫星Token 归一为普通 unit 商品——去掉 `type==='卫星Token'` 特判，
+ *  isAmount 仅由资产实际 pricingMode 决定（迁移后恒 unit → 恒 false；新建无存量值 → false） */
+const isAmount = computed(() => (isEdit.value ? getAsset(assetId.value)?.pricingMode === 'amount' : false))
 
 const rules = {
   name: [{ required: true, message: '请输入产品名称', trigger: 'blur' }],

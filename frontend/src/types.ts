@@ -278,6 +278,7 @@ export function expiringSoon(a: Asset, days: number, now = Date.now()): boolean 
 // ADR-019（PRICING-20261020）：新增 delivering（交付中）——合同录入签订时间后 active→delivering，
 // 交付动作（扣量/流水/交付记录）在 delivering→delivered 时发生
 export type ProjectStatus =
+  | 'pending_assign'
   | 'pending'
   | 'active'
   | 'delivering'
@@ -285,6 +286,9 @@ export type ProjectStatus =
   | 'terminated'
 
 export const PROJECT_STATUS: Record<ProjectStatus, { label: string; tag: 'success' | 'info' | 'warning' | 'danger' | 'primary' }> = {
+  // ADR-064（2026-11-10）：待分配 = 下单后、分配商务负责人前（pending 的前置派生态，businessOwner 空）；
+  // 中性 info 灰蓝（#71829a，--el-color-info 项目 token），区别于 pending 的 warning 黄
+  pending_assign: { label: '待分配', tag: 'info' },
   pending: { label: '待审核', tag: 'warning' },
   active: { label: '进行中', tag: 'primary' },
   delivering: { label: '交付中', tag: 'warning' }, // 橙（#A86514，与全局 --warning-color 同色板）

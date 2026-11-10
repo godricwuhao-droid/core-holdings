@@ -119,19 +119,22 @@ function openAssign(p: Project) {
   transferMode.value = 'assign'
   transferVisible.value = true
 }
-/** ADR-051：主管/管理员可对任意可见项目分配/改派（后端 claim is_mgr 分支；终态 400，前端按 pending/active 收敛） */
+/** ADR-051：主管/管理员可对任意可见项目分配/改派（后端 claim is_mgr 分支；终态 400，前端按 pending/active 收敛）
+ *  ADR-064：pending_assign（待分配）是主管/管理员的主操作场景——待分配行必须显「分配」，
+ *  分配（claim）后后端重算回落 pending（待审核） */
 function canAssignRow(row: { status: string }): boolean {
-  return canAssign.value && (row.status === 'pending' || row.status === 'active')
+  return canAssign.value && (row.status === 'pending_assign' || row.status === 'pending' || row.status === 'active')
 }
 
 /**
- * 撤销待审核订单（ADR-026 / TASK-FE-029）：仅 `pending` 且「本人下单（creator==当前登录）或 admin」可见。
+ * 撤销待审核订单（ADR-026 / TASK-FE-029）：仅 `pending`/`pending_assign` 且「本人下单（creator==当前登录）或 admin」可见。
  * 商务（editor）不显示——商务走「驳回」；viewer 他人单不可见（后端 creator 归属守卫兜底）。
+ * ADR-064：`pending_assign`（待分配）同样可撤——后端 withdraw 守卫已放行 `status in (pending, pending_assign)`。
  * 注：`ProjectOut` 自 2026-10-21 起已输出 `creator`（bootstrap 同步），按账号精确比对；
  * viewer 的 `projects[]` 仍由后端按 creator 过滤为「自己下单」，creator 为空时按可见性兜底。
  */
 function canWithdrawRow(row: { status: string; creator?: string }): boolean {
-  if (row.status !== 'pending') return false
+  if (row.status !== 'pending' && row.status !== 'pending_assign') return false
   if (isAdmin.value) return true
   if (canWrite.value) return false // 商务（editor）不显示，走驳回
   const creator = (row.creator || '').trim()
@@ -297,7 +300,9 @@ function canEditProject(p: Project): boolean {
   if (isViewer.value) return false // ADR-028：viewer 任何状态都不可编辑
   // ADR-012 §5.1：pending（待审核）项目仅商务负责人（或 admin 越过）可审核
   // ADR-051 Q3：商务主管兜底可审核（与后端 review 守卫同口径）
-  if (p.status === 'pending') {
+  // ADR-064：pending_assign（待分配）与 pending 同守卫（后端 update_project 同口径）——
+  // 待分配无负责人 → 实际仅 admin/supervisor 可编辑（editor 数据域本就看不到待分配单，此处为兜底）
+  if (p.status === 'pending' || p.status === 'pending_assign') {
     return isAdmin.value || isSupervisor.value || (p.businessOwner || '').trim() === currentUser.value?.username
   }
   if (!p.contractCount) return p.status === 'active'
